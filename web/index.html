@@ -1,1 +1,322 @@
-<!doctype html><title>weft</title><p>Mission Control loads here.</p>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Weft Mission Control</title>
+<meta name="description" content="Live view of a Weft repo: agents, intents, the speculative merge queue, changeset provenance and WQS quality scores.">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=IBM+Plex+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#F4F2EA; --panel:#FFFFFF; --panel2:#FAF8F1; --ink:#0E0F11; --muted:#5B5F66; --line:#0E0F11; --hair:#0E0F1122;
+  --lime:#C8FF1E; --magenta:#FF2E88; --violet:#7A3CFF; --tang:#FF6A00;
+  --ok:#14804A; --ok-bg:#DDF5E6; --warn:#9A6700; --warn-bg:#FFF1C7; --bad:#C4252B; --bad-bg:#FFE0DE; --info-bg:#E8E1FF;
+  --sh:4px 4px 0 var(--line);
+  --display:"Archivo Black","Arial Black",sans-serif; --body:"Space Grotesk","Helvetica Neue",Arial,sans-serif; --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0D0E10; --panel:#16181C; --panel2:#1C1F24; --ink:#F1F0EA; --muted:#A3A7AE; --line:#F1F0EA; --hair:#F1F0EA22;
+  --ok:#4ADE80; --ok-bg:#12321F; --warn:#FBBF24; --warn-bg:#3A2E0A; --bad:#FF7A7F; --bad-bg:#3D1416; --info-bg:#2A2147; color-scheme:dark;}}
+:root[data-theme="dark"]{
+  --bg:#0D0E10; --panel:#16181C; --panel2:#1C1F24; --ink:#F1F0EA; --muted:#A3A7AE; --line:#F1F0EA; --hair:#F1F0EA22;
+  --ok:#4ADE80; --ok-bg:#12321F; --warn:#FBBF24; --warn-bg:#3A2E0A; --bad:#FF7A7F; --bad-bg:#3D1416; --info-bg:#2A2147; color-scheme:dark;}
+*{box-sizing:border-box;border-radius:0}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 var(--body)}
+button,input,select{font:inherit;color:inherit}
+:focus-visible{outline:3px solid var(--violet);outline-offset:2px}
+.mono,code{font-family:var(--mono);font-size:12.5px}
+.top{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 16px;background:var(--panel);border-bottom:2px solid var(--line)}
+.logo{font:22px var(--display);display:flex;align-items:center;gap:8px}
+.logo i{width:22px;height:22px;background:var(--lime);border:2px solid var(--line);box-shadow:3px 3px 0 var(--magenta);display:inline-block}
+.repo{display:flex;gap:6px;align-items:center}
+.repo input{border:2px solid var(--line);background:var(--panel2);padding:4px 8px;width:170px;font-family:var(--mono);font-size:13px}
+.trunk{font:12px var(--mono);color:var(--muted)}
+.sp{flex:1}
+.live{display:flex;align-items:center;gap:6px;font:12px var(--mono)}
+.dot{width:9px;height:9px;background:var(--muted);display:inline-block}
+.live.on .dot{background:var(--ok)}
+.btn{border:2px solid var(--line);background:var(--panel);padding:5px 10px;font-weight:600;box-shadow:3px 3px 0 var(--line);cursor:pointer}
+.btn:hover{background:var(--lime);color:#0E0F11}
+.app{display:grid;grid-template-columns:190px minmax(0,1fr);min-height:calc(100vh - 56px)}
+.nav{border-right:2px solid var(--line);background:var(--panel);padding:14px 10px;display:flex;flex-direction:column;gap:4px}
+.nav button{display:flex;justify-content:space-between;align-items:center;text-align:left;border:2px solid transparent;background:none;padding:8px 10px;font-weight:600;cursor:pointer}
+.nav button:hover{border-color:var(--line)}
+.nav button[aria-current="page"]{background:var(--ink);color:var(--bg)}
+.nav .badge{font:11px var(--mono);border:1.5px solid currentColor;padding:0 5px}
+main{padding:18px;min-width:0}
+.view{display:none}.view.on{display:block}
+h1{font:24px var(--display);margin:0 0 4px;text-transform:uppercase}
+.lede{color:var(--muted);margin:0 0 16px;max-width:80ch}
+.grid{display:grid;gap:16px;grid-template-columns:minmax(0,1fr)}
+.g2{grid-template-columns:minmax(0,1.2fr) minmax(0,1fr)}
+@media (max-width:1100px){.g2{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:860px){.app{grid-template-columns:minmax(0,1fr)}.nav{position:fixed;bottom:0;left:0;right:0;z-index:6;flex-direction:row;border-right:0;border-top:2px solid var(--line);padding:6px;overflow-x:auto}.nav button{flex:1;justify-content:center;font-size:12px}.nav .badge{display:none}main{padding:14px 16px 90px}.trunk{display:none}}
+.panel{background:var(--panel);border:2px solid var(--line);box-shadow:var(--sh);min-width:0}
+.ph{display:flex;align-items:center;gap:10px;padding:9px 12px;border-bottom:2px solid var(--line)}
+.ph h2{font:13px var(--display);text-transform:uppercase;margin:0}
+.ph .meta{margin-left:auto;font:11.5px var(--mono);color:var(--muted)}
+.kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:16px}
+@media (max-width:1100px){.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media (max-width:520px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.kpi{background:var(--panel);border:2px solid var(--line);box-shadow:var(--sh);padding:10px 12px}
+.kpi b{display:block;font:26px/1.1 var(--display);font-variant-numeric:tabular-nums}
+.kpi span{font-size:12px;color:var(--muted)}
+.pill{display:inline-flex;align-items:center;gap:4px;font:11px/1.6 var(--mono);border:1.5px solid var(--line);padding:0 6px;white-space:nowrap}
+.s-ok{background:var(--ok-bg);color:var(--ok);border-color:var(--ok)}.s-warn{background:var(--warn-bg);color:var(--warn);border-color:var(--warn)}.s-bad{background:var(--bad-bg);color:var(--bad);border-color:var(--bad)}.s-info{background:var(--info-bg)}.s-mut{color:var(--muted);border-color:var(--muted)}
+.av{display:inline-grid;place-items:center;width:22px;height:22px;border:2px solid var(--line);font:11px var(--display);color:#fff;flex:none}
+.agent{display:inline-flex;align-items:center;gap:6px;font-weight:600}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+th{font:11px var(--display);text-transform:uppercase;text-align:left;padding:7px 10px;border-bottom:2px solid var(--line)}
+td{padding:8px 10px;border-bottom:1px solid var(--hair);vertical-align:middle}
+td.num{font-variant-numeric:tabular-nums;font-family:var(--mono)}
+tr.click{cursor:pointer}tr.click:hover td{background:var(--panel2)}
+.files .row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 12px;border-bottom:1px solid var(--hair)}
+.files .path{font:12.5px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.claims{display:flex;gap:4px}
+.claim{width:18px;height:18px;border:2px solid var(--line);position:relative}
+.claim.soft{opacity:.6}.claim.excl{outline:2px solid var(--line);outline-offset:1px}
+.claim.touched::after{content:"";position:absolute;inset:3px;background:var(--line)}
+.events{max-height:420px;overflow:auto;font:12px/1.5 var(--mono)}
+.ev{display:grid;grid-template-columns:44px 64px 190px minmax(0,1fr);gap:8px;padding:5px 12px;border-bottom:1px solid var(--hair)}
+.ev .t{color:var(--muted)}
+@media (max-width:640px){.ev{grid-template-columns:40px minmax(0,1fr)}.ev .d,.ev .ty{grid-column:2}}
+.chain{display:flex;overflow-x:auto;padding:14px 12px}
+.node{min-width:160px;border:2px solid var(--line);background:var(--panel2);padding:8px 10px;position:relative}
+.node + .node{margin-left:26px}
+.node + .node::before{content:"";position:absolute;left:-28px;top:50%;width:26px;border-top:2px solid var(--line)}
+.node.trunk{background:var(--ink);color:var(--bg)}
+.node.ok{border-color:var(--ok);box-shadow:3px 3px 0 var(--ok)}.node.bad{border-color:var(--bad);box-shadow:3px 3px 0 var(--bad)}.node.warn{border-color:var(--warn);box-shadow:3px 3px 0 var(--warn)}
+.node .id{font:12px var(--mono);font-weight:600}.node .msg{font-size:12px;margin:3px 0}
+.lanes{display:grid;grid-template-columns:repeat(5,minmax(170px,1fr));gap:12px;overflow-x:auto}
+.lane{background:var(--panel);border:2px solid var(--line);min-height:140px}
+.lane h3{font:12px var(--display);text-transform:uppercase;margin:0;padding:8px 10px;border-bottom:2px solid var(--line);display:flex;justify-content:space-between}
+.card{margin:8px;border:2px solid var(--line);padding:8px;background:var(--panel2);cursor:pointer}
+.card:hover{background:var(--lime);color:#0E0F11}
+.card .id{font:11px var(--mono);font-weight:600}.card .msg{font-size:12.5px;margin:2px 0 6px}
+.split{display:grid;grid-template-columns:minmax(220px,300px) minmax(0,1fr);gap:16px}
+@media (max-width:980px){.split{grid-template-columns:minmax(0,1fr)}}
+.cslist button{display:block;width:100%;text-align:left;border:0;border-bottom:1px solid var(--hair);background:none;padding:9px 12px;cursor:pointer}
+.cslist button[aria-selected="true"]{background:var(--ink);color:var(--bg)}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));border-top:2px solid var(--line)}
+.kv div{padding:8px 12px;border-bottom:1px solid var(--hair);border-right:1px solid var(--hair)}
+.kv dt{font:10.5px var(--display);text-transform:uppercase;color:var(--muted)}
+.kv dd{margin:2px 0 0;font:12.5px var(--mono);word-break:break-all}
+.bar{height:12px;background:var(--hair);min-width:60px}.bar i{display:block;height:100%;background:var(--violet)}
+.rub{display:grid;grid-template-columns:170px minmax(0,1fr) 64px;gap:8px;align-items:center;padding:5px 12px;font-size:12.5px}
+.rub small{grid-column:2/4;color:var(--muted);margin-top:-4px}
+.wqs{font:44px/1 var(--display);font-variant-numeric:tabular-nums}
+.trailers{font:12px/1.6 var(--mono);background:#0E0F11;color:#C8FF1E;padding:12px;margin:0;overflow-x:auto;white-space:pre}
+.empty{padding:20px 12px;color:var(--muted)}
+.note{font-size:12px;color:var(--muted);padding:8px 12px}
+.toast{position:fixed;right:16px;bottom:16px;z-index:9;background:var(--ink);color:var(--bg);border:2px solid var(--line);box-shadow:4px 4px 0 var(--magenta);padding:10px 14px;max-width:380px;display:none}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="logo"><i aria-hidden="true"></i>weft</div>
+  <form class="repo" id="repoForm"><label for="repoInput" class="mono">repo</label><input id="repoInput" autocomplete="off" spellcheck="false" placeholder="shop-live1"><button class="btn" type="submit">Open</button></form>
+  <span class="trunk">trunk <b id="trunkSha">—</b></span>
+  <span class="sp"></span>
+  <span class="live" id="live"><span class="dot" aria-hidden="true"></span><span id="liveTxt">offline</span></span>
+  <a class="btn" href="/demo.html" title="Offline simulation of the five-agent scenario">Simulation</a>
+</header>
+<div class="app">
+  <nav class="nav" aria-label="Views">
+    <button data-view="swarm" aria-current="page">Swarm <span class="badge" id="nb-agents">0</span></button>
+    <button data-view="queue">Queue <span class="badge" id="nb-queue">0</span></button>
+    <button data-view="changesets">Changesets <span class="badge" id="nb-cs">0</span></button>
+    <button data-view="quality">Quality</button>
+    <button data-view="events">Events</button>
+  </nav>
+  <main>
+    <section class="view on" id="v-swarm">
+      <h1>Swarm</h1>
+      <p class="lede">Live agents, what each declared, what each actually touched, and where two of them are about to collide.</p>
+      <div class="kpis" id="kpis"></div>
+      <div class="grid g2">
+        <div class="panel" style="align-self:start"><div class="ph"><h2>Lease map</h2><span class="meta" id="leaseMeta"></span></div><div class="files" id="files"></div>
+          <div class="note">Soft intent (faded) · exclusive lease (outlined) · touched by heartbeat (filled)</div></div>
+        <div class="panel"><div class="ph"><h2>Agents</h2><span class="meta" id="agentMeta"></span></div><div class="scroll"><table><thead><tr><th>Agent</th><th>Task · intent</th><th>State</th></tr></thead><tbody id="agents"></tbody></table></div></div>
+      </div>
+    </section>
+    <section class="view" id="v-queue">
+      <h1>Merge queue</h1>
+      <p class="lede">The Speculative Weave: changesets are judged against the WQS rubric, merged in memory onto trunk, checked once on the merged tip, bisected if red, and pushed in one compare-and-swap.</p>
+      <div class="panel" style="margin-bottom:16px"><div class="ph"><h2>Latest batch</h2><span class="meta" id="batchMeta">—</span></div><div class="chain" id="chain"><div class="empty">No batch yet.</div></div></div>
+      <div class="lanes" id="lanes"></div>
+    </section>
+    <section class="view" id="v-changesets">
+      <h1>Changesets</h1>
+      <p class="lede">Server-written provenance, the explained risk score, the WQS scorecard and the reason each changeset was held, rejected or landed.</p>
+      <div class="split"><div class="panel"><div class="ph"><h2>All changesets</h2></div><div class="cslist" id="cslist"></div></div><div id="csdetail"><div class="panel"><div class="empty">Select a changeset.</div></div></div></div>
+    </section>
+    <section class="view" id="v-quality">
+      <h1>Quality</h1>
+      <p class="lede">Every changeset is scored on the Weft Quality Score (WQS-1): deterministic gates (50), the Cloudflare CLEF decision model judging intent, tests and risk (40), and process (10). Ranked by agent and by model, this is the signal agents improve against.</p>
+      <div class="grid g2">
+        <div class="panel"><div class="ph"><h2>By agent</h2><span class="meta">mean WQS</span></div><div class="scroll"><table><thead><tr><th>Agent</th><th>WQS</th><th>Landed</th><th>First try</th><th>Intent</th></tr></thead><tbody id="lbAgent"></tbody></table></div></div>
+        <div class="panel"><div class="ph"><h2>By model</h2><span class="meta">mean WQS</span></div><div class="scroll"><table><thead><tr><th>Model</th><th>WQS</th><th>Landed</th><th>First try</th><th>Intent</th></tr></thead><tbody id="lbModel"></tbody></table></div></div>
+      </div>
+      <div class="panel" style="margin-top:16px"><div class="ph"><h2>The rubric</h2><span class="meta">wqs-1</span></div>
+        <div class="scroll"><table><thead><tr><th>Layer</th><th>Criterion</th><th>Points</th><th>Measured by</th></tr></thead><tbody>
+          <tr><td>Gates</td><td>Check passes on the merged tree</td><td class="num">25</td><td>merge-runner Container</td></tr>
+          <tr><td>Gates</td><td>Tests change with source</td><td class="num">10</td><td>authoritative diff</td></tr>
+          <tr><td>Gates</td><td>Edits stay inside the declared intent</td><td class="num">5</td><td>intent globs</td></tr>
+          <tr><td>Gates</td><td>Size within budget (400 lines)</td><td class="num">5</td><td>numstat</td></tr>
+          <tr><td>Gates</td><td>No secrets in added lines</td><td class="num">5</td><td>pattern scan (holds for review)</td></tr>
+          <tr><td>Judge</td><td>Intent alignment (0–3)</td><td class="num">15</td><td>CLEF <code>score</code></td></tr>
+          <tr><td>Judge</td><td>Test adequacy (0–3)</td><td class="num">10</td><td>CLEF <code>score</code></td></tr>
+          <tr><td>Judge</td><td>Maintainability (0–2)</td><td class="num">5</td><td>CLEF <code>score</code></td></tr>
+          <tr><td>Judge</td><td>No scope creep · no security concern</td><td class="num">5 + 5</td><td>CLEF <code>noul</code> (security ≥ 0.7 holds)</td></tr>
+          <tr><td>Process</td><td>Landed first try · fresh base</td><td class="num">5 + 5</td><td>coordinator history</td></tr>
+        </tbody></table></div></div>
+    </section>
+    <section class="view" id="v-events">
+      <h1>Events</h1>
+      <p class="lede">The coordinator's append-only event log, streamed over a hibernating WebSocket.</p>
+      <div class="panel"><div class="events" id="events" aria-live="polite"></div></div>
+    </section>
+  </main>
+</div>
+<div class="toast" id="toast" role="status"></div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const COLORS = ["#7A3CFF", "#FF6A00", "#00A3B8", "#FF2E88", "#3C7A00", "#B8860B", "#1F6FEB", "#9B2C8F"];
+const colorOf = (name) => { let h = 0; for (const c of String(name)) h = (h * 31 + c.charCodeAt(0)) >>> 0; return COLORS[h % COLORS.length]; };
+const av = (n) => `<span class="av" style="background:${colorOf(n)}" aria-hidden="true">${esc(String(n)[0] || "?").toUpperCase()}</span>`;
+const agent = (n) => `<span class="agent">${av(n)}${esc(n)}</span>`;
+const pill = (t, c) => `<span class="pill ${c}">${esc(t)}</span>`;
+const STATUS = { queued: ["◷ queued", "s-info"], needs_review: ["⚑ needs review", "s-warn"], validating: ["⟳ validating", "s-info"], landed: ["✓ landed", "s-ok"], rejected: ["✕ rejected", "s-bad"], reverted: ["↶ reverted", "s-mut"], active: ["● active", "s-info"], submitted: ["◷ submitted", "s-info"], conflicted: ["⚠ conflicted", "s-warn"], provisioning: ["… provisioning", "s-mut"] };
+const statusPill = (s) => pill(...(STATUS[s] || [s, "s-mut"]));
+const globRe = (g) => new RegExp("^" + g.replace(/[.+^$()|[\]\\]/g, "\\$&").replace(/\*\*\//g, "(?:.*/)?").replace(/\*\*/g, ".*").replace(/(?<!\.)\*/g, "[^/]*") + (/[*?]/.test(g) ? "$" : "(?:/.*)?$"));
+const matches = (p, globs) => globs.some((g) => globRe(g).test(p));
+
+let REPO = "", S = null, LB = null, selected = null, sock = null, pending = null;
+
+const get = async (path) => {
+  const r = await fetch(path, { headers: { accept: "application/json" } });
+  const j = await r.json();
+  if (!j.ok) throw new Error(`${j.error.code}: ${j.error.message}`);
+  return j.data;
+};
+const toast = (m) => { const t = $("toast"); t.textContent = m; t.style.display = "block"; clearTimeout(toast.t); toast.t = setTimeout(() => (t.style.display = "none"), 3500); };
+
+async function load() {
+  if (!REPO) return;
+  try {
+    [S, LB] = await Promise.all([get(`/v1/repos/${encodeURIComponent(REPO)}/snapshot`), get(`/v1/repos/${encodeURIComponent(REPO)}/leaderboard`)]);
+    if (!selected && S.changesets.length) selected = S.changesets[0].id;
+    render();
+  } catch (err) {
+    $("kpis").innerHTML = `<div class="panel" style="grid-column:1/-1"><div class="empty">Could not load <b>${esc(REPO)}</b>: ${esc(err.message)}</div></div>`;
+  }
+}
+const schedule = () => { clearTimeout(pending); pending = setTimeout(load, 300); };
+
+function connect() {
+  if (sock) try { sock.close(); } catch (err) { /* already closed */ }
+  const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/v1/repos/${encodeURIComponent(REPO)}/ws`;
+  sock = new WebSocket(url, ["weft"]);
+  sock.addEventListener("open", () => { $("live").classList.add("on"); $("liveTxt").textContent = "live"; });
+  sock.addEventListener("message", (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.t !== "event") return;
+    const e = m.event;
+    if (e.type === "workspace.alert") toast(`Collision forecast: ${e.data.agentName} and ${e.data.peerAgent} on ${(e.data.files || []).join(", ")}`);
+    if (e.type === "queue.batch_landed") toast(`Batch landed ${e.data.landed.length}, rejected ${e.data.rejected.length} (${e.data.checksRun} check runs)`);
+    schedule();
+  });
+  sock.addEventListener("close", () => { $("live").classList.remove("on"); $("liveTxt").textContent = "reconnecting"; setTimeout(() => REPO && connect(), 3000); });
+}
+
+function open(repo) {
+  REPO = repo.trim();
+  if (!REPO) return;
+  $("repoInput").value = REPO;
+  try { localStorage.setItem("weft-repo", REPO); } catch (err) { /* storage unavailable */ }
+  if (location.hash.slice(1) !== REPO) history.replaceState(null, "", `#${REPO}`);
+  selected = null; load(); connect();
+}
+
+function render() {
+  $("trunkSha").textContent = (S.trunkHead || "—").slice(0, 10);
+  const ws = S.workspaces, cs = S.changesets;
+  const live = ws.filter((w) => ["active", "conflicted", "submitted", "provisioning"].includes(w.status));
+  const inQueue = cs.filter((c) => ["queued", "validating", "needs_review"].includes(c.status));
+  const scored = cs.filter((c) => typeof c.scorecard?.total === "number");
+  const mean = scored.length ? Math.round(scored.reduce((s, c) => s + c.scorecard.total, 0) / scored.length) : "—";
+  const k = [[live.length, "live agents"], [inQueue.length, "in queue"], [cs.filter((c) => c.status === "landed").length, "landed"], [cs.filter((c) => c.status === "rejected").length, "rejected (returned to agent)"], [mean, "mean WQS"], [S.paused ? "paused" : "running", "queue"]];
+  $("kpis").innerHTML = k.map(([b, s]) => `<div class="kpi"><b>${esc(b)}</b><span>${esc(s)}</span></div>`).join("");
+  $("nb-agents").textContent = live.length; $("nb-queue").textContent = inQueue.length; $("nb-cs").textContent = cs.length;
+
+  const files = [...new Set(ws.flatMap((w) => w.touched).concat(cs.flatMap((c) => c.provenance.filesTouched)))].sort();
+  $("files").innerHTML = files.map((f) => {
+    const cl = live.filter((w) => matches(f, w.intent.globs) || w.touched.includes(f));
+    const union = (S.config.unionGlobs || []).some((g) => globRe(g).test(f));
+    const contested = !union && cl.filter((w) => w.touched.includes(f)).length > 1;
+    return `<div class="row"><div class="path">${esc(f)} ${union ? pill("union", "s-mut") : ""} ${contested ? pill("contested", "s-bad") : ""}</div><div class="claims">${cl.map((w) => `<span class="claim ${w.intent.mode === "exclusive" ? "excl" : "soft"} ${w.touched.includes(f) ? "touched" : ""}" style="background:${colorOf(w.agentName)}" title="${esc(w.agentName)}"></span>`).join("") || pill("free", "s-mut")}</div></div>`;
+  }).join("") || `<div class="empty">No files touched yet.</div>`;
+  $("leaseMeta").textContent = `${live.length} live intents`;
+  $("agents").innerHTML = ws.map((w) => `<tr><td>${agent(w.agentName)}<div class="mono" style="color:var(--muted)">${esc(w.model)}</div></td><td>${esc(w.task)}<div class="mono" style="color:var(--muted)">${esc(w.intent.globs.join(" "))}${w.intent.mode === "exclusive" ? " · exclusive" : ""}</div></td><td>${statusPill(w.status)}</td></tr>`).join("") || `<tr><td colspan="3" class="empty">No workspaces yet.</td></tr>`;
+  $("agentMeta").textContent = `${ws.length} workspaces`;
+
+  const b = S.batch;
+  if (b) {
+    const nodes = [`<div class="node trunk"><div class="id">trunk ${esc(b.trunkHead.slice(0, 10))}</div><div class="msg">base of ${esc(b.id)}</div></div>`];
+    for (const id of b.members) {
+      const c = cs.find((x) => x.id === id); if (!c) continue;
+      const cls = c.status === "landed" ? "ok" : c.status === "rejected" ? (c.rejection?.reason === "conflict" ? "warn" : "bad") : c.status === "needs_review" ? "warn" : "";
+      const tag = c.status === "landed" ? pill(`✓ landed ${c.landedCommit.slice(0, 7)}`, "s-ok") : c.status === "rejected" ? pill(`✕ ${c.rejection?.reason}`, c.rejection?.reason === "conflict" ? "s-warn" : "s-bad") : statusPill(c.status);
+      nodes.push(`<div class="node ${cls}"><div class="id">${esc(c.id)}${typeof c.scorecard?.total === "number" ? ` · WQS ${c.scorecard.total}` : ""}</div><div class="msg">${esc(c.message)}</div>${agent(c.provenance.agentName)}<div style="margin-top:6px">${tag}</div></div>`);
+    }
+    $("chain").innerHTML = nodes.join(""); $("batchMeta").textContent = `${b.id} · ${b.state}`;
+  }
+  const lanes = [["needs_review", "Needs review"], ["queued", "Queued"], ["validating", "Validating"], ["landed", "Landed"], ["rejected", "Rejected"]];
+  $("lanes").innerHTML = lanes.map(([k2, label]) => { const items = cs.filter((c) => c.status === k2); return `<div class="lane"><h3>${label}<span>${items.length}</span></h3>${items.map((c) => `<div class="card" tabindex="0" data-cs="${esc(c.id)}"><div class="id">${esc(c.id)} · risk ${c.riskScore}${typeof c.scorecard?.total === "number" ? ` · WQS ${c.scorecard.total}` : ""}</div><div class="msg">${esc(c.message)}</div>${agent(c.provenance.agentName)}${c.scorecard?.hold ? `<div style="margin-top:6px">${pill("held: " + c.scorecard.hold, "s-warn")}</div>` : ""}</div>`).join("") || '<div class="empty">—</div>'}</div>`; }).join("");
+
+  $("cslist").innerHTML = cs.map((c) => `<button role="option" aria-selected="${c.id === selected}" data-cs="${esc(c.id)}"><div class="mono"><b>${esc(c.id)}</b> ${statusPill(c.status)} ${typeof c.scorecard?.total === "number" ? pill("WQS " + c.scorecard.total, "s-info") : ""}</div><div>${esc(c.message)}</div><div style="margin-top:4px">${agent(c.provenance.agentName)}</div></button>`).join("") || '<div class="empty">None yet.</div>';
+  renderDetail();
+  const row = (r) => `<tr><td>${r.key.includes("/") || r.key.startsWith("@") || r.key.includes("-") && !/^[a-z]+$/.test(r.key) ? `<span class="mono">${esc(r.key)}</span>` : agent(r.key)}</td><td class="num"><b>${r.meanWqs ?? "—"}</b></td><td class="num">${r.landed}/${r.submitted}</td><td class="num">${r.firstTryRate}%</td><td class="num">${r.meanIntentAlignment ?? "—"}</td></tr>`;
+  $("lbAgent").innerHTML = (LB?.byAgent || []).map(row).join("") || `<tr><td colspan="5" class="empty">No scored changesets yet.</td></tr>`;
+  $("lbModel").innerHTML = (LB?.byModel || []).map(row).join("") || `<tr><td colspan="5" class="empty">No scored changesets yet.</td></tr>`;
+  $("events").innerHTML = S.events.map((e) => `<div class="ev"><span class="t">${e.seq}</span><span class="t">${esc(e.at.slice(11, 19))}</span><span class="ty">${esc(e.type)}</span><span class="d">${esc(e.actor)} ${esc(JSON.stringify(e.data).slice(0, 220))}</span></div>`).join("");
+}
+
+function renderDetail() {
+  const c = S.changesets.find((x) => x.id === selected);
+  if (!c) return;
+  const sc = c.scorecard, j = sc?.judge;
+  const rows = (sc ? [...sc.gates, ...sc.process] : []).map((g) => `<div class="rub"><span>${esc(g.name.replace(/_/g, " "))}</span><span class="bar"><i style="width:${(100 * g.points / g.max).toFixed(0)}%"></i></span><b class="mono">${g.points}/${g.max}</b><small>${esc(g.detail)}</small></div>`).join("");
+  const judgeRows = j && !j.error ? [["intent alignment", j.intentAlignment, 3], ["test adequacy", j.testAdequacy, 3], ["maintainability", j.maintainability, 2], ["scope creep (p)", j.scopeCreep, 1], ["security concern (p)", j.securityConcern, 1]].filter(([, v]) => v !== null).map(([n, v, m]) => `<div class="rub"><span>${n}</span><span class="bar"><i style="width:${(100 * v / m).toFixed(0)}%"></i></span><b class="mono">${Number(v).toFixed(2)}</b></div>`).join("") + `<div class="note">correctness risk: <b>${esc(j.correctnessRisk ?? "—")}</b> · model <code>${esc(j.model)}</code></div>` : `<div class="note">${j?.error ? "Judge unavailable: " + esc(j.error) : "Not judged yet."}</div>`;
+  const rej = c.rejection ? `<div class="note" style="color:var(--bad)"><b>${esc(c.rejection.reason)}</b>: ${esc(c.rejection.detail.slice(0, 300))}${c.rejection.conflictsWith?.length ? ` — conflicts with ${c.rejection.conflictsWith.map((p) => `${esc(p.changesetId)} (${esc(p.agentName)})`).join(", ")}` : ""}</div>` : "";
+  $("csdetail").innerHTML = `
+    <div class="panel" style="margin-bottom:16px"><div class="ph"><h2>${esc(c.id)}</h2>${statusPill(c.status)}<span class="meta">${esc(c.landedCommit ? c.landedCommit.slice(0, 10) : "")}</span></div>
+      <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap;padding:12px"><div style="flex:1;min-width:220px"><div style="font-size:17px;font-weight:700">${esc(c.message)}</div><div style="margin-top:6px">${agent(c.provenance.agentName)} <span class="mono" style="color:var(--muted)">· ${esc(c.provenance.model)} · ${esc(c.wsId)}</span></div></div>
+      <div style="text-align:right"><div class="wqs">${sc?.total ?? "—"}</div><div class="mono" style="color:var(--muted)">WQS / 100 · risk ${c.riskScore}</div></div></div>
+      ${rej}${sc?.hold ? `<div class="note" style="color:var(--warn)">Held for review: ${esc(sc.hold)}</div>` : ""}
+      <dl class="kv" style="margin:0"><div><dt>Task</dt><dd>${esc(c.provenance.task)}</dd></div><div><dt>Intent</dt><dd>${esc(c.provenance.intentGlobs.join(" "))}</dd></div><div><dt>Files</dt><dd>${esc(c.provenance.filesTouched.join(", "))}</dd></div><div><dt>Lines</dt><dd>+${c.provenance.linesAdded} −${c.provenance.linesDeleted}</dd></div><div><dt>Tool calls · cost</dt><dd>${c.provenance.toolCalls ?? "—"} · ${c.provenance.costUsd != null ? "$" + c.provenance.costUsd.toFixed(2) : "—"}</dd></div><div><dt>Review</dt><dd>${esc(c.approvedBy ? "approved by " + c.approvedBy : c.status === "needs_review" ? "waiting for a human" : "auto")}</dd></div></dl></div>
+    <div class="grid g2">
+      <div class="panel"><div class="ph"><h2>Rubric · gates &amp; process</h2><span class="meta">deterministic</span></div><div style="padding:6px 0">${rows || '<div class="note">Not scored yet.</div>'}</div>${sc?.advice?.length ? `<div class="note"><b>Advice to the agent:</b><br>${sc.advice.map(esc).join("<br>")}</div>` : ""}</div>
+      <div class="panel"><div class="ph"><h2>Rubric · judge</h2><span class="meta">Cloudflare CLEF</span></div><div style="padding:6px 0">${judgeRows}</div></div>
+    </div>`;
+}
+
+document.querySelectorAll(".nav button").forEach((b) => (b.onclick = () => show(b.dataset.view)));
+function show(v) {
+  document.querySelectorAll(".nav button").forEach((b) => { if (b.dataset.view === v) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current"); });
+  document.querySelectorAll(".view").forEach((s) => s.classList.toggle("on", s.id === "v-" + v));
+}
+document.addEventListener("click", (e) => { const el = e.target.closest("[data-cs]"); if (el) { selected = el.dataset.cs; render(); show("changesets"); } });
+document.addEventListener("keydown", (e) => { if ((e.key === "Enter" || e.key === " ") && e.target.matches(".card[data-cs]")) { e.preventDefault(); e.target.click(); } });
+$("repoForm").addEventListener("submit", (e) => { e.preventDefault(); open($("repoInput").value); });
+let initial = location.hash.slice(1);
+if (!initial) { try { initial = localStorage.getItem("weft-repo") || ""; } catch (err) { initial = ""; } }
+if (initial) open(initial); else $("kpis").innerHTML = `<div class="panel" style="grid-column:1/-1"><div class="empty">Enter a repo name above (for example <b>shop-live1</b>) to watch it live.</div></div>`;
+</script>
+</body>
+</html>

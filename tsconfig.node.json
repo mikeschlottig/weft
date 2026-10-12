@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["cli/**/*.ts", "container/**/*.ts", "src/core/**/*.ts"]
+  "include": ["cli/**/*.ts", "container/**/*.ts", "src/core/**/*.ts", "test/**/*.ts"]
 }

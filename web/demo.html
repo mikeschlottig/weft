@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Weft Mission Control</title>
+<meta name="description" content="Prototype UI for Weft: live agent swarm, lease map, speculative merge queue, changeset provenance and conflict rooms.">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=IBM+Plex+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#F4F2EA; --panel:#FFFFFF; --panel2:#FAF8F1; --ink:#0E0F11; --muted:#5B5F66; --line:#0E0F11; --hair:#0E0F1122;
+  --lime:#C8FF1E; --magenta:#FF2E88; --cyan:#00C2DB; --violet:#7A3CFF; --tang:#FF6A00;
+  --ok:#14804A; --ok-bg:#DDF5E6; --warn:#9A6700; --warn-bg:#FFF1C7; --bad:#C4252B; --bad-bg:#FFE0DE; --info-bg:#E8E1FF;
+  --sh:4px 4px 0 var(--line);
+  --display:"Archivo Black","Arial Black",sans-serif; --body:"Space Grotesk","Helvetica Neue",Arial,sans-serif; --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0D0E10; --panel:#16181C; --panel2:#1C1F24; --ink:#F1F0EA; --muted:#A3A7AE; --line:#F1F0EA; --hair:#F1F0EA22;
+  --ok:#4ADE80; --ok-bg:#12321F; --warn:#FBBF24; --warn-bg:#3A2E0A; --bad:#FF7A7F; --bad-bg:#3D1416; --info-bg:#2A2147; color-scheme:dark;}}
+:root[data-theme="dark"]{
+  --bg:#0D0E10; --panel:#16181C; --panel2:#1C1F24; --ink:#F1F0EA; --muted:#A3A7AE; --line:#F1F0EA; --hair:#F1F0EA22;
+  --ok:#4ADE80; --ok-bg:#12321F; --warn:#FBBF24; --warn-bg:#3A2E0A; --bad:#FF7A7F; --bad-bg:#3D1416; --info-bg:#2A2147; color-scheme:dark;}
+*{box-sizing:border-box;border-radius:0}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 var(--body);-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit;cursor:pointer}
+:focus-visible{outline:3px solid var(--violet);outline-offset:2px}
+code,.mono{font-family:var(--mono);font-size:12.5px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+
+/* shell */
+.top{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--panel);border-bottom:2px solid var(--line)}
+.logo{font:22px var(--display);letter-spacing:-.5px;display:flex;align-items:center;gap:8px}
+.logo i{display:inline-block;width:22px;height:22px;background:var(--lime);border:2px solid var(--line);box-shadow:3px 3px 0 var(--magenta)}
+.repo{font:13px var(--mono);border:2px solid var(--line);padding:3px 8px;background:var(--panel2);white-space:nowrap}
+.trunk{font:12px var(--mono);color:var(--muted);white-space:nowrap}
+.sp{flex:1}
+.live{display:flex;align-items:center;gap:6px;font:12px var(--mono)}
+.dot{width:9px;height:9px;background:var(--ok);display:inline-block}
+.live.paused .dot{background:var(--muted)}
+.btn{border:2px solid var(--line);background:var(--panel);padding:5px 10px;font-weight:600;box-shadow:3px 3px 0 var(--line)}
+.btn:hover{background:var(--lime);color:#0E0F11}
+.btn:active{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--line)}
+.btn.pri{background:var(--lime);color:#0E0F11}
+.btn.dng{background:var(--tang);color:#fff}
+.btn.sm{padding:3px 8px;font-size:12px}
+.app{display:grid;grid-template-columns:200px minmax(0,1fr);min-height:calc(100vh - 56px)}
+.nav{border-right:2px solid var(--line);background:var(--panel);padding:14px 10px;display:flex;flex-direction:column;gap:4px}
+.nav button{display:flex;justify-content:space-between;align-items:center;text-align:left;border:2px solid transparent;background:none;padding:8px 10px;font-weight:600}
+.nav button:hover{border-color:var(--line)}
+.nav button[aria-current="page"]{background:var(--ink);color:var(--bg)}
+.nav .badge{font:11px var(--mono);border:1.5px solid currentColor;padding:0 5px}
+.nav .foot{margin-top:auto;font:11px var(--mono);color:var(--muted);padding:8px}
+main{padding:18px;min-width:0}
+.view{display:none}
+.view.on{display:block}
+h1{font:24px var(--display);margin:0 0 4px;text-transform:uppercase;letter-spacing:-.3px}
+.lede{color:var(--muted);margin:0 0 16px;max-width:80ch}
+@media (max-width:860px){
+  .app{grid-template-columns:1fr}
+  .nav{position:fixed;bottom:0;left:0;right:0;z-index:6;flex-direction:row;border-right:0;border-top:2px solid var(--line);padding:6px;overflow-x:auto}
+  .nav .foot{display:none}
+  .nav button{flex:1;justify-content:center;font-size:12px;padding:6px}
+  .nav .badge{display:none}
+  main{padding:14px 16px 90px}
+  .trunk,.repo{display:none}
+  .app{grid-template-columns:minmax(0,1fr)}
+  .top{flex-wrap:wrap;gap:8px;padding:8px 16px}
+  .top .sp{display:none}
+  .live{order:9;flex-basis:100%;font-size:11px}
+  .lanes{grid-template-columns:repeat(5,minmax(200px,1fr))}
+}
+
+/* panels */
+.grid{display:grid;gap:16px;grid-template-columns:minmax(0,1fr)}
+.g2{grid-template-columns:minmax(0,1.25fr) minmax(0,1fr)}
+.g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+@media (max-width:1100px){.g2,.g3{grid-template-columns:minmax(0,1fr)}}
+.panel{background:var(--panel);border:2px solid var(--line);box-shadow:var(--sh);min-width:0}
+.ph{display:flex;align-items:center;gap:10px;padding:9px 12px;border-bottom:2px solid var(--line)}
+.ph h2{font:13px var(--display);text-transform:uppercase;margin:0;letter-spacing:.3px}
+.ph .meta{margin-left:auto;font:11.5px var(--mono);color:var(--muted)}
+.pb{padding:12px}
+.kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:16px}
+@media (max-width:1100px){.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media (max-width:520px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.kpi{background:var(--panel);border:2px solid var(--line);box-shadow:var(--sh);padding:10px 12px}
+.kpi b{display:block;font:26px/1.1 var(--display)}
+.kpi span{font-size:12px;color:var(--muted)}
+.kpi small{display:block;font:11px var(--mono);margin-top:2px}
+
+/* pills & avatars */
+.pill{display:inline-flex;align-items:center;gap:4px;font:11px/1.6 var(--mono);border:1.5px solid var(--line);padding:0 6px;white-space:nowrap}
+.s-ok{background:var(--ok-bg);color:var(--ok);border-color:var(--ok)}
+.s-warn{background:var(--warn-bg);color:var(--warn);border-color:var(--warn)}
+.s-bad{background:var(--bad-bg);color:var(--bad);border-color:var(--bad)}
+.s-info{background:var(--info-bg)}
+.s-mut{color:var(--muted);border-color:var(--muted)}
+.av{display:inline-grid;place-items:center;width:22px;height:22px;border:2px solid var(--line);font:11px var(--display);color:#fff;flex:none}
+.agent{display:inline-flex;align-items:center;gap:6px;font-weight:600}
+
+/* tables & lists */
+table{width:100%;border-collapse:collapse}
+th{font:11px var(--display);text-transform:uppercase;text-align:left;padding:7px 10px;border-bottom:2px solid var(--line);letter-spacing:.3px}
+td{padding:8px 10px;border-bottom:1px solid var(--hair);vertical-align:middle}
+tr.click{cursor:pointer}
+tr.click:hover td{background:var(--panel2)}
+.scroll{overflow-x:auto}
+.files .row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 12px;border-bottom:1px solid var(--hair)}
+.files .path{font:12.5px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.files .claims{display:flex;gap:4px;align-items:center}
+.claim{width:18px;height:18px;border:2px solid var(--line);position:relative}
+.claim.soft{opacity:.55}
+.claim.touched::after{content:"";position:absolute;inset:3px;background:var(--line)}
+.claim.excl{outline:2px solid var(--line);outline-offset:1px}
+.heat{height:6px;background:var(--hair);margin-top:4px}
+.heat i{display:block;height:100%;background:var(--magenta)}
+.legend{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:var(--muted);padding:8px 12px;border-top:2px solid var(--line)}
+.legend span{display:inline-flex;gap:5px;align-items:center}
+
+/* events */
+.events{max-height:340px;overflow:auto;font:12px/1.5 var(--mono)}
+.ev{display:grid;grid-template-columns:52px 170px minmax(0,1fr);gap:8px;padding:5px 12px;border-bottom:1px solid var(--hair)}
+.ev.new{background:var(--info-bg)}
+.ev .t{color:var(--muted)}
+@media (max-width:640px){.ev{grid-template-columns:44px minmax(0,1fr)}.ev .d{grid-column:2}}
+
+/* queue */
+.chain{display:flex;align-items:stretch;gap:0;overflow-x:auto;padding:14px 12px}
+.node{min-width:150px;border:2px solid var(--line);background:var(--panel2);padding:8px 10px;position:relative}
+.node + .node{margin-left:26px}
+.node + .node::before{content:"";position:absolute;left:-28px;top:50%;width:26px;border-top:2px solid var(--line)}
+.node.trunk{background:var(--ink);color:var(--bg)}
+.node.ok{border-color:var(--ok);box-shadow:3px 3px 0 var(--ok)}
+.node.bad{border-color:var(--bad);box-shadow:3px 3px 0 var(--bad)}
+.node.warn{border-color:var(--warn);box-shadow:3px 3px 0 var(--warn)}
+.node .id{font:12px var(--mono);font-weight:600}
+.node .msg{font-size:12px;margin:3px 0}
+.lanes{display:grid;grid-template-columns:repeat(5,minmax(160px,1fr));gap:12px;overflow-x:auto}
+.lane{background:var(--panel);border:2px solid var(--line);min-height:160px}
+.lane h3{font:12px var(--display);text-transform:uppercase;margin:0;padding:8px 10px;border-bottom:2px solid var(--line);display:flex;justify-content:space-between}
+.card{margin:8px;border:2px solid var(--line);padding:8px;background:var(--panel2);cursor:pointer}
+.card:hover{background:var(--lime);color:#0E0F11}
+.card .id{font:11px var(--mono);font-weight:600}
+.card .msg{font-size:12.5px;margin:2px 0 6px}
+.steps{display:flex;gap:6px;flex-wrap:wrap;padding:0 12px 12px}
+.step{font:11px var(--mono);border:1.5px solid var(--line);padding:2px 7px}
+.step.done{background:var(--lime);color:#0E0F11}
+.step.cur{background:var(--magenta);color:#fff}
+
+/* changeset detail */
+.split{display:grid;grid-template-columns:minmax(220px,300px) minmax(0,1fr);gap:16px}
+@media (max-width:980px){.split{grid-template-columns:minmax(0,1fr)}}
+.cslist button{display:block;width:100%;text-align:left;border:0;border-bottom:1px solid var(--hair);background:none;padding:9px 12px}
+.cslist button[aria-selected="true"]{background:var(--ink);color:var(--bg)}
+.cslist .id{font:12px var(--mono);font-weight:600}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:0;border-top:2px solid var(--line)}
+.kv div{padding:8px 12px;border-bottom:1px solid var(--hair);border-right:1px solid var(--hair)}
+.kv dt{font:10.5px var(--display);text-transform:uppercase;color:var(--muted);letter-spacing:.3px}
+.kv dd{margin:2px 0 0;font:12.5px var(--mono);word-break:break-all}
+.risk{display:grid;grid-template-columns:150px minmax(0,1fr) 40px;gap:8px;align-items:center;padding:4px 12px;font-size:12.5px}
+.risk .bar{height:12px;background:var(--hair)}
+.risk .bar i{display:block;height:100%;background:var(--violet)}
+.riskbig{font:40px var(--display);line-height:1}
+.diff{font:12.5px/1.55 var(--mono);overflow-x:auto;border-top:2px solid var(--line)}
+.diff div{white-space:pre;padding:0 12px}
+.diff .h{background:var(--panel2);color:var(--muted);padding:4px 12px;border-bottom:1px solid var(--hair)}
+.diff .a{background:var(--ok-bg)}
+.diff .d{background:var(--bad-bg)}
+.trailers{font:12px/1.6 var(--mono);background:#0E0F11;color:var(--lime);padding:12px;margin:0;overflow-x:auto;white-space:pre}
+
+/* conflict room */
+.room{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+@media (max-width:1100px){.room{grid-template-columns:minmax(0,1fr)}}
+.side h4{margin:0;font:12px var(--display);text-transform:uppercase;padding:8px 10px;border-bottom:2px solid var(--line);display:flex;gap:8px;align-items:center}
+.side pre{margin:0;padding:10px;font:12px/1.55 var(--mono);white-space:pre;overflow-x:auto}
+.verdict{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:12px;border-top:2px solid var(--line)}
+
+/* console */
+.console{background:#0E0F11;color:#DADAD3;font:12px/1.55 var(--mono);padding:12px;max-height:520px;overflow:auto;border-top:2px solid var(--line)}
+.console .p{color:var(--lime)}
+.console .j{color:#9FD9FF;white-space:pre-wrap;word-break:break-word}
+.console .e{color:#FF9BA0;white-space:pre-wrap;word-break:break-word}
+.toast{position:fixed;right:16px;bottom:16px;z-index:9;background:var(--ink);color:var(--bg);border:2px solid var(--line);box-shadow:4px 4px 0 var(--magenta);padding:10px 14px;max-width:360px;display:none;font-size:13px}
+@media (max-width:860px){.toast{bottom:76px;left:16px;right:16px}}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+.empty{padding:20px 12px;color:var(--muted);font-size:13px}
+.note{font-size:12px;color:var(--muted);padding:8px 12px}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="logo"><i aria-hidden="true"></i>weft</div>
+  <span class="repo">leverageai / shop</span>
+  <span class="trunk">trunk <b id="trunkSha">f13823f</b> · <span id="trunkCount">1</span> commits</span>
+  <span class="sp"></span>
+  <span class="live" id="live"><span class="dot" aria-hidden="true"></span><span id="liveTxt">LIVE · step 0/0</span></span>
+  <button class="btn sm" id="playBtn" aria-pressed="true">Pause</button>
+  <button class="btn sm" id="stepBtn">Step</button>
+  <button class="btn sm" id="replayBtn">Replay</button>
+  <button class="btn sm" id="themeBtn" aria-label="Toggle color theme">◐</button>
+</header>
+<div class="app">
+  <nav class="nav" aria-label="Views">
+    <button data-view="swarm" aria-current="page">Swarm <span class="badge" id="nb-agents">0</span></button>
+    <button data-view="queue">Queue <span class="badge" id="nb-queue">0</span></button>
+    <button data-view="changesets">Changesets <span class="badge" id="nb-cs">0</span></button>
+    <button data-view="conflicts">Conflicts <span class="badge" id="nb-rooms">0</span></button>
+    <button data-view="console">Agent console</button>
+    <div class="foot">Prototype · simulated data from<br>prototype/cli demo run<br>2026-10-12</div>
+  </nav>
+  <main>
+    <!-- SWARM -->
+    <section class="view on" id="v-swarm" aria-labelledby="h-swarm">
+      <h1 id="h-swarm">Swarm</h1>
+      <p class="lede">Every live agent, what it has declared, what it has actually touched, and where two of them are about to collide, before either one submits.</p>
+      <div class="kpis" id="kpis"></div>
+      <div class="grid g2">
+        <div class="panel" style="align-self:start">
+          <div class="ph"><h2>Lease map</h2><span class="meta" id="leaseMeta"></span></div>
+          <div class="files" id="files"></div>
+          <div class="legend"><span><i class="claim soft" style="background:var(--muted)"></i>soft intent</span><span><i class="claim excl" style="background:var(--muted)"></i>exclusive lease</span><span><i class="claim touched" style="background:var(--muted)"></i>touched (heartbeat)</span><span>bar = live claimants</span></div>
+        </div>
+        <div class="grid" style="align-content:start">
+          <div class="panel">
+            <div class="ph"><h2>Agents</h2><span class="meta" id="agentMeta"></span></div>
+            <div class="scroll"><table><thead><tr><th>Agent</th><th>Task</th><th>State</th><th>Forecast</th></tr></thead><tbody id="agents"></tbody></table></div>
+          </div>
+          <div class="panel">
+            <div class="ph"><h2>Live events</h2><span class="meta">RepoCoordinator · WebSocket</span></div>
+            <div class="events" id="events" aria-live="polite"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- QUEUE -->
+    <section class="view" id="v-queue" aria-labelledby="h-queue">
+      <h1 id="h-queue">Merge queue</h1>
+      <p class="lede">The Speculative Weave: changesets merge in memory onto trunk, the merged tip is checked once, red tips are bisected, and trunk is pushed once per batch.</p>
+      <div class="panel" style="margin-bottom:16px">
+        <div class="ph"><h2>Current batch</h2><span class="meta" id="batchMeta">idle</span></div>
+        <div class="chain" id="chain"><div class="empty">No batch running. Submitted changesets wait for the next claim.</div></div>
+        <div class="steps" id="steps"></div>
+      </div>
+      <div class="lanes" id="lanes"></div>
+    </section>
+
+    <!-- CHANGESETS -->
+    <section class="view" id="v-changesets" aria-labelledby="h-cs">
+      <h1 id="h-cs">Changesets</h1>
+      <p class="lede">Every changeset carries server-written provenance, an explained risk score, and the reason it was held, rejected or landed.</p>
+      <div class="split">
+        <div class="panel"><div class="ph"><h2>All changesets</h2></div><div class="cslist" id="cslist" role="listbox" aria-label="Changesets"></div></div>
+        <div id="csdetail"><div class="panel"><div class="empty">Changesets appear here as agents submit.</div></div></div>
+      </div>
+    </section>
+
+    <!-- CONFLICTS -->
+    <section class="view" id="v-conflicts" aria-labelledby="h-cf">
+      <h1 id="h-cf">Conflict rooms</h1>
+      <p class="lede">When two changesets collide, both intents meet in one room. A resolver proposes a merge, and the same check that guards trunk decides.</p>
+      <div id="rooms"><div class="panel"><div class="empty">No collisions yet. Rooms open automatically when the queue rejects a changeset for conflict.</div></div></div>
+    </section>
+
+    <!-- CONSOLE -->
+    <section class="view" id="v-console" aria-labelledby="h-con">
+      <h1 id="h-con">Agent console</h1>
+      <p class="lede">What each agent actually sees: the <code>weft</code> CLI's JSON envelopes, hints and exit codes, as captured from the prototype demo run.</p>
+      <div class="panel">
+        <div class="ph"><h2>Session</h2><span class="meta"><label for="conAgent">agent</label> <select id="conAgent" class="mono"></select></span></div>
+        <div class="console" id="console"></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+"use strict";
+/* ---------------- static model (mirrors prototype/cli demo run) ---------------- */
+const AGENTS = {
+  atlas:{name:"atlas",model:"claude-opus-5-5",color:"#7A3CFF"},
+  birch:{name:"birch",model:"claude-sonnet-5-5",color:"#FF6A00"},
+  cedar:{name:"cedar",model:"claude-haiku-5-5",color:"#00A3B8"},
+  dune:{name:"dune",model:"claude-sonnet-5-5",color:"#FF2E88"},
+  elm:{name:"elm",model:"claude-haiku-5-5",color:"#3C7A00"}
+};
+const FILES = ["src/auth/session.js","src/billing/invoice.js","src/util/format.js","test/invoice.test.js","test/discount.test.js","test/format.test.js","test/session.test.js","CHANGELOG.md","package.json"];
+const UNION = ["CHANGELOG.md"];
+const DIFFS = {
+  "cs-0009":[["h","src/billing/invoice.js"],[" ","export function total(items) {"],[" ","  const subtotal = items.reduce((sum, item) => sum + item.price * item.qty, 0);"],["d","  return subtotal;"],["a","  return Math.round(subtotal * 1.08 * 100) / 100;"],[" ","}"],["h","test/invoice.test.js"],["d","  assert.equal(total([{ price: 10, qty: 2 }]), 20);"],["a","  assert.equal(total([{ price: 10, qty: 2 }]), 21.6);"],["h","CHANGELOG.md  (union driver)"],["a","- billing: 8% sales tax on invoice totals (atlas)"]],
+  "cs-0014":[["h","src/util/format.js"],[" ","export function pad(value, width) {"],["d",'  return String(value).padStart(width, "0");'],["a",'  return String(value).padStart(width, " ");'],[" ","}"],["a",""],["a","export function currency(cents) {"],["a","  return `$${(cents / 100).toFixed(2)}`;"],["a","}"]],
+  "cs-0016":[["h","src/billing/invoice.js"],["a","export function discount(subtotal) {"],["a","  return subtotal >= 100 ? subtotal * 0.1 : 0;"],["a","}"],["a",""],[" ","export function total(items) {"],["d","  return subtotal;"],["a","  return subtotal - discount(subtotal);"],["h","test/discount.test.js (new)"],["a","  assert.equal(total([{ price: 200, qty: 1 }]), 180);"]],
+  "cs-0011":[["h","src/auth/session.js   ⚑ sensitive path"],["d","export const SESSION_TTL_SECONDS = 86400;"],["a","export const SESSION_TTL_SECONDS = 3600;"],["h","CHANGELOG.md  (union driver)"],["a","- auth: session TTL cut to 1h (dune)"]],
+  "cs-0027":[["h","src/billing/invoice.js"],["a","export function discount(subtotal) {"],["a","  return subtotal >= 100 ? subtotal * 0.1 : 0;"],["a","}"],["d","  return Math.round(subtotal * 1.08 * 100) / 100;"],["a","  return Math.round((subtotal - discount(subtotal)) * 1.08 * 100) / 100;"],["h","test/discount.test.js (new)"],["a","  assert.equal(total([{ price: 200, qty: 1 }]), 194.4);"]],
+  "cs-0029":[["h","src/util/format.js"],[" ",'  return String(value).padStart(width, "0");'],["a","export function currency(cents) {"],["a","  return `$${(cents / 100).toFixed(2)}`;"],["a","}"]]
+};
+
+/* ---------------- script: each step is one coordinator event ---------------- */
+const SCRIPT = [
+  {t:"workspace.started",a:"atlas",ws:"ws-0004-atlas",task:"add sales tax to invoices",globs:["src/billing/**","test/invoice.test.js"],mode:"soft",fc:"none"},
+  {t:"workspace.started",a:"cedar",ws:"ws-0002-cedar",task:"add volume discount",globs:["src/billing/**"],mode:"soft",fc:"medium",peer:"atlas"},
+  {t:"workspace.started",a:"birch",ws:"ws-0003-birch",task:"add currency formatting",globs:["src/util/**"],mode:"soft",fc:"none"},
+  {t:"workspace.started",a:"dune",ws:"ws-0001-dune",task:"shorten session TTL",globs:["src/auth/**"],mode:"exclusive",fc:"none"},
+  {t:"lease.refused",a:"elm",task:"log session expiry",globs:["src/auth/session.js"],holder:"dune"},
+  {t:"workspace.heartbeat",a:"atlas",touched:["src/billing/invoice.js","test/invoice.test.js","CHANGELOG.md"]},
+  {t:"workspace.heartbeat",a:"cedar",touched:["src/billing/invoice.js","test/discount.test.js","CHANGELOG.md"],alert:"atlas"},
+  {t:"workspace.heartbeat",a:"birch",touched:["src/util/format.js","CHANGELOG.md"]},
+  {t:"workspace.heartbeat",a:"dune",touched:["src/auth/session.js","CHANGELOG.md"]},
+  {t:"changeset.submitted",a:"atlas",cs:"cs-0009",msg:"Add 8% sales tax to invoice totals",risk:16,status:"queued",factors:[["breadth",6,"3 files"],["size",0,"+3 −3"],["live_overlap",10,"1 live overlapping workspace"]],tool:14,cost:0.42},
+  {t:"changeset.submitted",a:"birch",cs:"cs-0014",msg:"Add currency() formatter",risk:4,status:"queued",factors:[["breadth",4,"2 files"],["size",0,"+6 −1"]],tool:6,cost:0.08},
+  {t:"changeset.submitted",a:"cedar",cs:"cs-0016",msg:"Add 10% volume discount",risk:32,status:"queued",factors:[["breadth",6,"3 files"],["size",1,"+13 −1"],["out_of_intent",15,"test/discount.test.js"],["live_overlap",10,"1 live overlapping workspace"]],tool:9,cost:0.03},
+  {t:"changeset.submitted",a:"dune",cs:"cs-0011",msg:"Shorten session TTL to one hour",risk:39,status:"needs_review",factors:[["breadth",4,"2 files"],["sensitive_paths",35,"src/auth/session.js"]],tool:4,cost:0.05},
+  {t:"queue.batch_started",batch:["cs-0009","cs-0014","cs-0016"],trunk:"f13823f"},
+  {t:"queue.speculate",results:{"cs-0009":"applied","cs-0014":"applied","cs-0016":"conflict"}},
+  {t:"queue.check",target:"tip",pass:false,note:"tip (0009+0014) red: format.test.js expected '007', got '  7'"},
+  {t:"queue.bisect",probe:"cs-0009",pass:true,culprit:"cs-0014"},
+  {t:"queue.batch_landed",landed:{"cs-0009":"7252f3d"},rejected:{"cs-0014":"check_failed","cs-0016":"conflict"},trunk:"7252f3d",checks:3},
+  {t:"room.opened",room:"room-01",cs:"cs-0016",peer:"cs-0009",file:"src/billing/invoice.js"},
+  {t:"changeset.approved",cs:"cs-0011",by:"mike"},
+  {t:"room.proposal",room:"room-01",pass:true},
+  {t:"changeset.submitted",a:"cedar",cs:"cs-0027",msg:"Add 10% volume discount (applied before tax)",risk:22,status:"queued",factors:[["breadth",4,"2 files"],["size",0,"+5 −1"],["out_of_intent",15,"test/discount.test.js"],["drift",2,"1 trunk commit behind"]],tool:5,cost:0.02,resolves:"cs-0016"},
+  {t:"changeset.submitted",a:"birch",cs:"cs-0029",msg:"Add currency() formatter",risk:6,status:"queued",factors:[["breadth",4,"2 files"],["size",0,"+3 −0"],["drift",2,"1 trunk commit behind"]],tool:3,cost:0.02},
+  {t:"queue.batch_started",batch:["cs-0011","cs-0027","cs-0029"],trunk:"7252f3d"},
+  {t:"queue.speculate",results:{"cs-0011":"applied","cs-0027":"applied","cs-0029":"applied"}},
+  {t:"queue.check",target:"tip",pass:true,note:"tip green: 5/5 tests"},
+  {t:"queue.batch_landed",landed:{"cs-0011":"92bd948","cs-0027":"2cd56e7","cs-0029":"2406d63"},rejected:{},trunk:"2406d63",checks:2},
+  {t:"workspace.started",a:"elm",ws:"ws-0031-elm",task:"log session expiry",globs:["src/auth/session.js"],mode:"soft",fc:"none",retry:true}
+];
+
+const CONSOLE = {
+  atlas:[
+    ["p","weft start --agent atlas --task \"add sales tax to invoices\" --touch 'src/billing/**' --touch test/invoice.test.js"],
+    ["j",'{"ok":true,"command":"start","data":{"workspace":{"id":"ws-0004-atlas","status":"active","branch":"weft/ws-0004-atlas"},"forecast":{"risk":"medium","overlaps":[{"workspaceId":"ws-0002-cedar","strength":"files","files":["src/billing/invoice.js"]}],"advice":"Another agent has declared intent on the same files. Coordinate, narrow scope, or sync often."}},"hints":["weft who <path>  # see who else is in scope","cd .weft/workspaces/ws-0004-atlas","weft status"]}'],
+    ["p","weft checkpoint -m \"wip: tax\""],["j",'{"ok":true,"command":"checkpoint","data":{"commit":"3f1c…","noop":false},"hints":[]}'],
+    ["p","weft submit -m \"Add 8% sales tax to invoice totals\" --tool-calls 14 --cost 0.42"],
+    ["j",'{"ok":true,"command":"submit","data":{"changeset":{"id":"cs-0009","status":"queued","riskScore":16}},"hints":["weft queue run","weft show cs-0009"]}']],
+  cedar:[
+    ["p","weft status"],
+    ["j",'{"ok":true,"command":"status","data":{"touched":["CHANGELOG.md","src/billing/invoice.js","test/discount.test.js"],"outOfIntent":["test/discount.test.js"],"forecast":{"risk":"medium","overlaps":[{"workspaceId":"ws-0004-atlas","strength":"files","files":["src/billing/invoice.js"]}]}},"hints":["weft widen --touch \\"test/discount.test.js\\"","weft submit -m \\"...\\""]}'],
+    ["p","weft show cs-0016"],
+    ["j",'{"ok":true,"command":"show","data":{"id":"cs-0016","status":"rejected","rejection":{"reason":"conflict","files":["src/billing/invoice.js"],"conflictsWith":[{"changesetId":"cs-0009","files":["src/billing/invoice.js"]}]}},"hints":["weft sync  # then resolve and resubmit"]}'],
+    ["p","weft sync"],
+    ["e",'{"ok":false,"command":"sync","error":{"code":"SYNC_CONFLICT","message":"sync stopped on 1 conflicted file(s)","retryable":false,"hint":"edit the files to remove conflict markers, then `weft sync --continue` (or `weft sync --abort`)","details":{"conflicts":{"files":["src/billing/invoice.js"],"peers":[{"changesetId":"cs-0009","agentId":"agt_…atlas","workspaceId":"ws-0004-atlas"}]}}}}   # exit 3'],
+    ["p","weft sync --continue"],["j",'{"ok":true,"command":"sync","data":{"action":"continued"},"hints":["weft status"]}'],
+    ["p","weft submit -m \"Add 10% volume discount (applied before tax)\""],["j",'{"ok":true,"command":"submit","data":{"changeset":{"id":"cs-0027","status":"queued","riskScore":22}},"hints":["weft queue run","weft show cs-0027"]}']],
+  dune:[
+    ["p","weft start --agent dune --task \"shorten session TTL\" --touch 'src/auth/**' --exclusive"],
+    ["j",'{"ok":true,"command":"start","data":{"workspace":{"id":"ws-0001-dune"},"forecast":{"risk":"none","overlaps":[]}},"hints":["cd .weft/workspaces/ws-0001-dune","weft status"]}'],
+    ["p","weft submit -m \"Shorten session TTL to one hour\""],
+    ["j",'{"ok":true,"command":"submit","data":{"changeset":{"id":"cs-0011","status":"needs_review","riskScore":39,"risk":[{"name":"sensitive_paths","weight":35,"detail":"src/auth/session.js"}]}},"hints":["weft approve cs-0011 --by <human>  # risk 39"]}']],
+  elm:[
+    ["p","weft start --agent elm --task \"log session expiry\" --touch src/auth/session.js"],
+    ["e",'{"ok":false,"command":"start","error":{"code":"LEASE_HELD","message":"an exclusive intent overlaps the requested scope","retryable":true,"hint":"narrow --touch, wait for the holder to land, or start in soft mode","details":{"blocking":[{"workspaceId":"ws-0001-dune","mode":"exclusive","strength":"files","files":["src/auth/session.js"]}]}}}   # exit 4']],
+  birch:[
+    ["p","weft show cs-0014"],
+    ["j",'{"ok":true,"command":"show","data":{"id":"cs-0014","status":"rejected","rejection":{"reason":"check_failed","detail":"check failed on the merged result (bisected in 1 step(s)): … actual: \'  7\' expected: \'007\'","logPath":".weft/logs/shop/check-…log"}}}'],
+    ["p","weft submit -m \"Add currency() formatter\""],["j",'{"ok":true,"command":"submit","data":{"changeset":{"id":"cs-0029","status":"queued","riskScore":6}}}']]
+};
+
+/* ---------------- state + reducer ---------------- */
+let S, step = 0, timer = null, playing = true, selectedCs = null, newSeq = -1;
+const reset = () => {
+  S = {ws:{}, cs:{}, order:[], events:[], trunk:"f13823f", commits:1, batch:null, rooms:{}, refused:{}, landedToday:126, checksSaved:0, conflictsEarly:0, seq:0};
+  step = 0; newSeq = -1;
+};
+const now = () => { const d = new Date(Date.now()); return d.toTimeString().slice(0,8); };
+const globRe = g => new RegExp("^" + g.replace(/[.+^$()|[\]\\]/g,"\\$&").replace(/\*\*\//g,"(?:.*/)?").replace(/\*\*/g,".*").replace(/(?<!\.)\*/g,"[^/]*") + (/[*?]/.test(g) ? "$" : "(?:/.*)?$"));
+const matches = (p, globs) => globs.some(g => globRe(g).test(p));
+const log = (type, actor, detail) => { S.seq += 1; S.events.unshift({seq:S.seq, at:now(), type, actor, detail}); newSeq = S.seq; };
+
+const apply = (e) => {
+  switch (e.t) {
+    case "workspace.started":
+      S.ws[e.a] = {agent:e.a, id:e.ws, task:e.task, globs:e.globs, mode:e.mode, touched:[], state:"active", fc:e.fc, peer:e.peer || null};
+      delete S.refused[e.a];
+      log("workspace.started", e.a, `${e.ws} · ${e.mode} ${e.globs.join(", ")} · forecast ${e.fc}${e.peer ? " (overlaps " + e.peer + ")" : ""}${e.retry ? " · lease freed after dune landed" : ""}`);
+      if (e.fc === "medium") toast(`${e.a} started in scope already declared by ${e.peer}. Forecast: medium.`);
+      break;
+    case "lease.refused":
+      S.refused[e.a] = {task:e.task, globs:e.globs, holder:e.holder};
+      log("lease.refused", e.a, `LEASE_HELD (exit 4) · ${e.globs[0]} exclusively held by ${e.holder}`);
+      break;
+    case "workspace.heartbeat":
+      S.ws[e.a].touched = e.touched;
+      if (e.alert) { S.ws[e.a].fc = "high"; S.conflictsEarly += 1; S.ws[e.alert].fc = "high"; S.ws[e.alert].peer = e.a; }
+      log("workspace.heartbeat", e.a, `touched ${e.touched.length} files${e.alert ? " · ALERT: " + e.alert + " already modified src/billing/invoice.js" : ""}`);
+      if (e.alert) toast(`Collision forecast: ${e.a} and ${e.alert} both modified src/billing/invoice.js. Neither has submitted yet.`);
+      break;
+    case "changeset.submitted": {
+      const ws = S.ws[e.a];
+      S.cs[e.cs] = {id:e.cs, agent:e.a, ws:ws.id, msg:e.msg, risk:e.risk, status:e.status, factors:e.factors, task:ws.task, globs:ws.globs.slice(), files:ws.touched.slice(), tool:e.tool, cost:e.cost, landed:null, rejection:null, approvedBy:null, resolves:e.resolves || null, submittedAt:now()};
+      S.order.unshift(e.cs);
+      ws.state = "submitted"; ws.cs = e.cs;
+      log("changeset.submitted", e.a, `${e.cs} · risk ${e.risk} · ${e.status === "needs_review" ? "held for review (sensitive path)" : "queued"}`);
+      if (!selectedCs) selectedCs = e.cs;
+      break; }
+    case "queue.batch_started":
+      S.batch = {ids:e.batch, trunk:e.trunk, results:{}, stage:"claim", check:null, bisect:null};
+      e.batch.forEach(id => S.cs[id].status = "validating");
+      log("queue.batch_started", "merge-queue", `claim ${e.batch.join(", ")} on trunk ${e.trunk}`);
+      break;
+    case "queue.speculate":
+      S.batch.results = e.results; S.batch.stage = "speculate";
+      log("queue.speculate", "merge-runner", Object.entries(e.results).map(([k,v]) => `${k} ${v}`).join(" · "));
+      break;
+    case "queue.check":
+      S.batch.check = {pass:e.pass, note:e.note}; S.batch.stage = "check";
+      log("queue.check", "check-sandbox", e.note);
+      break;
+    case "queue.bisect":
+      S.batch.bisect = e; S.batch.stage = "bisect";
+      log("queue.bisect", "merge-queue", `probe prefix [${e.probe}] → green · culprit ${e.culprit}`);
+      break;
+    case "queue.batch_landed":
+      Object.entries(e.landed).forEach(([id, sha]) => { const c = S.cs[id]; c.status = "landed"; c.landed = sha; S.ws[c.agent].state = "landed"; S.commits += 1; S.landedToday += 1; });
+      Object.entries(e.rejected).forEach(([id, why]) => { const c = S.cs[id]; c.status = "rejected"; c.rejection = why; S.ws[c.agent].state = "active"; });
+      S.trunk = e.trunk; S.batch.stage = "land"; S.batch.done = true;
+      S.checksSaved += Object.keys(e.landed).length + Object.keys(e.rejected).length - e.checks;
+      log("queue.batch_landed", "merge-queue", `landed ${Object.keys(e.landed).join(", ") || "—"} · rejected ${Object.entries(e.rejected).map(([k,v]) => k + " (" + v + ")").join(", ") || "—"} · ${e.checks} check runs · trunk → ${e.trunk}`);
+      toast(`Batch landed ${Object.keys(e.landed).length}, rejected ${Object.keys(e.rejected).length}. Trunk is now ${e.trunk}.`);
+      break;
+    case "room.opened":
+      S.rooms[e.room] = {id:e.room, cs:e.cs, peer:e.peer, file:e.file, state:"open", proposal:null};
+      log("room.opened", "coordinator", `${e.room} · ${e.cs} (cedar) vs ${e.peer} (atlas) on ${e.file}`);
+      break;
+    case "room.proposal":
+      S.rooms[e.room].state = "verified"; S.rooms[e.room].proposal = e.pass;
+      log("room.proposal", "resolver", `${e.room} · candidate merges discount before tax · check green 4/4 · sent to cedar`);
+      break;
+    case "changeset.approved":
+      S.cs[e.cs].status = "queued"; S.cs[e.cs].approvedBy = e.by;
+      log("changeset.approved", e.by, `${e.cs} released from review`);
+      break;
+  }
+};
+
+/* ---------------- rendering ---------------- */
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const av = a => `<span class="av" style="background:${AGENTS[a].color}" aria-hidden="true">${a[0].toUpperCase()}</span>`;
+const agent = a => `<span class="agent">${av(a)}${a}</span>`;
+const pill = (txt, cls) => `<span class="pill ${cls}">${txt}</span>`;
+const statusPill = s => ({queued:pill("◷ queued","s-info"), needs_review:pill("⚑ needs review","s-warn"), validating:pill("⟳ validating","s-info"), landed:pill("✓ landed","s-ok"), rejected:pill("✕ rejected","s-bad"), active:pill("● active","s-info"), submitted:pill("◷ submitted","s-info"), refused:pill("✕ lease held","s-bad")}[s] || pill(s,"s-mut"));
+const fcPill = f => ({none:pill("none","s-ok"), low:pill("low","s-ok"), medium:pill("▲ medium","s-warn"), high:pill("▲▲ high","s-bad")}[f] || "—");
+
+function renderKpis() {
+  const live = Object.values(S.ws).filter(w => w.state !== "landed").length;
+  const queued = Object.values(S.cs).filter(c => ["queued","validating","needs_review"].includes(c.status)).length;
+  const total = Object.values(S.cs).filter(c => c.status === "landed" || c.status === "rejected").length;
+  const k = [
+    [live, "live agents", `${Object.keys(S.refused).length} waiting on a lease`],
+    [queued, "in queue", `${Object.values(S.cs).filter(c => c.status === "needs_review").length} need review`],
+    [S.landedToday, "landed today", `trunk ${S.trunk}`],
+    [S.checksSaved, "check runs saved", total ? `vs serial · ${total} processed` : "batching not yet run"],
+    [S.conflictsEarly, "collisions caught pre-submit", "via heartbeats"],
+    [Object.keys(S.rooms).length, "conflict rooms", Object.values(S.rooms).filter(r => r.state === "verified").length + " verified"]
+  ];
+  $("kpis").innerHTML = k.map(([b, s, m]) => `<div class="kpi"><b>${b}</b><span>${s}</span><small>${esc(m)}</small></div>`).join("");
+}
+
+function renderFiles() {
+  const live = Object.values(S.ws).filter(w => w.state !== "landed");
+  $("files").innerHTML = FILES.map(f => {
+    const cl = live.filter(w => matches(f, w.globs) || w.touched.includes(f));
+    const union = UNION.includes(f);
+    const marks = cl.map(w => `<span class="claim ${w.mode === "exclusive" ? "excl" : "soft"} ${w.touched.includes(f) ? "touched" : ""}" style="background:${AGENTS[w.agent].color}" title="${w.agent}: ${w.mode}${w.touched.includes(f) ? ", touched" : ""}"></span>`).join("");
+    const contested = !union && cl.filter(w => w.touched.includes(f)).length > 1;
+    const heat = Math.min(100, cl.length * 34);
+    return `<div class="row"><div><div class="path">${esc(f)} ${union ? pill("union","s-mut") : ""} ${contested ? pill("contested","s-bad") : ""}</div><div class="heat"><i style="width:${union ? 0 : heat}%"></i></div></div><div class="claims">${marks || '<span class="pill s-mut">free</span>'}</div></div>`;
+  }).join("");
+  $("leaseMeta").textContent = `${live.length} live intents · ${FILES.length} files`;
+}
+
+function renderAgents() {
+  const rows = Object.values(S.ws).map(w => `<tr><td>${agent(w.agent)}<div class="mono" style="color:var(--muted)">${AGENTS[w.agent].model}</div></td><td>${esc(w.task)}<div class="mono" style="color:var(--muted)">${esc(w.globs.join(" "))}${w.mode === "exclusive" ? " · exclusive" : ""}</div></td><td>${statusPill(w.state)}</td><td>${w.state === "landed" ? "—" : fcPill(w.fc)}${w.peer && w.state !== "landed" ? `<div class="mono" style="color:var(--muted)">vs ${w.peer}</div>` : ""}</td></tr>`);
+  Object.entries(S.refused).forEach(([a, r]) => rows.push(`<tr><td>${agent(a)}<div class="mono" style="color:var(--muted)">${AGENTS[a].model}</div></td><td>${esc(r.task)}<div class="mono" style="color:var(--muted)">${esc(r.globs.join(" "))}</div></td><td>${statusPill("refused")}</td><td><div class="mono">held by ${r.holder}</div></td></tr>`));
+  $("agents").innerHTML = rows.join("") || `<tr><td colspan="4" class="empty">Waiting for agents to start…</td></tr>`;
+  $("agentMeta").textContent = `${Object.keys(S.ws).length + Object.keys(S.refused).length} agents`;
+}
+
+function renderEvents() {
+  $("events").innerHTML = S.events.slice(0, 60).map(e => `<div class="ev ${e.seq === newSeq ? "new" : ""}"><span class="t">${e.at.slice(3)}</span><span>${esc(e.type)} · <b>${esc(e.actor)}</b></span><span class="d">${esc(e.detail)}</span></div>`).join("") || `<div class="empty">No events yet.</div>`;
+}
+
+function renderQueue() {
+  const b = S.batch;
+  if (b) {
+    const nodes = [`<div class="node trunk"><div class="id">trunk ${b.trunk}</div><div class="msg">base of batch</div></div>`];
+    b.ids.forEach(id => {
+      const c = S.cs[id], r = b.results[id];
+      let cls = "", tag = pill("pending","s-mut");
+      if (r === "conflict") { cls = "warn"; tag = pill("✕ conflict","s-warn"); }
+      else if (r === "applied") { cls = ""; tag = pill("merged in memory","s-info"); }
+      if (b.bisect && b.bisect.culprit === id) { cls = "bad"; tag = pill("✕ culprit (bisect)","s-bad"); }
+      if (b.bisect && b.bisect.probe === id) { cls = "ok"; tag = pill("✓ prefix green","s-ok"); }
+      if (b.done && c.status === "landed") { cls = "ok"; tag = pill("✓ landed " + c.landed,"s-ok"); }
+      nodes.push(`<div class="node ${cls}"><div class="id">${id}</div><div class="msg">${esc(c.msg)}</div>${agent(c.agent)}<div style="margin-top:6px">${tag}</div></div>`);
+    });
+    if (b.check) nodes.push(`<div class="node ${b.check.pass ? "ok" : "bad"}"><div class="id">merged tip</div><div class="msg">${esc(b.check.note)}</div>${b.check.pass ? pill("✓ check green","s-ok") : pill("✕ check red","s-bad")}</div>`);
+    $("chain").innerHTML = nodes.join("");
+    const order = ["claim","speculate","check","bisect","land"];
+    const at = order.indexOf(b.stage);
+    $("steps").innerHTML = order.map((s, i) => `<span class="step ${i < at || b.done ? "done" : i === at ? "cur" : ""}">${i + 1}. ${s}${s === "bisect" && !b.bisect && at > 2 ? " (skipped)" : ""}</span>`).join("");
+    $("batchMeta").textContent = b.done ? "batch complete" : `stage: ${b.stage}`;
+  }
+  const lanes = [["needs_review","Needs review"],["queued","Queued"],["validating","Validating"],["landed","Landed"],["rejected","Rejected"]];
+  $("lanes").innerHTML = lanes.map(([k, label]) => {
+    const items = S.order.map(id => S.cs[id]).filter(c => c.status === k);
+    return `<div class="lane"><h3>${label}<span>${items.length}</span></h3>${items.map(c => `<div class="card" tabindex="0" data-cs="${c.id}"><div class="id">${c.id} · risk ${c.risk}</div><div class="msg">${esc(c.msg)}</div>${agent(c.agent)}${c.rejection ? `<div style="margin-top:6px">${pill(c.rejection,"s-bad")}</div>` : ""}${c.approvedBy ? `<div style="margin-top:6px">${pill("approved · " + c.approvedBy,"s-ok")}</div>` : ""}</div>`).join("") || '<div class="empty">—</div>'}</div>`;
+  }).join("");
+}
+
+function renderCsList() {
+  $("cslist").innerHTML = S.order.map(id => { const c = S.cs[id]; return `<button role="option" aria-selected="${id === selectedCs}" data-cs="${id}"><div class="id">${id} ${statusPill(c.status)}</div><div>${esc(c.msg)}</div><div style="margin-top:4px">${agent(c.agent)}</div></button>`; }).join("") || '<div class="empty">None yet.</div>';
+}
+
+function renderCsDetail() {
+  const c = S.cs[selectedCs];
+  if (!c) return;
+  const max = 40;
+  const rej = c.rejection === "conflict"
+    ? `<div class="note" style="color:var(--bad)">Rejected for <b>conflict</b> in src/billing/invoice.js with <b>cs-0009</b> (atlas, landed). A conflict room opened automatically.</div>`
+    : c.rejection === "check_failed"
+    ? `<div class="note" style="color:var(--bad)">Rejected: <b>check failed on the merged tree</b>, culprit found by bisection in 1 step. <span class="mono">format.test.js: expected '007', actual '  7'</span></div>` : "";
+  const trailers = c.landed ? `${esc(c.msg)}\n\nWeft-Changeset: ${c.id}\nWeft-Agent: ${c.agent}\nWeft-Model: ${AGENTS[c.agent].model}\nWeft-Task: ${esc(c.task)}\nWeft-Workspace: ${c.ws}\nWeft-Risk: ${c.risk}${c.approvedBy ? "\nWeft-Approved-By: " + c.approvedBy : ""}${c.resolves ? "\nWeft-Resolves: " + c.resolves : ""}` : null;
+  const actions = c.status === "needs_review" ? `<button class="btn pri" data-act="approve" data-cs="${c.id}">Approve</button>` : c.status === "landed" ? `<button class="btn dng" data-act="revert" data-cs="${c.id}">Revert on trunk</button>` : c.rejection === "conflict" ? `<button class="btn" data-act="room">Open conflict room</button>` : "";
+  $("csdetail").innerHTML = `
+    <div class="panel" style="margin-bottom:16px">
+      <div class="ph"><h2>${c.id}</h2>${statusPill(c.status)}<span class="meta">${actions}</span></div>
+      <div class="pb" style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
+        <div style="flex:1;min-width:220px"><div style="font-size:17px;font-weight:700">${esc(c.msg)}</div><div style="margin-top:6px">${agent(c.agent)} <span class="mono" style="color:var(--muted)">· ${AGENTS[c.agent].model} · ${c.ws}</span></div></div>
+        <div style="text-align:right"><div class="riskbig">${c.risk}</div><div class="mono" style="color:var(--muted)">risk / 100</div></div>
+      </div>
+      ${rej}
+      <dl class="kv" style="margin:0">
+        <div><dt>Task</dt><dd>${esc(c.task)}</dd></div>
+        <div><dt>Declared intent</dt><dd>${esc(c.globs.join(" "))}</dd></div>
+        <div><dt>Files touched</dt><dd>${esc(c.files.join(", "))}</dd></div>
+        <div><dt>Tool calls · cost</dt><dd>${c.tool} · $${c.cost.toFixed(2)}</dd></div>
+        <div><dt>Landed as</dt><dd>${c.landed || "—"}</dd></div>
+        <div><dt>Review</dt><dd>${c.approvedBy ? "approved by " + c.approvedBy : c.status === "needs_review" ? "waiting: sensitive path policy" : "auto (risk below 60)"}</dd></div>
+      </dl>
+    </div>
+    <div class="grid g2">
+      <div class="panel"><div class="ph"><h2>Diff</h2><span class="meta">${c.files.length} files</span></div><div class="diff">${(DIFFS[c.id] || []).map(([k, t]) => k === "h" ? `<div class="h">${esc(t)}</div>` : `<div class="${k === "a" ? "a" : k === "d" ? "d" : ""}">${k === "a" ? "+" : k === "d" ? "−" : " "} ${esc(t)}</div>`).join("")}</div></div>
+      <div class="grid" style="align-content:start">
+        <div class="panel"><div class="ph"><h2>Risk factors</h2><span class="meta">threshold 60 · sensitive → human</span></div><div style="padding:8px 0">${c.factors.map(([n, w, d]) => `<div class="risk"><span>${n}</span><span class="bar" title="${esc(d)}"><i style="width:${Math.min(100, w / max * 100)}%"></i></span><b>${w}</b></div><div class="note" style="padding:0 12px 4px 170px">${esc(d)}</div>`).join("")}</div></div>
+        <div class="panel"><div class="ph"><h2>Server-written provenance</h2></div>${trailers ? `<pre class="trailers">${trailers}</pre>` : `<div class="empty">Trailers are written by the merge queue when the changeset lands. Agents cannot write or forge them.</div>`}</div>
+      </div>
+    </div>`;
+}
+
+function renderRooms() {
+  const rooms = Object.values(S.rooms);
+  if (!rooms.length) return;
+  $("rooms").innerHTML = rooms.map(r => `
+    <div class="panel">
+      <div class="ph"><h2>${r.id} · ${esc(r.file)}</h2>${r.state === "verified" ? pill("✓ resolution verified","s-ok") : pill("● open","s-warn")}<span class="meta">${r.cs} (cedar) vs ${r.peer} (atlas, landed)</span></div>
+      <div class="room pb">
+        <div class="panel side"><h4>${av("atlas")} atlas · landed ${r.peer}</h4><div class="note">Intent: add sales tax to invoices · src/billing/**</div><pre>  return <b>Math.round(subtotal * 1.08 * 100) / 100</b>;</pre></div>
+        <div class="panel side"><h4>${av("cedar")} cedar · rejected ${r.cs}</h4><div class="note">Intent: add volume discount · src/billing/**</div><pre>  return <b>subtotal - discount(subtotal)</b>;</pre></div>
+        <div class="panel side"><h4>resolver proposal</h4><div class="note">Both intents hold: discount first, then tax.</div><pre>${r.proposal === null ? "  … proposing" : "  return Math.round(\n    (subtotal - discount(subtotal))\n      * 1.08 * 100) / 100;"}</pre></div>
+      </div>
+      <div class="verdict">${r.proposal === null ? pill("waiting for resolver","s-mut") : pill("✓ check on trunk + candidate: 4/4 tests","s-ok")}<span class="note" style="padding:0">The model proposes, and the check decides. The candidate goes to cedar's workspace and lands as <b>cs-0027</b> with <code>Weft-Resolves: cs-0016</code>.</span><span class="sp"></span>${r.proposal ? `<button class="btn pri" data-act="toast" data-msg="Applied to ws-0002-cedar. cedar resubmitted as cs-0027.">Apply to cedar's workspace</button>` : ""}</div>
+    </div>`).join("");
+}
+
+function renderConsole() {
+  const a = $("conAgent").value || "atlas";
+  $("console").innerHTML = (CONSOLE[a] || []).map(([k, t]) => k === "p" ? `<div><span class="p">$</span> ${esc(t)}</div>` : `<div class="${k}">${esc(t)}</div>`).join("");
+}
+
+function render() {
+  renderKpis(); renderFiles(); renderAgents(); renderEvents(); renderQueue(); renderCsList(); renderCsDetail(); renderRooms();
+  $("trunkSha").textContent = S.trunk; $("trunkCount").textContent = S.commits;
+  $("liveTxt").textContent = `${playing ? "LIVE" : "PAUSED"} · step ${step}/${SCRIPT.length}`;
+  $("live").classList.toggle("paused", !playing);
+  $("nb-agents").textContent = Object.values(S.ws).filter(w => w.state !== "landed").length;
+  $("nb-queue").textContent = Object.values(S.cs).filter(c => ["queued","validating","needs_review"].includes(c.status)).length;
+  $("nb-cs").textContent = S.order.length;
+  $("nb-rooms").textContent = Object.keys(S.rooms).length;
+}
+
+/* ---------------- controls ---------------- */
+let toastTimer = null;
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.style.display = "block"; clearTimeout(toastTimer); toastTimer = setTimeout(() => t.style.display = "none", 3800); }
+function tick() { if (step >= SCRIPT.length) { setPlaying(false); return; } apply(SCRIPT[step]); step += 1; render(); }
+function setPlaying(p) {
+  playing = p; $("playBtn").textContent = p ? "Pause" : "Play"; $("playBtn").setAttribute("aria-pressed", String(p));
+  clearInterval(timer); if (p) timer = setInterval(tick, 1700); render();
+}
+$("playBtn").onclick = () => setPlaying(!playing);
+$("stepBtn").onclick = () => { setPlaying(false); tick(); };
+$("replayBtn").onclick = () => { reset(); selectedCs = null; render(); setPlaying(true); };
+$("themeBtn").onclick = () => {
+  const root = document.documentElement, cur = root.getAttribute("data-theme");
+  const dark = cur ? cur === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  root.setAttribute("data-theme", dark ? "light" : "dark");
+  try { localStorage.setItem("weft-theme", dark ? "light" : "dark"); } catch (err) { /* storage unavailable: theme still applies for this view */ }
+};
+try { const t = localStorage.getItem("weft-theme"); if (t) document.documentElement.setAttribute("data-theme", t); } catch (err) { /* storage unavailable */ }
+document.querySelectorAll(".nav button").forEach(b => b.onclick = () => show(b.dataset.view));
+function show(v) {
+  document.querySelectorAll(".nav button").forEach(b => { if (b.dataset.view === v) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current"); });
+  document.querySelectorAll(".view").forEach(s => s.classList.toggle("on", s.id === "v-" + v));
+  if (v === "console") renderConsole();
+}
+document.addEventListener("click", e => {
+  const el = e.target.closest("[data-cs],[data-act]");
+  if (!el) return;
+  if (el.dataset.act === "approve") { apply({t:"changeset.approved", cs:el.dataset.cs, by:"you"}); render(); toast(`${el.dataset.cs} approved and queued.`); return; }
+  if (el.dataset.act === "revert") { toast(`Revert of ${el.dataset.cs} enqueued: one 3-way merge (base = landed commit) plus a compare-and-swap on main.`); return; }
+  if (el.dataset.act === "room") { show("conflicts"); return; }
+  if (el.dataset.act === "toast") { toast(el.dataset.msg); return; }
+  if (el.dataset.cs) { selectedCs = el.dataset.cs; renderCsList(); renderCsDetail(); show("changesets"); }
+});
+document.addEventListener("keydown", e => { if ((e.key === "Enter" || e.key === " ") && e.target.matches(".card[data-cs]")) { e.preventDefault(); e.target.click(); } });
+$("conAgent").innerHTML = Object.keys(CONSOLE).map(a => `<option value="${a}">${a}</option>`).join("");
+$("conAgent").onchange = renderConsole;
+
+// Deep links for demos and screenshots: #view=queue&step=18 (step=all jumps to the end, paused),
+// or a bare view token (#queue, #conflicts …) that opens that view at the end of the run.
+reset(); render();
+const rawHash = location.hash.slice(1);
+const VIEWS = ["swarm", "queue", "changesets", "conflicts", "console"];
+const params = VIEWS.includes(rawHash) ? new URLSearchParams(`view=${rawHash}&step=all`) : new URLSearchParams(rawHash);
+const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const jump = params.get("step");
+const target = jump === "all" || (reduced && !jump) ? SCRIPT.length : jump ? Math.min(SCRIPT.length, Math.max(0, parseInt(jump, 10) || 0)) : 0;
+while (step < target) { apply(SCRIPT[step]); step += 1; }
+if (params.get("cs")) selectedCs = params.get("cs");
+if (params.get("agent")) $("conAgent").value = params.get("agent");
+if (params.get("view")) show(params.get("view"));
+setPlaying(!jump && !reduced);
+render();
+</script>
+</body>
+</html>
