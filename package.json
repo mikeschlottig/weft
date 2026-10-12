@@ -1,0 +1,20 @@
+{
+  "name": "weft",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Weft — coordination-first version control for many agents, on Cloudflare Workers + Artifacts.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3",
+    "wrangler": "4.149.0"
+  }
+}
