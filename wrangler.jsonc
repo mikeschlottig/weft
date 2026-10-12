@@ -1,0 +1,46 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "weft",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-10-08",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "assets": { "directory": "./web", "binding": "ASSETS", "run_worker_first": ["/v1/*", "/mcp", "/healthz"] },
+
+  // Artifacts: trunk + one fork per workspace, all in the "weft" namespace.
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "weft" }],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "REPO", "class_name": "RepoCoordinator" },
+      { "name": "MERGE_RUNNER", "class_name": "MergeRunner" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RepoCoordinator", "MergeRunner"] }],
+
+  // The only trunk writer: real git in a Container, one instance per repo.
+  "containers": [
+    {
+      "class_name": "MergeRunner",
+      "image": "./container/Dockerfile",
+      "image_build_context": ".",
+      "max_instances": 10,
+      "instance_type": "basic"
+    }
+  ],
+
+  "workflows": [{ "name": "weft-merge-queue", "binding": "MERGE_QUEUE", "class_name": "MergeQueue" }],
+
+  "queues": {
+    "producers": [{ "binding": "JOBS", "queue": "weft-jobs" }],
+    "consumers": [{ "queue": "weft-jobs", "max_batch_size": 50, "max_batch_timeout": 2 }]
+  },
+
+  "d1_databases": [{ "binding": "DB", "database_name": "weft-index", "database_id": "c9956b9e-91ce-4812-b7a2-070a6ffcc7d5", "migrations_dir": "migrations" }],
+  "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "weft-blobs" }],
+  "ai": { "binding": "AI" },
+  "analytics_engine_datasets": [{ "binding": "METRICS", "dataset": "weft_events" }],
+
+  "secrets": { "required": ["ADMIN_TOKEN", "JWT_SIGNING_SECRET"] },
+  "vars": { "PUBLIC_READ": "true" }
+}

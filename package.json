@@ -2,11 +2,11 @@
   "name": "weft",
   "version": "0.1.0",
   "private": true,
-  "description": "Weft — coordination-first version control for many agents, on Cloudflare Workers + Artifacts.",
+  "description": "Weft \u2014 coordination-first version control for many agents, on Cloudflare Workers + Artifacts.",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "types": "wrangler types",
@@ -16,5 +16,14 @@
     "@types/node": "24.10.1",
     "typescript": "5.9.3",
     "wrangler": "4.149.0"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "agents": "^0.28.0",
+    "zod": "^4.6.7"
+  },
+  "bin": {
+    "weft": "./cli/weft.ts"
   }
 }
