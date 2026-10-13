@@ -7,6 +7,69 @@ import { withRetry } from "../core/retry.ts";
 
 const FRESH = { retryable: isRetryableFreshArtifactsError, attempts: 5, baseMs: 300 } as const;
 
+// ---- D7: namespace sharding. Shard k is the Artifacts binding ARTIFACTS (k = 0) or ARTIFACTS_S<k>, each bound to
+// its own namespace (Artifacts limits control-plane calls per namespace: 2,000 requests / 10 s). A repo and all of
+// its forks live in one shard, chosen at `init` (stable hash, recorded in D1 `repos.shard` and the coordinator's
+// meta). Repos created before sharding are shard 0. Callers register the shard before any Artifacts call.
+
+const shardOfRepo = new Map<string, number>();
+
+/** Fork names are `<trunk>--<ws>` (trunk names are ≤ 41 chars, so the prefix survives fork-name hashing). */
+export const trunkName = (name: string): string => name.split("--")[0] ?? name;
+
+export const registerShard = (repo: string, shard: number): void => {
+  shardOfRepo.set(trunkName(repo), shard);
+};
+
+/** Shards this deployment has bindings for (ARTIFACTS_SHARDS, default 1). */
+export const shardCount = (env: Env): number => Math.max(1, Math.min(8, Number((env as unknown as { ARTIFACTS_SHARDS?: string }).ARTIFACTS_SHARDS ?? "1") || 1));
+
+/** Stable placement for a new repo (FNV-1a of the name). */
+export const pickShard = (repo: string, shards: number): number => {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < repo.length; i += 1) {
+    h ^= repo.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h % Math.max(1, shards);
+};
+
+export const namespaceBinding = (env: Env, shard: number): Artifacts => {
+  const b = shard === 0 ? env.ARTIFACTS : (env as unknown as Record<string, Artifacts | undefined>)[`ARTIFACTS_S${shard}`];
+  if (!b) throw new WeftError("INTERNAL", `no Artifacts binding for shard ${shard} (ARTIFACTS_S${shard})`);
+  return b;
+};
+
+// D7 limits dashboard: control-plane calls per trunk in this isolate over the last 10 s (a coordinator's own
+// calls run in its isolate, so for the coordinator this is its true rate; retries are counted, they are calls).
+const callLog = new Map<string, number[]>();
+export const artifactsCalls10s = (repo: string): number => {
+  const t = Date.now() - 10_000;
+  const xs = (callLog.get(trunkName(repo)) ?? []).filter((x) => x > t);
+  callLog.set(trunkName(repo), xs);
+  return xs.length;
+};
+
+const ns = (env: Env, name: string): Artifacts => {
+  const t = trunkName(name);
+  const xs = callLog.get(t) ?? [];
+  xs.push(Date.now());
+  if (xs.length > 4_000) xs.splice(0, xs.length - 4_000);
+  callLog.set(t, xs);
+  return namespaceBinding(env, shardOfRepo.get(t) ?? 0);
+};
+
+/** Look up (and register) a repo's shard from D1 when this isolate has not seen it. Unknown → 0 (legacy). */
+export const resolveShard = async (env: Env, repo: string): Promise<number> => {
+  const t = trunkName(repo);
+  const known = shardOfRepo.get(t);
+  if (known !== undefined) return known;
+  const row = await env.DB.prepare("SELECT shard FROM repos WHERE id = ?").bind(t).first<{ shard: number | null }>();
+  const shard = row?.shard ?? 0;
+  shardOfRepo.set(t, shard);
+  return shard;
+};
+
 const wrap = (err: unknown, what: string): WeftError => {
   const c = codeOf(err);
   if (err instanceof WeftError) return err;
@@ -39,17 +102,17 @@ export const forkName = (trunk: string, wsId: string): string => {
 export const headerToken = (plaintext: string): string => plaintext.split("?expires=")[0] ?? plaintext;
 
 export const createTrunk = (env: Env, repo: string, description: string): Promise<ArtifactsCreateRepoResult> =>
-  call(`create ${repo}`, () => env.ARTIFACTS.create(repo, { setDefaultBranch: "main", description }));
+  call(`create ${repo}`, () => ns(env, repo).create(repo, { setDefaultBranch: "main", description }));
 
 /** FR-39: import an external git remote (public HTTPS) as the trunk repo. */
 export const importTrunk = (env: Env, repo: string, url: string, branch: string | undefined, description: string): Promise<ArtifactsCreateRepoResult> =>
-  call(`import ${url} -> ${repo}`, () => env.ARTIFACTS.import({ source: { url, ...(branch ? { branch } : {}) }, target: { name: repo, opts: { description } } }));
+  call(`import ${url} -> ${repo}`, () => ns(env, repo).import({ source: { url, ...(branch ? { branch } : {}) }, target: { name: repo, opts: { description } } }));
 
 /** An import is asynchronous: `get()` throws IMPORT_IN_PROGRESS until it is ready. Wait (≈ 60 s budget). */
 export const awaitImported = async (env: Env, name: string): Promise<ArtifactsRepoInfo> => {
   for (let i = 1; ; i += 1) {
     try {
-      using r = await env.ARTIFACTS.get(name);
+      using r = await ns(env, name).get(name);
       return await r.info();
     } catch (err: unknown) {
       const c = codeOf(err);
@@ -62,14 +125,14 @@ export const awaitImported = async (env: Env, name: string): Promise<ArtifactsRe
 
 export const repoInfo = (env: Env, name: string, fresh = false): Promise<ArtifactsRepoInfo> =>
   call(`info ${name}`, async () => {
-    using r = await env.ARTIFACTS.get(name);
+    using r = await ns(env, name).get(name);
     return r.info();
   }, fresh);
 
 export const forkFrom = async (env: Env, trunk: string, name: string, description: string, allBranches = false): Promise<{ remote: string }> => {
   try {
     const res = await call(`fork ${trunk} -> ${name}`, async () => {
-      using r = await env.ARTIFACTS.get(trunk);
+      using r = await ns(env, trunk).get(trunk);
       return r.fork(name, { defaultBranchOnly: !allBranches, description });
     });
     return { remote: res.remote };
@@ -109,20 +172,20 @@ export const provisionFork = async (
 /** `fresh`: the repo was created by Weft in this same request — retry NOT_FOUND (read-after-create lag). */
 export const mintToken = (env: Env, name: string, scope: "read" | "write", ttl: number, fresh = false): Promise<ArtifactsCreateTokenResult> =>
   call(`token ${scope} ${name}`, async () => {
-    using r = await env.ARTIFACTS.get(name);
+    using r = await ns(env, name).get(name);
     return r.createToken(scope, ttl);
   }, fresh);
 
 export const revokeToken = (env: Env, name: string, tokenId: string): Promise<boolean> =>
   call(`revoke ${name}`, async () => {
-    using r = await env.ARTIFACTS.get(name);
+    using r = await ns(env, name).get(name);
     return r.revokeToken(tokenId);
   });
 
 /** FR-40 kill switch: revoke every active token on a repo (agents may hold several after refreshes). */
 export const revokeAllTokens = (env: Env, name: string): Promise<number> =>
   call(`revoke-all ${name}`, async () => {
-    using r = await env.ARTIFACTS.get(name);
+    using r = await ns(env, name).get(name);
     const list = await r.listTokens();
     let n = 0;
     for (const t of list.tokens.filter((x) => x.state === "active")) if (await r.revokeToken(t.id)) n += 1;
@@ -131,14 +194,14 @@ export const revokeAllTokens = (env: Env, name: string): Promise<number> =>
 
 export const headOf = (env: Env, name: string, ref = "main"): Promise<string | null> =>
   call(`log ${name}`, async () => {
-    using r = await env.ARTIFACTS.get(name);
+    using r = await ns(env, name).get(name);
     const log = await r.log({ ref, limit: 1 });
     return log[0]?.hash ?? null;
   });
 
 export const trunkLog = (env: Env, name: string, limit: number): Promise<ArtifactsCommitMetadata[]> =>
   call(`log ${name}`, async () => {
-    using r = await env.ARTIFACTS.get(name);
+    using r = await ns(env, name).get(name);
     return r.log({ ref: "main", limit });
   });
 
@@ -148,7 +211,7 @@ export const trunkLog = (env: Env, name: string, limit: number): Promise<Artifac
  */
 export const changedPaths = (env: Env, name: string, from: string, to: string, cap = 2_000): Promise<string[]> =>
   call(`diff ${name} ${from.slice(0, 8)}..${to.slice(0, 8)}`, async () => {
-    using r = await env.ARTIFACTS.get(name);
+    using r = await ns(env, name).get(name);
     const a = await r.readCommit(from);
     const b = await r.readCommit(to);
     if (!b) return [];
@@ -193,12 +256,13 @@ export const changedPaths = (env: Env, name: string, from: string, to: string, c
     return [...new Set(out)].sort();
   });
 
-/** Recursive tree walk of a commit, descending only where needed; capped for forecast use. */
-export const listFiles = (env: Env, name: string, commit: string, cap = 5_000): Promise<string[]> =>
+/** Recursive tree walk of a commit, capped for forecast use. `truncated` says the repo has more files than
+ *  the cap (E5, review M1): callers must not treat an absent path as "no such file". */
+export const listFiles = (env: Env, name: string, commit: string, cap = 5_000): Promise<{ files: string[]; truncated: boolean }> =>
   call(`tree ${name}@${commit.slice(0, 8)}`, async () => {
-    using r = await env.ARTIFACTS.get(name);
+    using r = await ns(env, name).get(name);
     const c = await r.readCommit(commit);
-    if (!c) return [];
+    if (!c) return { files: [], truncated: false };
     const out: string[] = [];
     const stack: { hash: string; prefix: string }[] = [{ hash: c.treeHash, prefix: "" }];
     while (stack.length > 0 && out.length < cap) {
@@ -211,5 +275,5 @@ export const listFiles = (env: Env, name: string, commit: string, cap = 5_000): 
         else if (e.type !== "gitlink") out.push(path);
       }
     }
-    return out.sort();
+    return { files: out.slice(0, cap).sort(), truncated: out.length >= cap && (stack.length > 0 || out.length > cap) };
   });

@@ -6,13 +6,14 @@
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
-import { WeftError, decodeFromRpc } from "../core/errors.ts";
+import { WeftError, decodeFromRpc, infraFailure } from "../core/errors.ts";
 import { holdReason, preCheckGates } from "../core/rubric.ts";
 import type { BatchClaim, DiffStats, GateResult, JudgeAnswers, Rejection } from "../core/types.ts";
 
 type Claim = BatchClaim & { pre: Record<string, { gates: GateResult[]; judge: JudgeAnswers | null; behind: number; rejections: number }> };
-import { headOf, headerToken, mintToken } from "./artifacts.ts";
+import { headOf, headerToken, mintToken, resolveShard } from "./artifacts.ts";
 import { judgeChangeset } from "./judge.ts";
+import { pushMirror } from "./mirror.ts";
 import { runner, signingKey, type SpecInput } from "./runner-client.ts";
 
 interface Params {
@@ -26,8 +27,9 @@ const LONG = { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" 
 /** RPC/runner errors: retryable ones throw (Workflows retries); fatal ones stop retries. */
 const rpc = async <T>(fn: () => Promise<unknown>): Promise<T> => {
   try {
-    // DO RPC results carry a Disposable marker; step outputs must be plain JSON.
-    return JSON.parse(JSON.stringify(await fn())) as T;
+    // DO RPC results carry a Disposable marker; step outputs must be plain JSON (a void method → null).
+    const v: unknown = await fn();
+    return (v === undefined ? null : JSON.parse(JSON.stringify(v))) as T;
   } catch (err: unknown) {
     const e = err instanceof WeftError ? err : decodeFromRpc(err);
     if (!e.retryable) throw new NonRetryableError(`${e.code}: ${e.message}`);
@@ -62,15 +64,17 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
     const { repo, batchId } = event.payload;
     const coord = this.env.REPO.getByName(repo);
     try {
+      await resolveShard(this.env, repo); // D7: Artifacts calls below go to this repo's namespace shard
       const claim = await step.do("claim", STEP, () => rpc<Claim | null>(() => coord.claimBatch(batchId)));
       if (!claim || claim.members.length === 0) return { idle: true };
+      const lane = claim.lane ?? 0; // E1: this batch's own merge-runner instance
 
       // 1. authoritative diffs, computed by the runner from the forks themselves
       const prepared = await step.do("prepare", STEP, async () => {
         const toks = await forkTokens(this.env, claim, claim.members.map((m) => m.id));
         const trunkRead = headerToken((await mintToken(this.env, claim.trunkRepo, "read", 1800)).plaintext);
         return rpc<{ stats: Record<string, DiffStats> }>(() =>
-          runner(this.env, repo).prepare({
+          runner(this.env, repo, lane).prepare({
             trunk: { remote: claim.trunkRemote, token: trunkRead },
             trunkHead: claim.trunkHead,
             members: claim.members.map((m) => ({ id: m.id, forkRemote: m.forkRemote, forkToken: toks[m.id] ?? "", branch: m.branch, headCommit: m.headCommit })),
@@ -100,7 +104,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
               }
             : null;
           const hold = holdReason(gates, judge, claim.config);
-          return rpc<{ held: boolean }>(() => coord.recordJudgement(batchId, m.id, gates, judge, hold));
+          return rpc<{ held: boolean }>(() => coord.recordJudgement(batchId, m.id, gates, judge, hold, { files: stats.files, added: stats.added, deleted: stats.deleted }));
         });
         if (res.held) held.push(m.id);
       }
@@ -115,19 +119,23 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
       // 3. speculative merge chain + merged-tree check + bisection (in the runner)
       const spec = await step.do("speculate", LONG, async () => {
         const input = await specInput(this.env, claim, ids);
+        const startedAt = Date.now();
         try {
-          const r = await runner(this.env, repo).speculate(input);
+          const r = await runner(this.env, repo, lane).speculate(input);
+          const endedAt = Date.now();
           const logKeys: Record<string, string> = {};
           for (const l of r.logs) {
             const key = `logs/${repo}/${batchId}/check-${l.commit.slice(0, 12)}.log`;
             await this.env.BLOBS.put(key, l.text, { httpMetadata: { contentType: "text/plain; charset=utf-8" } });
             for (const rej of r.rejected) if (rej.rejection.logKey === `commit:${l.commit}`) logKeys[rej.id] = key;
           }
-          return { trunkRed: null as string | null, tip: r.tip, applied: r.applied, rejected: r.rejected, checkPassed: r.checkPassed, checksRun: r.checksRun, bisectSteps: r.bisectSteps, logKeys, readmitted: r.readmitted ?? [] };
+          return { trunkRed: null as string | null, tip: r.tip, applied: r.applied, rejected: r.rejected, checkPassed: r.checkPassed, checksRun: r.checksRun, bisectSteps: r.bisectSteps, logKeys, readmitted: r.readmitted ?? [], flaky: r.flaky ?? [], speculation: { lane, startedAt, endedAt } };
         } catch (err: unknown) {
           if (err instanceof WeftError && err.code === "TRUNK_RED") {
-            return { trunkRed: String(err.details.log ?? err.message), tip: claim.trunkHead, applied: [], rejected: [] as { id: string; rejection: Rejection }[], checkPassed: {}, checksRun: 1, bisectSteps: 0, logKeys: {}, readmitted: [] as string[] };
+            return { trunkRed: String(err.details.log ?? err.message), tip: claim.trunkHead, applied: [], rejected: [] as { id: string; rejection: Rejection }[], checkPassed: {}, checksRun: 1, bisectSteps: 0, logKeys: {}, readmitted: [] as string[], flaky: [] as string[], speculation: { lane, startedAt, endedAt: Date.now() } };
           }
+          // A deterministic runner verdict (e.g. CHECK_FLAKY, HEAD_MISSING) must not be retried by Workflows.
+          if (err instanceof WeftError && !err.retryable) throw new NonRetryableError(`${err.code}: ${err.message}`);
           throw err;
         }
       });
@@ -140,7 +148,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
       // 4. the single trunk write, with a compare-and-swap lease (verified against Artifacts 2026-10-12).
       //    FR-26: if another lane landed first (TRUNK_MOVED), re-speculate this lane on the new trunk —
       //    full chain + one check on the new merged tip — and push again, instead of requeueing.
-      let final = { trunkHead: claim.trunkHead, tip: spec.tip, applied: spec.applied, rejected: spec.rejected, checkPassed: spec.checkPassed, checksRun: spec.checksRun, bisectSteps: spec.bisectSteps, logKeys: spec.logKeys, readmitted: spec.readmitted };
+      let final = { trunkHead: claim.trunkHead, tip: spec.tip, applied: spec.applied, rejected: spec.rejected, checkPassed: spec.checkPassed, checksRun: spec.checksRun, bisectSteps: spec.bisectSteps, logKeys: spec.logKeys, readmitted: spec.readmitted, flaky: spec.flaky };
       let rebases = 0;
       if (final.applied.length > 0) {
         for (let attempt = 1; ; attempt += 1) {
@@ -149,7 +157,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
             const rebuild = { ...(await specInput(this.env, claim, ids)), trunkHead: at.trunkHead };
             const write = headerToken((await mintToken(this.env, claim.trunkRepo, "write", 600)).plaintext);
             try {
-              await runner(this.env, repo).push({ trunk: { ...rebuild.trunk, writeToken: write }, expectedOld: at.trunkHead, tip: at.tip, rebuild });
+              await runner(this.env, repo, lane).push({ trunk: { ...rebuild.trunk, writeToken: write }, expectedOld: at.trunkHead, tip: at.tip, rebuild });
               return { moved: false };
             } catch (err: unknown) {
               if (err instanceof WeftError && err.code === "TRUNK_MOVED") return { moved: true };
@@ -166,7 +174,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
             if (!head) throw new NonRetryableError("trunk vanished");
             const input = { ...(await specInput(this.env, claim, final.applied.map((a) => a.id))), trunkHead: head };
             try {
-              const r = await runner(this.env, repo).speculate(input);
+              const r = await runner(this.env, repo, lane).speculate(input);
               return { trunkRed: false, head, r };
             } catch (err: unknown) {
               if (err instanceof WeftError && err.code === "TRUNK_RED") return { trunkRed: true, head, r: null };
@@ -189,6 +197,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
             bisectSteps: final.bisectSteps + r.bisectSteps,
             logKeys: final.logKeys,
             readmitted: [...final.readmitted, ...(r.readmitted ?? [])],
+            flaky: [...new Set([...final.flaky, ...(r.flaky ?? [])])],
           };
           if (final.applied.length === 0) break;
         }
@@ -218,7 +227,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
             notes.push({ commit, text: `weft-provenance v1\nchangeset: ${b.csId}\nbundle: r2://${key}\nsha256: ${sha}\nfetch: /v1/repos/${repo}/changesets/${b.csId}/provenance\n` });
           }
           const write = headerToken((await mintToken(this.env, claim.trunkRepo, "write", 600)).plaintext);
-          const r = await runner(this.env, repo).notes({ trunk: { remote: claim.trunkRemote, token: write, writeToken: write }, notes, claimTime: claim.claimTime });
+          const r = await runner(this.env, repo, lane).notes({ trunk: { remote: claim.trunkRemote, token: write, writeToken: write }, notes, claimTime: claim.claimTime });
           return { notes: notes.length, pushed: r.notesPushed };
         });
       }
@@ -237,13 +246,28 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
             logKeys: final.logKeys,
             readmitted: final.readmitted,
             laneRebases: rebases,
+            flaky: final.flaky,
+            speculation: spec.speculation,
           }),
         ),
       );
+      // 7. D5 mirror-out: an exact copy of trunk (main + provenance notes) on the configured remote. Best effort:
+      //    a mirror outage is recorded and reported, never allowed to undo or block a landing.
+      if (final.applied.length > 0) {
+        const tip = final.tip;
+        const mirrored = await step.do("mirror", STEP, async () => {
+          const r = await pushMirror(this.env, repo, claim.trunkRemote, tip, lane);
+          if (r) await rpc<null>(() => coord.mirrorResult({ ok: r.ok, pushed: r.pushed, remoteMain: r.remoteMain, error: r.error }));
+          return r ? { ok: r.ok } : null;
+        });
+        if (mirrored && !mirrored.ok) console.log(JSON.stringify({ level: "warn", msg: "mirror push failed", repo, batchId }));
+      }
       return { landed: final.applied.length, rejected: final.rejected.length, held: held.length, checksRun: final.checksRun, laneRebases: rebases };
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);
-      await step.do("requeue-on-failure", STEP, () => rpc<null>(() => coord.requeueBatch(batchId, `workflow failed: ${reason.slice(0, 300)}`)));
+      // E4 (review M3): transient infrastructure failures never count against a changeset's attempts.
+      const kind = infraFailure(err) ? "infra" : "failure";
+      await step.do("requeue-on-failure", STEP, () => rpc<null>(() => coord.requeueBatch(batchId, `workflow failed: ${reason.slice(0, 300)}`, kind)));
       return { failed: reason };
     }
   }

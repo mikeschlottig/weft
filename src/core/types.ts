@@ -4,7 +4,7 @@
 export type IntentMode = "soft" | "exclusive";
 export type WorkspaceStatus = "provisioning" | "active" | "conflicted" | "submitted" | "landed" | "abandoned";
 export type ChangesetStatus = "queued" | "needs_review" | "validating" | "landed" | "rejected" | "reverted";
-export type RejectionReason = "conflict" | "check_failed" | "policy" | "judge_hold" | "dependency" | "recipe_failed" | "human";
+export type RejectionReason = "conflict" | "check_failed" | "policy" | "judge_hold" | "dependency" | "recipe_failed" | "human" | "infra";
 
 /** FR-47: lagging outcome labels used to calibrate the judge (FR-48). */
 export interface OutcomeLabel {
@@ -18,9 +18,12 @@ export interface AgentClaims {
   sub: string; // agent id
   name: string;
   model: string;
-  role: "agent" | "admin";
+  /** `review`: a human (via Cloudflare Access) who may approve/reject but not administer. */
+  role: "agent" | "admin" | "review";
   iat: number;
   exp: number;
+  /** Token id (D6): recorded for long-lived grants. */
+  jti?: string;
 }
 
 export interface Intent {
@@ -87,6 +90,8 @@ export interface Provenance {
   promptSha256: string | null;
   toolCalls: number | null;
   costUsd: number | null;
+  /** E3: what the agent claimed at submit, kept when the runner's authoritative diff replaced it. */
+  claimed?: { filesTouched: string[]; linesAdded: number; linesDeleted: number } | null;
 }
 
 export interface RiskFactor {
@@ -116,6 +121,8 @@ export interface Changeset {
   resolves: string | null;
   scorecard: Scorecard | null;
   attempts: number;
+  /** E4: platform failures while validating (separate from `attempts`, which count the changeset's own failures). */
+  infraAttempts?: number;
   /** FR-27: parent changeset; this one is speculated on top of it and rejected if it is rejected. */
   after?: string | null;
   /** FR-25: replayed on the current trunk at landing instead of merging the fork's text. */
@@ -197,6 +204,10 @@ export type EventType =
   | "queue.speculated"
   | "queue.batch_landed"
   | "queue.requeued"
+  | "queue.flaky_check"
+  | "changeset.rescored"
+  | "mirror.pushed"
+  | "mirror.failed"
   | "queue.trunk_red"
   | "room.opened"
   | "room.proposed"
@@ -294,6 +305,8 @@ export interface BatchClaim {
   claimTime: number; // unix seconds — fixed commit dates make speculation deterministic
   config: RepoConfig;
   members: BatchMember[];
+  /** FR-26 / E1: lane slot (0-based). Each lane has its own merge-runner instance, so lanes run concurrently. */
+  lane?: number;
 }
 
 export interface SpeculationResult {
@@ -305,6 +318,8 @@ export interface SpeculationResult {
   bisectSteps: number;
   logs: { commit: string; text: string }[];
   readmitted?: string[]; // FR-28: conflict-rejected, then re-admitted after their only peers were culprits
+  /** E2 flake guard: the merged tip was red once and green on a fresh re-run (these changesets landed anyway). */
+  flaky?: string[];
 }
 
 export interface Envelope<T> {

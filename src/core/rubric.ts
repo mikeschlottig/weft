@@ -29,6 +29,29 @@ export const SECRET_PATTERNS: { name: string; re: RegExp }[] = [
   { name: "generic_assignment", re: /(?:api[_-]?key|secret|passwd|password|token)\s*[:=]\s*['"][A-Za-z0-9_\-/+=]{16,}['"]/i },
 ];
 
+/** Shannon entropy in bits per character. */
+export const entropy = (s: string): number => {
+  const counts = new Map<string, number>();
+  for (const ch of s) counts.set(ch, (counts.get(ch) ?? 0) + 1);
+  let h = 0;
+  for (const n of counts.values()) h -= (n / s.length) * Math.log2(n / s.length);
+  return h;
+};
+
+const LOCKFILE = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|go\.sum|poetry\.lock|composer\.lock|Gemfile\.lock|bun\.lockb?)$/;
+const TOKEN = /[A-Za-z0-9_\-+/=]{32,}/g;
+
+/**
+ * E7 (review L3): a credential that matches no known pattern still looks random. Flags tokens of ≥ 32 chars
+ * with ≥ 4.0 bits/char that mix letters and digits. Pure hex (commit SHAs, digests), lockfiles and
+ * `sha256-`/`sha512-` integrity strings are skipped.
+ */
+export const highEntropyTokens = (line: string): string[] =>
+  [...line.matchAll(TOKEN)]
+    .filter((m) => !/sha(1|256|384|512)-$/i.test(line.slice(Math.max(0, (m.index ?? 0) - 7), m.index ?? 0)))
+    .map((m) => m[0])
+    .filter((t) => !/^sha(1|256|384|512)-/i.test(t) && !/^[0-9a-fA-F]+$/.test(t) && /[A-Za-z]/.test(t) && /[0-9]/.test(t) && entropy(t) >= 4.0);
+
 /** Scan only added lines of a unified diff. Returns finding names with file names, never the secret. */
 export const scanAddedLines = (diff: string): string[] => {
   const out = new Set<string>();
@@ -36,7 +59,12 @@ export const scanAddedLines = (diff: string): string[] => {
   for (const line of diff.split("\n")) {
     if (line.startsWith("+++ b/")) file = line.slice(6);
     else if (line.startsWith("+") && !line.startsWith("+++")) {
-      for (const p of SECRET_PATTERNS) if (p.re.test(line)) out.add(`${p.name} in ${file}`);
+      let named = false;
+      for (const p of SECRET_PATTERNS) if (p.re.test(line)) {
+        out.add(`${p.name} in ${file}`);
+        named = true;
+      }
+      if (!named && !LOCKFILE.test(file) && highEntropyTokens(line.slice(1)).length > 0) out.add(`high_entropy_string in ${file}`);
     }
   }
   return [...out];

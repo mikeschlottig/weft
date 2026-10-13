@@ -32,6 +32,7 @@ export const forecast = (
   trunkFiles: readonly string[],
   config: RepoConfig,
   nowMs: number,
+  opts: { truncated?: boolean } = {},
 ): Forecast => {
   // Union and sorted-lines files cannot conflict, so they never count as an overlap.
   const conflictFree = [...config.unionGlobs, ...(config.drivers ?? []).filter((d) => d.driver === "union" || d.driver === "sorted-lines").map((d) => d.glob)];
@@ -83,7 +84,8 @@ export const forecast = (
       continue;
     }
     const prefixHit = prefixesOverlap(self.globs, ws.intent.globs);
-    if (prefixHit.length > 0) overlaps.push(finding(ws, "prefix", [], prefixHit));
+    // E5: past the listing cap a missing file may simply be unlisted, so a shared prefix counts as a file overlap.
+    if (prefixHit.length > 0) overlaps.push(finding(ws, opts.truncated ? "files" : "prefix", [], prefixHit));
   }
   const risk: Forecast["risk"] = overlaps.some((o) => o.strength === "touched")
     ? "high"
@@ -105,7 +107,7 @@ export const forecast = (
         : risk === "medium"
           ? "Another agent has declared intent on the same files. Coordinate, narrow scope, or sync often."
           : "Another agent has already modified the same files. Expect a conflict; sync before continuing.";
-  return { risk, overlaps, advice };
+  return { risk, overlaps, advice: opts.truncated ? `${advice} (Large repo: the trunk file list is truncated, so shared path prefixes are treated as file overlaps.)` : advice };
 };
 
 export const blockingOverlaps = (fc: Forecast, requestedMode: "soft" | "exclusive"): OverlapFinding[] =>
@@ -136,3 +138,41 @@ export const scoreRisk = (
 
 export const outOfIntent = (touched: readonly string[], globs: readonly string[], unionGlobs: readonly string[]): string[] =>
   touched.filter((f) => !matches(f, globs) && !matches(f, unionGlobs));
+
+/**
+ * E3 (review H3): submit-time risk is computed from the agent's own diff stats. When the runner computes the
+ * authoritative diff, re-score with it and decide whether the change must now be held for a human:
+ *  - files the agent did not report, or materially more changed lines → hold ("under-reported");
+ *  - otherwise the authoritative risk crossing the review threshold (or touching a sensitive path) → hold.
+ * Returns the authoritative provenance and risk either way, so the changeset records the truth.
+ */
+export const reconcileDiff = (
+  config: RepoConfig,
+  claimed: Provenance,
+  actual: { files: string[]; added: number; deleted: number },
+  overlaps: number,
+  behind: number,
+): { prov: Provenance; risk: ReturnType<typeof scoreRisk>; hidden: string[]; underReported: boolean; hold: string | null } => {
+  const prov: Provenance = {
+    ...claimed,
+    filesTouched: actual.files,
+    linesAdded: actual.added,
+    linesDeleted: actual.deleted,
+    claimed: { filesTouched: claimed.filesTouched, linesAdded: claimed.linesAdded, linesDeleted: claimed.linesDeleted },
+  };
+  const risk = scoreRisk(config, prov, overlaps, behind);
+  const hidden = actual.files.filter((f) => !claimed.filesTouched.includes(f));
+  const claimedLines = claimed.linesAdded + claimed.linesDeleted;
+  const actualLines = actual.added + actual.deleted;
+  const underReported = hidden.length > 0 || actualLines > claimedLines * 1.5 + 20;
+  let hold: string | null = null;
+  if (underReported) {
+    const parts = [hidden.length > 0 ? `${hidden.length} unreported file(s): ${hidden.slice(0, 5).join(", ")}` : null, actualLines > claimedLines * 1.5 + 20 ? `${actualLines} changed lines vs ${claimedLines} claimed` : null].filter((x): x is string => x !== null);
+    hold = `diff under-reported at submit (${parts.join("; ")}); authoritative risk ${risk.score}`;
+  } else if (risk.sensitive) {
+    hold = `authoritative diff touches a sensitive path (risk ${risk.score})`;
+  } else if (risk.score >= config.reviewThreshold) {
+    hold = `authoritative risk ${risk.score} ≥ review threshold ${config.reviewThreshold}`;
+  }
+  return { prov, risk, hidden, underReported, hold };
+};

@@ -38,9 +38,18 @@ interface Run {
   code: number;
   stdout: string;
   stderr: string;
+  /** The process died from a signal we did not send (e.g. the instance is being replaced). */
+  interrupted?: boolean;
+  timedOut?: boolean;
 }
 
-const redact = (s: string): string => s.replace(/Bearer [A-Za-z0-9_\-.?=]+/g, "Bearer <redacted>").replace(/art_v1_[0-9a-f]+/g, "art_v1_<redacted>");
+const redact = (s: string): string =>
+  s
+    .replace(/Bearer [A-Za-z0-9_\-.?=]+/g, "Bearer <redacted>")
+    .replace(/Basic [A-Za-z0-9+/=]+/g, "Basic <redacted>")
+    .replace(/art_v1_[0-9a-f]+/g, "art_v1_<redacted>")
+    .replace(/gh[pousr]_[A-Za-z0-9]{20,}/g, "gh_<redacted>")
+    .replace(/https:\/\/[^\s/@]+@/g, "https://<redacted>@");
 
 const run = (cmd: string, args: string[], opts: { cwd?: string; input?: string; env?: Record<string, string>; timeoutMs?: number; allow?: number[] } = {}): Promise<Run> =>
   new Promise((resolve, reject) => {
@@ -51,7 +60,11 @@ const run = (cmd: string, args: string[], opts: { cwd?: string; input?: string; 
     });
     let stdout = "";
     let stderr = "";
-    const timer = setTimeout(() => child.kill("SIGKILL"), opts.timeoutMs ?? GIT_TIMEOUT_MS);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, opts.timeoutMs ?? GIT_TIMEOUT_MS);
     child.stdout.on("data", (d: Buffer) => {
       if (stdout.length < 4_000_000) stdout += d.toString();
     });
@@ -62,9 +75,9 @@ const run = (cmd: string, args: string[], opts: { cwd?: string; input?: string; 
       clearTimeout(timer);
       reject(new RunnerError("SPAWN_FAILED", `${cmd}: ${e.message}`));
     });
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       clearTimeout(timer);
-      const r = { code: code ?? -1, stdout, stderr };
+      const r: Run = { code: code ?? -1, stdout, stderr, interrupted: code === null && signal !== null && !timedOut, timedOut };
       if (r.code !== 0 && !(opts.allow ?? []).includes(r.code)) {
         reject(new RunnerError("GIT_FAILED", redact(`${cmd} ${args.filter((a) => !a.includes("Bearer")).slice(0, 4).join(" ")} exited ${r.code}: ${stderr.slice(0, 600)}`)));
       } else resolve(r);
@@ -73,8 +86,8 @@ const run = (cmd: string, args: string[], opts: { cwd?: string; input?: string; 
     else child.stdin.end();
   });
 
-const git = (gitDir: string, args: string[], opts: { input?: string; env?: Record<string, string>; allow?: number[]; token?: string } = {}): Promise<Run> => {
-  const auth = opts.token ? ["-c", `http.extraHeader=Authorization: Bearer ${opts.token.split("?expires=")[0] ?? opts.token}`] : [];
+const git = (gitDir: string, args: string[], opts: { input?: string; env?: Record<string, string>; allow?: number[]; token?: string; authHeader?: string } = {}): Promise<Run> => {
+  const auth = opts.authHeader ? ["-c", `http.extraHeader=${opts.authHeader}`] : opts.token ? ["-c", `http.extraHeader=Authorization: Bearer ${opts.token.split("?expires=")[0] ?? opts.token}`] : [];
   return run("git", [...auth, `--git-dir=${gitDir}`, ...args], opts);
 };
 
@@ -382,6 +395,8 @@ const runCheck = async (gitDir: string, commit: string, command: string): Promis
     const archive = await run("sh", ["-c", 'git --git-dir="$1" archive "$2" | tar -x -C "$3"', "sh", gitDir, commit, dir]);
     if (archive.code !== 0) throw new RunnerError("CHECKOUT_FAILED", `could not materialize ${commit}`);
     const r = await run("sh", ["-c", command], { cwd: dir, env: { WEFT_COMMIT: commit, CI: "1" }, timeoutMs: CHECK_TIMEOUT_MS, allow: Array.from({ length: 256 }, (_, i) => i).concat([-1]) });
+    // A check killed by a signal we did not send says nothing about the code (instance replaced, OOM): infra.
+    if (r.interrupted) throw new RunnerError("CHECK_INTERRUPTED", `the check on ${commit.slice(0, 12)} was killed by a signal before it finished; nobody is blamed`, 503, true);
     return { pass: r.code === 0, text: `$ ${command}\n# commit ${commit}\n${r.stdout}${r.stderr}\n# exit ${r.code}\n`.slice(0, 200_000) };
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -403,15 +418,22 @@ const speculateSigned = async (body: SpecInput, sign: { pre: string[]; flag: str
     if (!body.checkCommand) return { pass: true, text: "" };
     const hit = cache.get(tree);
     if (hit) return hit;
+    return fresh(commit, tree);
+  };
+  /** E2 flake guard: run the check again regardless of the tree cache (and replace the cached verdict). */
+  const fresh = async (commit: string, tree: string): Promise<CheckOutcome> => {
+    if (!body.checkCommand) return { pass: true, text: "" };
     checksRun += 1;
     const res = await runCheck(gitDir, commit, body.checkCommand);
     cache.set(tree, res);
     logs.push({ commit, text: res.text });
     return res;
   };
+  const flaky: string[] = [];
 
   const trunkTree = await out(gitDir, ["rev-parse", `${body.trunkHead}^{tree}`]);
-  if (body.checkCommand && !(await check(body.trunkHead, trunkTree)).pass) {
+  // The trunk-red guard pauses the whole queue, so it gets the same flake guard as a red tip: re-run once.
+  if (body.checkCommand && !(await check(body.trunkHead, trunkTree)).pass && !(await fresh(body.trunkHead, trunkTree)).pass) {
     throw new RunnerError("TRUNK_RED", "the check fails on trunk itself; refusing to blame changesets", 409, false, {
       trunkHead: body.trunkHead,
       log: logs[0]?.text.slice(-2000) ?? "",
@@ -451,11 +473,20 @@ const speculateSigned = async (body: SpecInput, sign: { pre: string[]; flag: str
     }
     candidates = chain.applied.map((a) => a.m);
     const last = chain.applied[chain.applied.length - 1];
-    if (!last) return { tip: body.trunkHead, applied: [], rejected, checkPassed, checksRun, bisectSteps, logs, readmitted };
-    const tipOutcome = await check(last.commit, last.tree);
+    if (!last) return { tip: body.trunkHead, applied: [], rejected, checkPassed, checksRun, bisectSteps, logs, readmitted, flaky };
+    let tipOutcome = await check(last.commit, last.tree);
+    // E2 (PRD §10 "check flakiness → wrong culprit"): a red tip is re-run once before anyone is blamed.
+    // Red then green means the check is flaky on this tree, so the batch lands and the flake is reported.
+    if (!tipOutcome.pass && body.checkCommand) {
+      const again = await fresh(last.commit, last.tree);
+      if (again.pass) {
+        flaky.push(...chain.applied.map((a) => a.m.id));
+        tipOutcome = again;
+      }
+    }
     if (tipOutcome.pass) {
       for (const a of chain.applied) checkPassed[a.m.id] = true;
-      return { tip: chain.tip, applied: chain.applied.map((a) => ({ id: a.m.id, commit: a.commit, tree: a.tree })), rejected, checkPassed, checksRun, bisectSteps, logs, readmitted };
+      return { tip: chain.tip, applied: chain.applied.map((a) => ({ id: a.m.id, commit: a.commit, tree: a.tree })), rejected, checkPassed, checksRun, bisectSteps, logs, readmitted, flaky };
     }
     let lo = 1;
     let hi = chain.applied.length;
@@ -469,7 +500,12 @@ const speculateSigned = async (body: SpecInput, sign: { pre: string[]; flag: str
     }
     const culprit = chain.applied[lo - 1];
     if (!culprit) throw new RunnerError("BISECT_LOST", "bisection lost its culprit");
-    const outcome = await check(culprit.commit, culprit.tree);
+    // Bisection assumes failure is monotonic across prefixes. Confirm the culprit on a fresh run: if its
+    // prefix is green now, the check is not deterministic and nobody is blamed (infra, retried later).
+    const outcome = await fresh(culprit.commit, culprit.tree);
+    if (outcome.pass) {
+      throw new RunnerError("CHECK_FLAKY", `the check is not deterministic on this batch (bisected culprit ${culprit.m.id} passed on re-run); no changeset was blamed`, 409, false, { csId: culprit.m.id });
+    }
     checkPassed[culprit.m.id] = false;
     rejected.push({
       id: culprit.m.id,
@@ -560,6 +596,26 @@ const revert = async (body: {
   if (r.code !== 0) throw new RunnerError("TRUNK_MOVED", "trunk moved; retry the revert", 409, true);
   return { commit };
 });
+
+// ---------------------------------------------------------------- D5 mirror-out (FR-39)
+
+/**
+ * Make `target` an exact mirror of trunk: force-push main and refs/notes/weft. The credential arrives as a full
+ * header (Basic for GitHub, Bearer for Artifacts), is passed with -c http.extraHeader, and is never logged.
+ */
+const mirror = async (body: { trunk: TrunkRef; trunkHead: string; target: { url: string; authHeader: string } }): Promise<{ pushed: string; notes: boolean; remoteMain: string | null }> => {
+  const localTest = process.env.WEFT_RUNNER_ALLOW_LOCAL_MIRROR === "1" && body.target.url.startsWith("/");
+  if (!localTest && !/^https:\/\/[^\s@]+$/.test(body.target.url)) throw new RunnerError("BAD_MIRROR", "mirror url must be https:// without embedded credentials", 400);
+  const gitDir = await repoDir(body.trunk.remote);
+  await fetchTrunk(gitDir, body.trunk, body.trunkHead);
+  const notes = (await git(gitDir, ["fetch", "-q", body.trunk.remote, "+refs/notes/weft:refs/notes/weft"], { token: body.trunk.token, allow: [1, 128] })).code === 0;
+  const refs = [`+${body.trunkHead}:refs/heads/main`, ...(notes ? ["+refs/notes/weft:refs/notes/weft"] : [])];
+  const r = await git(gitDir, ["push", "--porcelain", body.target.url, ...refs], { authHeader: body.target.authHeader, allow: [1, 128] });
+  if (r.code !== 0) throw new RunnerError("MIRROR_FAILED", redact(`push to mirror failed: ${(r.stderr || r.stdout).slice(0, 400)}`), 502, true);
+  const ls = await git(gitDir, ["ls-remote", body.target.url, "refs/heads/main"], { authHeader: body.target.authHeader, allow: [1, 128] });
+  const remoteMain = ls.code === 0 ? (ls.stdout.split("\t")[0] ?? "").trim() || null : null;
+  return { pushed: body.trunkHead, notes, remoteMain };
+};
 
 // ---------------------------------------------------------------- Conflict Rooms (FR-24)
 
@@ -739,6 +795,7 @@ createServer((req, res) => {
     "/room-prepare": roomPrepare as (b: never) => Promise<unknown>,
     "/room-verify": roomVerify as (b: never) => Promise<unknown>,
     "/fast-forward": fastForward as (b: never) => Promise<unknown>,
+    "/mirror": mirror as (b: never) => Promise<unknown>,
     "/notes": (async (b: { trunk: TrunkRef & { writeToken: string }; notes: { commit: string; text: string }[]; claimTime: number }) => {
       const gitDir = await repoDir(b.trunk.remote);
       return { notesPushed: await pushNotes(gitDir, b.trunk, b.notes, b.claimTime) };

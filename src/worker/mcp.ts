@@ -123,6 +123,32 @@ const buildServer = (env: Env, claims: AgentClaims): McpServer => {
     },
     async (a) => envelope("room accept", () => repo(a.repo).roomAccept(a.room, claims), ["git fetch origin && git reset --hard <head> in your checkout"]),
   );
+  // D8: an agent with no local checkout works entirely through its workspace sandbox.
+  s.registerTool(
+    "weft_sandbox_open",
+    { description: "Clone your workspace fork into a cloud sandbox (no local checkout needed). Then use weft_exec to run commands in it.", inputSchema: z.object({ repo: z.string(), workspace: z.string() }) },
+    async (a) =>
+      envelope("sandbox open", async () => {
+        const spec = await repo(a.repo).workspaceGit(a.workspace, claims);
+        return env.SANDBOX.getByName(`${a.repo}/${a.workspace}`).open({ repo: a.repo, wsId: a.workspace, branch: spec.branch, baseCommit: spec.baseCommit, agentName: spec.agentName, fork: spec.fork, trunk: spec.trunk, stackedOn: spec.stackedOn });
+      }),
+  );
+  s.registerTool(
+    "weft_exec",
+    { description: "Run a shell command (bash -lc) in your workspace sandbox, in the repo root. Returns exitCode, stdout, stderr. Edit files with it, run tests with it.", inputSchema: z.object({ repo: z.string(), workspace: z.string(), cmd: z.string().max(20000), timeoutSeconds: z.number().int().min(1).max(900).optional() }) },
+    async (a) =>
+      envelope("exec", async () => {
+        await repo(a.repo).workspaceGit(a.workspace, claims);
+        const r = await env.SANDBOX.getByName(`${a.repo}/${a.workspace}`).exec(a.cmd, (a.timeoutSeconds ?? 300) * 1000);
+        if ("needsOpen" in r) throw new Error("INVALID_STATE: the sandbox is not open (or stopped while idle); call weft_sandbox_open, then retry");
+        return r;
+      }),
+  );
+  s.registerTool(
+    "weft_limits",
+    { description: "Measured usage of a repo against documented platform limits (Artifacts namespace rate, DO storage, lanes, queue depth).", inputSchema: z.object({ repo: z.string() }) },
+    async (a) => envelope("limits", () => repo(a.repo).limits()),
+  );
   s.registerTool(
     "weft_leaderboard",
     { description: "Quality leaderboard for the repo: mean WQS, land rate and first-try rate by agent and by model.", inputSchema: z.object({ repo: z.string() }) },

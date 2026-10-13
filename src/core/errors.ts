@@ -33,6 +33,8 @@ const HTTP: Record<string, number> = {
   TRUNK_MOVED: 503,
   UPSTREAM_ARTIFACTS: 502,
   UPSTREAM_RUNNER: 502,
+  UPSTREAM_MIRROR: 502,
+  UPSTREAM_SANDBOX: 502,
   INTERNAL: 500,
 };
 
@@ -75,8 +77,8 @@ export const notFound = (what: string, id: string, hint: string | null = null): 
 export const invalidState = (message: string, hint: string | null = null): WeftError =>
   new WeftError("INVALID_STATE", message, { exitCode: EXIT.state, hint });
 
-export const unauthenticated = (message: string): WeftError =>
-  new WeftError("UNAUTHENTICATED", message, { exitCode: EXIT.usage, hint: "set WEFT_TOKEN to an agent token from `weft agent register`" });
+export const unauthenticated = (message: string, hint = "set WEFT_TOKEN to an agent token from `weft agent register`"): WeftError =>
+  new WeftError("UNAUTHENTICATED", message, { exitCode: EXIT.usage, hint });
 
 export const forbidden = (message: string): WeftError => new WeftError("FORBIDDEN", message, { exitCode: EXIT.usage });
 
@@ -145,3 +147,12 @@ const isWeftErrorShape = (
   v: unknown,
 ): v is { code: string; message: string; retryable: boolean; hint: string | null; details: Record<string, unknown> } =>
   typeof v === "object" && v !== null && "code" in v && "message" in v && typeof (v as { code: unknown }).code === "string";
+
+// ---- E4 (review M3): infrastructure vs. changeset failures
+
+/** Codes that describe the platform, not the changeset: retried without counting toward MAX_ATTEMPTS. */
+const INFRA_CODES = /\b(UPSTREAM_RUNNER|UPSTREAM_ARTIFACTS|GIT_FAILED|SPAWN_FAILED|CHECKOUT_FAILED|TIP_DIVERGED|CHECK_FLAKY|CHECK_INTERRUPTED|BISECT_LOST|INTERNAL|TIMEOUT)\b|\bcontainer\b|\bnetwork\b|timed? ?out|ECONNRESET|\b50[234]\b/i;
+export const infraFailure = (err: unknown): boolean => {
+  if (err instanceof WeftError) return err.retryable || INFRA_CODES.test(err.code);
+  return INFRA_CODES.test(err instanceof Error ? `${err.name} ${err.message}` : String(err));
+};

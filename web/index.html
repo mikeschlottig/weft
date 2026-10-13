@@ -139,6 +139,7 @@ tr.click{cursor:pointer}tr.click:hover td{background:var(--panel2)}
     <button data-view="agents">Agents <span class="badge" id="nb-agentlist">0</span></button>
     <button data-view="conflicts">Conflicts <span class="badge" id="nb-rooms">0</span></button>
     <button data-view="quality">Quality</button>
+    <button data-view="limits">Limits</button>
     <button data-view="events">Events</button>
   </nav>
   <main>
@@ -194,6 +195,13 @@ tr.click{cursor:pointer}tr.click:hover td{background:var(--panel2)}
           <tr><td>Process</td><td>Landed first try · fresh base</td><td class="num">5 + 5</td><td>coordinator history</td></tr>
         </tbody></table></div></div>
     </section>
+    <section class="view" id="v-limits">
+      <h1>Limits</h1>
+      <p class="lede">Measured usage against documented platform limits, closest to the limit first. Repos are sharded across Artifacts namespaces, because control-plane calls are limited per namespace. Nothing here is estimated: a limit the Worker cannot measure says so.</p>
+      <div class="kpis" id="shardKpis"></div>
+      <div class="panel"><div class="ph"><h2>This repo</h2><span class="meta" id="limitsMeta">—</span></div>
+        <div class="scroll"><table><thead><tr><th>Area</th><th>Limit</th><th>Used</th><th>Of</th><th>Headroom</th><th>Source</th></tr></thead><tbody id="limitRows"></tbody></table></div></div>
+    </section>
     <section class="view" id="v-events">
       <h1>Events</h1>
       <p class="lede">The coordinator's append-only event log, streamed over a hibernating WebSocket.</p>
@@ -216,6 +224,7 @@ const statusPill = (s) => pill(...(STATUS[s] || [s, "s-mut"]));
 const globRe = (g) => new RegExp("^" + g.replace(/[.+^$()|[\]\\]/g, "\\$&").replace(/\*\*\//g, "(?:.*/)?").replace(/\*\*/g, ".*").replace(/(?<!\.)\*/g, "[^/]*") + (/[*?]/.test(g) ? "$" : "(?:/.*)?$"));
 const matches = (p, globs) => globs.some((g) => globRe(g).test(p));
 
+let LIM = null;
 let REPO = "", S = null, LB = null, EV = [], selected = null, selAgent = null, selRoom = null, sock = null, pending = null;
 
 const get = async (path) => {
@@ -232,6 +241,7 @@ async function load() {
     [S, LB, EV] = await Promise.all([get(`/v1/repos/${encodeURIComponent(REPO)}/snapshot`), get(`/v1/repos/${encodeURIComponent(REPO)}/leaderboard`), get(`/v1/repos/${encodeURIComponent(REPO)}/events?since=0`)]);
     if (!selected && S.changesets.length) selected = (S.changesets.find((c) => c.status === "landed" && c.scorecard) || S.changesets[0]).id;
     render();
+    get(`/v1/limits?repo=${encodeURIComponent(REPO)}`).then((l) => { LIM = l; renderLimits(); }, (err) => { $("limitsMeta").textContent = `limits unavailable: ${err.message}`; });
   } catch (err) {
     $("kpis").innerHTML = `<div class="panel" style="grid-column:1/-1"><div class="empty">Could not load <b>${esc(REPO)}</b>: ${esc(err.message)}</div></div>`;
   }
@@ -397,6 +407,18 @@ function renderRooms() {
     <div class="grid g2"><div class="panel"><div class="ph"><h2>Resolver attempts</h2><span class="meta">Workers AI → merge-runner check</span></div><div class="tl">${attempts}</div></div>
       <div class="panel">${hunks || '<div class="empty">Conflict contents not captured yet.</div>'}</div></div>`;
 }
+// ---------------------------------------------------------------- limits (D7)
+const fmtNum = (n, unit) => n === null ? "not measurable" : unit === "bytes" ? (n >= 1e9 ? (n / 1e9).toFixed(2) + " GB" : n >= 1e6 ? (n / 1e6).toFixed(1) + " MB" : (n / 1e3).toFixed(0) + " KB") : Number(n).toLocaleString() + " " + unit;
+const LSTAT = { ok: ["ok", "s-ok"], watch: ["watch", "s-warn"], near: ["near limit", "s-bad"], unknown: ["unmeasured", "s-mut"] };
+function renderLimits() {
+  if (!LIM) return;
+  $("shardKpis").innerHTML = LIM.shards.map((s) => `<div class="kpi"><div class="k">Shard ${s.shard} · <span class="mono">${esc(s.binding)}</span></div><div class="v">${s.repos}</div><div class="k">repos${LIM.repo && LIM.repo.usage.shard === s.shard ? " · <b>this repo</b>" : ""}</div></div>`).join("");
+  if (!LIM.repo) { $("limitRows").innerHTML = '<tr><td colspan="6"><div class="empty">Open a repo to see its usage.</div></td></tr>'; return; }
+  const u = LIM.repo.usage;
+  $("limitsMeta").textContent = `${u.workspacesLive} live workspaces · ${u.forksTotal} forks · shard ${u.shard}`;
+  $("limitRows").innerHTML = LIM.repo.rows.map((r) => `<tr><td>${esc(r.area)}</td><td>${esc(r.name)}${r.note ? `<div class="sub" style="color:var(--muted)">${esc(r.note)}</div>` : ""}</td><td class="num">${esc(fmtNum(r.used, r.unit))}</td><td class="num">${esc(fmtNum(r.limit, r.unit))}</td><td>${pill(...(LSTAT[r.status] || [r.status, "s-mut"]))} ${r.pct === null ? "" : `<span class="mono">${r.pct}%</span>`}</td><td class="mono" style="color:var(--muted);font-size:11px">${esc(r.source)}</td></tr>`).join("");
+}
+
 document.addEventListener("click", (e) => {
   const a = e.target.closest("[data-agent]"); if (a) { selAgent = a.dataset.agent; renderAgents(); }
   const r = e.target.closest("[data-room]"); if (r) { selRoom = r.dataset.room; renderRooms(); }

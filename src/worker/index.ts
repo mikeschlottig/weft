@@ -1,14 +1,17 @@
 // weft-api Worker: the single public entry point (spec §6). Routes decisions to the repo's
 // RepoCoordinator DO; git data never flows through here (agents talk to Artifacts directly).
 
-import { WeftError, decodeFromRpc, usage } from "../core/errors.ts";
+import { WeftError, decodeFromRpc, invalidState as invalidStateErr, usage } from "../core/errors.ts";
 import { type ContextPack, contextMarkdown } from "../core/context.ts";
 import { DUPLICATE_THRESHOLD, EMBED_MODEL, cosine } from "../core/similarity.ts";
 import { BAD_OUTCOMES, type LabeledRow, calibrate } from "../core/calibration.ts";
-import { signJwt } from "../core/jwt.ts";
+import { jwks, tokenTtl } from "../core/keys.ts";
+import { DOCUMENTED } from "../core/limits.ts";
 import type { AgentClaims, Envelope, ErrorEnvelope, IntentMode, RepoConfig } from "../core/types.ts";
-import { trunkLog } from "./artifacts.ts";
-import { authenticate, optionalAuth, requireAdmin } from "./auth.ts";
+import { pickShard, repoInfo, resolveShard, shardCount, trunkLog } from "./artifacts.ts";
+import { getMirror, pushMirror, removeMirror, setMirror } from "./mirror.ts";
+import { authenticate, optionalAuth, requireAdmin, requireReviewer } from "./auth.ts";
+import { keyStatus, mintAgentToken, publicKeys, rotateIfDue, rotateKeys } from "./keystore.ts";
 import { handleMcp } from "./mcp.ts";
 
 export { RepoCoordinator } from "./coordinator.ts";
@@ -16,6 +19,8 @@ export { MergeQueue } from "./merge-queue.ts";
 export { RoomResolver } from "./room-resolver.ts";
 export { PushObserver } from "./push-observer.ts";
 export { MergeRunner } from "./runner-client.ts";
+export { WorkspaceSandbox } from "./sandbox.ts";
+import type { ExecResult } from "./sandbox.ts";
 
 type Handler = (ctx: Ctx) => Promise<{ data: unknown; hints?: string[] }>;
 interface Ctx {
@@ -28,10 +33,11 @@ interface Ctx {
   body: () => Promise<Record<string, unknown>>;
 }
 
-const routes: { method: string; pattern: RegExp; keys: string[]; command: string; auth: "public" | "read" | "agent" | "admin"; fn: Handler }[] = [];
-const route = (method: string, path: string, command: string, auth: "public" | "read" | "agent" | "admin", fn: Handler): void => {
+type Auth = "public" | "read" | "agent" | "review" | "admin";
+const routes: { method: string; pattern: RegExp; keys: string[]; command: string; auth: Auth; fn: Handler }[] = [];
+const route = (method: string, path: string, command: string, auth: Auth, fn: Handler): void => {
   const keys: string[] = [];
-  const pattern = new RegExp(`^${path.replace(/:([a-zA-Z]+)/g, (_m, k: string) => {
+  const pattern = new RegExp(`^${path.replace(/\./g, "\\.").replace(/:([a-zA-Z]+)/g, (_m, k: string) => {
     keys.push(k);
     return "([^/]+)";
   })}$`);
@@ -120,21 +126,40 @@ route("GET", "/v1/signing-key", "signing-key", "public", async (c) => {
   };
 });
 
+// D6: the public verification keys for agent tokens (EdDSA, by kid).
+route("GET", "/.well-known/jwks.json", "jwks", "public", async (c) => ({ data: jwks(await publicKeys(c.env)) }));
+
 route("POST", "/v1/agents", "agent register", "admin", async (c) => {
   const b = await c.body();
   const name = str(b.name, "name");
   const model = str(b.model, "model");
   if (!/^[a-z0-9][a-z0-9_-]{0,30}$/.test(name)) throw usage(`invalid agent name: ${name}`, "lowercase letters, digits, - and _ (max 31)");
-  const ttlHours = Math.min(168, Math.max(1, numOr(b.ttlHours, 24) ?? 24));
+  // E8 (review H2): agent tokens live ≤ 1 h (spec §12). Longer is an explicit, recorded admin grant (≤ 24 h).
+  const ttl = tokenTtl(numOr(b.ttlHours, null), b.longLived === true);
   const existing = await c.env.DB.prepare("SELECT id FROM agents WHERE name = ?").bind(name).first<{ id: string }>();
   const id = existing?.id ?? `agt_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
   await c.env.DB.prepare("INSERT INTO agents (id, name, model, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET model = excluded.model")
     .bind(id, name, model, Date.now())
     .run();
-  const iat = Math.floor(Date.now() / 1000);
-  const token = await signJwt({ sub: id, name, model, role: "agent", iat, exp: iat + ttlHours * 3600 }, c.env.JWT_SIGNING_SECRET);
-  return { data: { agent: { id, name, model }, token, expiresAt: new Date((iat + ttlHours * 3600) * 1000).toISOString() }, hints: [`export WEFT_TOKEN=<token>  # as ${name}`] };
+  const minted = await mintAgentToken(c.env, { id, name, model }, ttl.ttlS, { by: claimsOf(c).name, via: "register", longLived: ttl.longLived });
+  const hints = [`export WEFT_TOKEN=<token>  # as ${name}`, "weft agent refresh  # before it expires (tokens live 1 h)"];
+  if (ttl.clamped) hints.unshift(`token lifetime capped at ${ttl.ttlS / 3600} h${b.longLived === true ? "" : " (pass --long-lived for an audited grant of up to 24 h)"}`);
+  return { data: { agent: { id, name, model }, token: minted.token, expiresAt: minted.expiresAt, kid: minted.kid, ttlSeconds: ttl.ttlS, longLived: ttl.longLived }, hints };
 });
+
+// E8: an agent re-issues its own token before expiry (≤ 1 h). A killed agent is refused by gateAgent first.
+route("POST", "/v1/agents/token/refresh", "agent refresh", "agent", async (c) => {
+  const cl = claimsOf(c);
+  if (cl.role !== "agent") throw usage("only agent tokens can be refreshed", "admins and Access users do not need tokens");
+  const minted = await mintAgentToken(c.env, { id: cl.sub, name: cl.name, model: cl.model }, tokenTtl(null, false).ttlS, { by: cl.name, via: "refresh", longLived: false });
+  return { data: { agent: { id: cl.sub, name: cl.name, model: cl.model }, token: minted.token, expiresAt: minted.expiresAt, kid: minted.kid }, hints: ["export WEFT_TOKEN=<token>"] };
+});
+
+route("GET", "/v1/admin/keys", "keys list", "admin", async (c) => ({ data: await keyStatus(c.env) }));
+route("POST", "/v1/admin/keys/rotate", "keys rotate", "admin", async (c) => ({
+  data: await rotateKeys(c.env, claimsOf(c).name),
+  hints: ["tokens signed by the previous key keep working until they expire; the key before it is retired"],
+}));
 
 route("GET", "/v1/agents", "agent list", "admin", async (c) => {
   const rows = await c.env.DB.prepare("SELECT id, name, model, created_at FROM agents ORDER BY name").all();
@@ -192,11 +217,18 @@ route("POST", "/v1/repos", "init", "admin", async (c) => {
   const b = await c.body();
   const repo = str(b.repo, "repo");
   const imp = b.import && typeof b.import === "object" ? (b.import as Record<string, unknown>) : null;
+  // D7: place the repo (and all of its forks) on a namespace shard; recorded before any Artifacts call.
+  const shards = shardCount(c.env);
+  const shard = typeof b.shard === "number" && Number.isInteger(b.shard) && b.shard >= 0 && b.shard < shards ? b.shard : pickShard(repo, shards);
+  const prior = await c.env.DB.prepare("SELECT shard FROM repos WHERE id = ?").bind(repo).first<{ shard: number }>();
+  const placed = prior ? prior.shard : shard; // an existing (adopted) repo keeps its shard
+  await c.env.DB.prepare("INSERT INTO repos (id, created_at, config, shard) VALUES (?, ?, '{}', ?) ON CONFLICT(id) DO NOTHING").bind(repo, Date.now(), placed).run();
   const data = await coord(c.env, repo).init({
     repo,
     config: (b.config ?? {}) as Partial<RepoConfig>,
     actor: claimsOf(c).name,
     import: imp ? { url: str(imp.url, "import.url"), ...(typeof imp.branch === "string" && imp.branch ? { branch: imp.branch } : {}) } : null,
+    shard: placed,
   });
   return { data, hints: ["push an initial commit to the returned remote (the CLI does this with --from DIR)", "weft agent register --name <agent> --model <model>"] };
 });
@@ -204,6 +236,49 @@ route("POST", "/v1/repos", "init", "admin", async (c) => {
 route("PATCH", "/v1/repos/:repo/config", "config", "admin", async (c) => ({
   data: await coord(c.env, c.params.repo ?? "").configure((await c.body()) as Partial<RepoConfig>, claimsOf(c).name),
 }));
+
+// ---- D7: namespace shards + limits dashboard
+route("GET", "/v1/limits", "limits", "read", async (c) => {
+  const shards = shardCount(c.env);
+  const perShard = await c.env.DB.prepare("SELECT shard, COUNT(*) AS repos FROM repos GROUP BY shard").all<{ shard: number; repos: number }>();
+  const repo = c.url.searchParams.get("repo");
+  const detail = repo ? await coord(c.env, repo).limits() : null;
+  return {
+    data: {
+      shards: Array.from({ length: shards }, (_, k) => ({ shard: k, binding: k === 0 ? "ARTIFACTS" : `ARTIFACTS_S${k}`, repos: perShard.results.find((r) => r.shard === k)?.repos ?? 0 })),
+      documented: DOCUMENTED,
+      repo: detail,
+    },
+    hints: repo ? [] : ["GET /v1/limits?repo=<name> for one repo's measured usage"],
+  };
+});
+
+// ---- D5 mirror-out (FR-39)
+route("PUT", "/v1/repos/:repo/mirror", "mirror set", "admin", async (c) => {
+  const b = await c.body();
+  const repo = c.params.repo ?? "";
+  await coord(c.env, repo).snapshot(); // 404 unless the repo exists
+  const kind = b.kind === "bearer" ? "bearer" : "github";
+  const view = await setMirror(c.env, repo, { url: str(b.url, "url"), kind, token: str(b.token, "token"), by: claimsOf(c).name });
+  return { data: view, hints: [`weft mirror sync --repo ${repo}  # push the current trunk now; every landing pushes afterwards`] };
+});
+route("GET", "/v1/repos/:repo/mirror", "mirror show", "admin", async (c) => {
+  const v = await getMirror(c.env, c.params.repo ?? "");
+  if (!v) throw new WeftError("NOT_FOUND", `no mirror configured for ${c.params.repo ?? ""}`, { hint: "weft mirror set --url https://github.com/owner/repo.git --token-env GITHUB_TOKEN" });
+  const last = await coord(c.env, c.params.repo ?? "").mirrorLast();
+  return { data: { ...v, last: last ?? v.last } };
+});
+route("POST", "/v1/repos/:repo/mirror/sync", "mirror sync", "admin", async (c) => {
+  const repo = c.params.repo ?? "";
+  await resolveShard(c.env, repo);
+  const info = await repoInfo(c.env, repo);
+  const last = await pushMirror(c.env, repo, info.remote, null);
+  if (!last) throw new WeftError("NOT_FOUND", `no mirror configured for ${repo}`);
+  await coord(c.env, repo).mirrorResult({ ok: last.ok, pushed: last.pushed, remoteMain: last.remoteMain, error: last.error });
+  if (!last.ok) throw new WeftError("UPSTREAM_MIRROR", `mirror push failed: ${last.error ?? "unknown"}`, { retryable: true, details: { last } });
+  return { data: last };
+});
+route("DELETE", "/v1/repos/:repo/mirror", "mirror remove", "admin", async (c) => ({ data: { removed: await removeMirror(c.env, c.params.repo ?? "") } }));
 
 route("GET", "/v1/repos/:repo/snapshot", "snapshot", "read", async (c) => ({ data: await coord(c.env, c.params.repo ?? "").snapshot() }));
 
@@ -282,6 +357,63 @@ route("POST", "/v1/repos/:repo/workspaces/:ws/changesets", "submit", "agent", as
   };
 });
 
+// ---- D8 (FR-15): sandbox per workspace — clone, exec and submit in the cloud, no local checkout needed
+const sandboxOf = (env: Env, repo: string, ws: string) => env.SANDBOX.getByName(`${repo}/${ws}`);
+const openSandbox = async (c: Ctx): Promise<{ head: string; branch: string; ms: number }> => {
+  const repo = c.params.repo ?? "";
+  const ws = c.params.ws ?? "";
+  const spec = await coord(c.env, repo).workspaceGit(ws, claimsOf(c)); // ownership + fresh tokens
+  return sandboxOf(c.env, repo, ws).open({ repo, wsId: ws, branch: spec.branch, baseCommit: spec.baseCommit, agentName: spec.agentName, fork: spec.fork, trunk: spec.trunk, stackedOn: spec.stackedOn });
+};
+route("POST", "/v1/repos/:repo/workspaces/:ws/sandbox", "sandbox open", "agent", async (c) => {
+  const opened = await openSandbox(c);
+  return { data: { sandbox: `${c.params.repo ?? ""}/${c.params.ws ?? ""}`, ...opened, exec: `/v1/repos/${c.params.repo ?? ""}/workspaces/${c.params.ws ?? ""}/exec` }, hints: ['weft exec -- "npm test"', 'weft submit -m "..."  # commits and pushes from the sandbox'] };
+});
+route("GET", "/v1/repos/:repo/workspaces/:ws/sandbox", "sandbox status", "agent", async (c) => {
+  await coord(c.env, c.params.repo ?? "").ownWorkspace(c.params.ws ?? "", claimsOf(c));
+  return { data: await sandboxOf(c.env, c.params.repo ?? "", c.params.ws ?? "").status() };
+});
+route("POST", "/v1/repos/:repo/workspaces/:ws/exec", "exec", "agent", async (c) => {
+  const b = await c.body();
+  const cmd = str(b.cmd, "cmd");
+  if (cmd.length > 20_000) throw usage("command too long (max 20,000 chars)");
+  const repo = c.params.repo ?? "";
+  const ws = c.params.ws ?? "";
+  await coord(c.env, repo).workspaceGit(ws, claimsOf(c)); // ownership on every call
+  const box = sandboxOf(c.env, repo, ws);
+  let r = await box.exec(cmd, numOr(b.timeoutMs, 300_000) ?? 300_000);
+  let reopened = false;
+  if ("needsOpen" in r) {
+    // The container stopped while idle: re-clone (pushed checkpoints survive on the fork) and run again.
+    await openSandbox(c);
+    reopened = true;
+    r = await box.exec(cmd, numOr(b.timeoutMs, 300_000) ?? 300_000);
+    if ("needsOpen" in r) throw new WeftError("UPSTREAM_SANDBOX", "sandbox could not be reopened", { retryable: true });
+  }
+  const res = r as ExecResult;
+  return { data: { ...res, reopened }, hints: res.exitCode === 0 ? [] : [`exit ${res.exitCode}`] };
+});
+route("POST", "/v1/repos/:repo/workspaces/:ws/sandbox/submit", "submit", "agent", async (c) => {
+  const b = await c.body();
+  const repo = c.params.repo ?? "";
+  const ws = c.params.ws ?? "";
+  const spec = await coord(c.env, repo).workspaceGit(ws, claimsOf(c));
+  const prep = await sandboxOf(c.env, repo, ws).prepareSubmit({ message: str(b.message, "message"), forkToken: spec.fork.token, trunkToken: spec.trunk.token });
+  if ("needsOpen" in prep) throw invalidStateErr("the sandbox was stopped while idle; run `weft exec -- true` to reopen it (pushed checkpoints are kept), then submit");
+  const refund = claimsOf(c).role === "agent" ? await chargeSubmit(c.env, claimsOf(c), numOr(b.costUsd, 0) ?? 0) : null;
+  const res = await coord(c.env, repo)
+    .submit({ wsId: ws, agent: claimsOf(c), message: str(b.message, "message"), head: prep.head, base: prep.base, filesTouched: prep.files, linesAdded: prep.added, linesDeleted: prep.deleted, checkpoints: prep.checkpoints, behind: prep.behind, promptSha256: typeof b.promptSha256 === "string" ? b.promptSha256 : null, toolCalls: numOr(b.toolCalls, null), costUsd: numOr(b.costUsd, null), resolves: typeof b.resolves === "string" ? b.resolves : null, recipe: null })
+    .catch(async (err: unknown) => {
+      if (refund) await refund();
+      throw err;
+    });
+  return { data: { ...res, sandbox: { head: prep.head, files: prep.files.length } }, hints: [`weft show ${res.changeset.id}  # the queue runs automatically`] };
+});
+route("DELETE", "/v1/repos/:repo/workspaces/:ws/sandbox", "sandbox close", "agent", async (c) => {
+  await coord(c.env, c.params.repo ?? "").ownWorkspace(c.params.ws ?? "", claimsOf(c));
+  return { data: await sandboxOf(c.env, c.params.repo ?? "", c.params.ws ?? "").close() };
+});
+
 route("DELETE", "/v1/repos/:repo/workspaces/:ws", "abandon", "agent", async (c) => ({ data: await coord(c.env, c.params.repo ?? "").abandon(c.params.ws ?? "", claimsOf(c)) }));
 
 route("GET", "/v1/repos/:repo/queue", "queue", "read", async (c) => ({ data: await coord(c.env, c.params.repo ?? "").queue() }));
@@ -312,12 +444,12 @@ route("GET", "/v1/repos/:repo/changesets/:cs/log", "logs", "read", async (c) => 
   return { data: { key, log: obj ? await obj.text() : null } };
 });
 
-route("POST", "/v1/repos/:repo/changesets/:cs/approve", "approve", "admin", async (c) => ({
+route("POST", "/v1/repos/:repo/changesets/:cs/approve", "approve", "review", async (c) => ({
   data: await coord(c.env, c.params.repo ?? "").approve(c.params.cs ?? "", claimsOf(c).name === "admin" ? String((await c.body()).by ?? "admin") : claimsOf(c).name),
   hints: ["the queue runs automatically"],
 }));
 
-route("POST", "/v1/repos/:repo/changesets/:cs/reject", "reject", "admin", async (c) => {
+route("POST", "/v1/repos/:repo/changesets/:cs/reject", "reject", "review", async (c) => {
   const b = await c.body();
   return { data: await coord(c.env, c.params.repo ?? "").reject(c.params.cs ?? "", String(b.by ?? claimsOf(c).name), String(b.reason ?? "rejected in review")) };
 });
@@ -354,6 +486,7 @@ route("POST", "/v1/repos/:repo/changesets/:cs/revert", "revert", "admin", async 
 
 route("GET", "/v1/repos/:repo/log", "log", "read", async (c) => {
   const n = Math.min(100, Math.max(1, Number(c.url.searchParams.get("n") ?? "20")));
+  await resolveShard(c.env, c.params.repo ?? "");
   const log = await trunkLog(c.env, c.params.repo ?? "", n);
   return {
     data: log.map((e) => {
@@ -458,7 +591,7 @@ export default {
     }
     if (url.pathname === "/mcp") {
       try {
-        const claims = await authenticate(req, env);
+        const claims = await authenticate(req, env, exec);
         await gateAgent(env, claims);
         return await handleMcp(req, env, exec, claims);
       } catch (err: unknown) {
@@ -469,7 +602,7 @@ export default {
     const wsMatch = /^\/v1\/repos\/([^/]+)\/ws$/.exec(url.pathname);
     if (wsMatch && req.headers.get("Upgrade") === "websocket") {
       try {
-        const claims = await optionalAuth(req, env);
+        const claims = await optionalAuth(req, env, exec);
         if (!claims && env.PUBLIC_READ !== "true") throw new WeftError("UNAUTHENTICATED", "missing bearer token");
         const headers = new Headers(req.headers);
         headers.set("x-weft-ws-role", claims && claims.role === "agent" && url.searchParams.get("as") === "agent" ? "agent" : "ui");
@@ -490,9 +623,10 @@ export default {
     r.keys.forEach((k, i) => (params[k] = decodeURIComponent(m?.[i + 1] ?? "")));
     let cached: Record<string, unknown> | null = null;
     try {
-      const claims = r.auth === "public" ? null : r.auth === "read" ? await optionalAuth(req, env) : await authenticate(req, env);
+      const claims = r.auth === "public" ? null : r.auth === "read" ? await optionalAuth(req, env, exec) : await authenticate(req, env, exec);
       if (r.auth === "read" && !claims && env.PUBLIC_READ !== "true") throw new WeftError("UNAUTHENTICATED", "missing bearer token");
       if (r.auth === "admin" && claims) requireAdmin(claims);
+      if (r.auth === "review" && claims) requireReviewer(claims);
       await gateAgent(env, claims);
       const ctx: Ctx = {
         req,
@@ -523,5 +657,11 @@ export default {
 
   async queue(batch: MessageBatch<Record<string, unknown>>, env: Env): Promise<void> {
     await projection(batch, env);
+  },
+
+  // D6: weekly agent-token key rotation (no-op until the current key is 7 days old).
+  async scheduled(_ctl: ScheduledController, env: Env): Promise<void> {
+    const rotated = await rotateIfDue(env);
+    console.log(JSON.stringify({ level: "info", msg: "cron: key rotation check", rotated }));
   },
 } satisfies ExportedHandler<Env, Record<string, unknown>>;

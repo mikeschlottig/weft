@@ -7,18 +7,27 @@
   "observability": { "enabled": true },
   "assets": { "directory": "./web", "binding": "ASSETS", "run_worker_first": ["/v1/*", "/mcp", "/healthz", "/.well-known/*"] },
 
-  // Artifacts: trunk + one fork per workspace, all in the "weft" namespace.
-  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "weft" }],
+  // Artifacts: trunk + one fork per workspace. D7: repos are sharded across namespaces (ARTIFACTS = shard 0,
+  // ARTIFACTS_S1 = shard 1); a repo and its forks share one namespace. ARTIFACTS_SHARDS must match.
+  "artifacts": [
+    { "binding": "ARTIFACTS", "namespace": "weft" },
+    { "binding": "ARTIFACTS_S1", "namespace": "weft-s1" }
+  ],
 
   "durable_objects": {
     "bindings": [
       { "name": "REPO", "class_name": "RepoCoordinator" },
-      { "name": "MERGE_RUNNER", "class_name": "MergeRunner" }
+      { "name": "MERGE_RUNNER", "class_name": "MergeRunner" },
+      { "name": "SANDBOX", "class_name": "WorkspaceSandbox" }
     ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RepoCoordinator", "MergeRunner"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RepoCoordinator", "MergeRunner"] },
+    { "tag": "v2", "new_sqlite_classes": ["WorkspaceSandbox"] }
+  ],
 
-  // The only trunk writer: real git in a Container, one instance per repo.
+  // The only trunk writer: real git in a Container, one instance per repo lane (E1).
+  // D8: one sandbox per workspace, started by its Durable Object (Sandbox SDK 1.0 model).
   "containers": [
     {
       "class_name": "MergeRunner",
@@ -26,6 +35,11 @@
       "image_build_context": ".",
       "max_instances": 10,
       "instance_type": "basic"
+    },
+    {
+      "class_name": "WorkspaceSandbox",
+      "scheduling_policy": "durable_object",
+      "images": { "workspace": { "dockerfile": "./container/Dockerfile.sandbox" } }
     }
   ],
 
@@ -35,8 +49,13 @@
     { "name": "weft-push-observer", "binding": "PUSH_OBSERVER", "class_name": "PushObserver" }
   ],
   // FR-05: every push to any repo in the namespace starts a PushObserver (no per-fork subscriptions).
+  // D6: weekly agent-token key rotation check (Mondays 04:17 UTC).
   "triggers": {
-    "events": [{ "type": "cf.artifacts.repo.pushed", "filter": { "namespace": "weft" }, "targets": [{ "type": "workflow", "workflow_name": "weft-push-observer" }] }]
+    "crons": ["17 4 * * 1"],
+    "events": [
+      { "type": "cf.artifacts.repo.pushed", "filter": { "namespace": "weft" }, "targets": [{ "type": "workflow", "workflow_name": "weft-push-observer" }] },
+      { "type": "cf.artifacts.repo.pushed", "filter": { "namespace": "weft-s1" }, "targets": [{ "type": "workflow", "workflow_name": "weft-push-observer" }] }
+    ]
   },
 
   "queues": {
@@ -55,7 +74,7 @@
   "analytics_engine_datasets": [{ "binding": "METRICS", "dataset": "weft_events" }],
 
   "secrets": { "required": ["ADMIN_TOKEN", "JWT_SIGNING_SECRET"] },
-  "vars": { "PUBLIC_READ": "true", "WEFT_ENV": "production", "ARTIFACTS_EVENTS_QUEUE": "weft-artifacts-events", "WEFT_SIGNING_PUBKEY": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAPlo/RKrXy/UAmmyhjeG/gO2X1uybR5IhEfRtaYu294 queue@weft.dev" },
+  "vars": { "PUBLIC_READ": "true", "WEFT_ENV": "production", "ARTIFACTS_SHARDS": "2", "ARTIFACTS_EVENTS_QUEUE": "weft-artifacts-events", "WEFT_SIGNING_PUBKEY": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAPlo/RKrXy/UAmmyhjeG/gO2X1uybR5IhEfRtaYu294 queue@weft.dev" },
 
   // ---------------------------------------------------------------- weft-dev
   // M1–M3 development. A separate Worker (weft-dev) with its own Artifacts namespace, D1, R2, KV,
@@ -63,11 +82,15 @@
   // Deploy: npx wrangler deploy --env dev
   "env": {
     "dev": {
-      "artifacts": [{ "binding": "ARTIFACTS", "namespace": "weft-dev" }],
+      "artifacts": [
+        { "binding": "ARTIFACTS", "namespace": "weft-dev" },
+        { "binding": "ARTIFACTS_S1", "namespace": "weft-dev-s1" }
+      ],
       "durable_objects": {
         "bindings": [
           { "name": "REPO", "class_name": "RepoCoordinator" },
-          { "name": "MERGE_RUNNER", "class_name": "MergeRunner" }
+          { "name": "MERGE_RUNNER", "class_name": "MergeRunner" },
+          { "name": "SANDBOX", "class_name": "WorkspaceSandbox" }
         ]
       },
       "containers": [
@@ -77,6 +100,11 @@
           "image_build_context": ".",
           "max_instances": 10,
           "instance_type": "basic"
+        },
+        {
+          "class_name": "WorkspaceSandbox",
+          "scheduling_policy": "durable_object",
+          "images": { "workspace": { "dockerfile": "./container/Dockerfile.sandbox" } }
         }
       ],
       "workflows": [
@@ -85,7 +113,11 @@
         { "name": "weft-push-observer-dev", "binding": "PUSH_OBSERVER", "class_name": "PushObserver" }
       ],
       "triggers": {
-        "events": [{ "type": "cf.artifacts.repo.pushed", "filter": { "namespace": "weft-dev" }, "targets": [{ "type": "workflow", "workflow_name": "weft-push-observer-dev" }] }]
+        "crons": ["17 4 * * 1"],
+        "events": [
+          { "type": "cf.artifacts.repo.pushed", "filter": { "namespace": "weft-dev" }, "targets": [{ "type": "workflow", "workflow_name": "weft-push-observer-dev" }] },
+          { "type": "cf.artifacts.repo.pushed", "filter": { "namespace": "weft-dev-s1" }, "targets": [{ "type": "workflow", "workflow_name": "weft-push-observer-dev" }] }
+        ]
       },
       "queues": {
         "producers": [{ "binding": "JOBS", "queue": "weft-jobs-dev" }],
@@ -100,7 +132,7 @@
       "ai": { "binding": "AI" },
       "analytics_engine_datasets": [{ "binding": "METRICS", "dataset": "weft_events_dev" }],
       "secrets": { "required": ["ADMIN_TOKEN", "JWT_SIGNING_SECRET"] },
-      "vars": { "PUBLIC_READ": "true", "WEFT_ENV": "dev", "ARTIFACTS_EVENTS_QUEUE": "weft-artifacts-events-dev", "WEFT_SIGNING_PUBKEY": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKm+s/wrMSuz9vOCkPL8XrGMvtU+fkhJYg3vtHv2S6PT queue@weft.dev" }
+      "vars": { "PUBLIC_READ": "true", "WEFT_ENV": "dev", "ARTIFACTS_SHARDS": "2", "ARTIFACTS_EVENTS_QUEUE": "weft-artifacts-events-dev", "WEFT_SIGNING_PUBKEY": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKm+s/wrMSuz9vOCkPL8XrGMvtU+fkhJYg3vtHv2S6PT queue@weft.dev" }
     }
   }
 }

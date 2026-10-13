@@ -9,10 +9,11 @@
 import { DurableObject } from "cloudflare:workers";
 import { WeftError, encodeForRpc, invalidState, notFound, toWeftError, usage } from "../core/errors.ts";
 import { RECIPE_ARG } from "../core/types.ts";
-import { blockingOverlaps, forecast, isLive, isRealOverlap, outOfIntent, scoreRisk } from "../core/forecast.ts";
+import { blockingOverlaps, forecast, isLive, isRealOverlap, outOfIntent, reconcileDiff, scoreRisk } from "../core/forecast.ts";
 import { matches, prefixesOverlap } from "../core/glob.ts";
 import { DUPLICATE_THRESHOLD, EMBED_MODEL, cosine, parseEmbedding } from "../core/similarity.ts";
 import { checkGate, composeScorecard, processGates } from "../core/rubric.ts";
+import { type LimitRow, type RepoUsage, assessRepo } from "../core/limits.ts";
 import type {
   AgentClaims,
   BatchClaim,
@@ -36,7 +37,7 @@ import type {
   WeftEvent,
   Workspace,
 } from "../core/types.ts";
-import { awaitImported, changedPaths, createTrunk, forkName, headOf, headerToken, importTrunk, listFiles, mintToken, provisionFork, repoInfo, revokeAllTokens, revokeToken } from "./artifacts.ts";
+import { artifactsCalls10s, awaitImported, changedPaths, createTrunk, forkName, headOf, headerToken, importTrunk, listFiles, mintToken, provisionFork, registerShard, repoInfo, revokeAllTokens, revokeToken } from "./artifacts.ts";
 import { runner, signingKey } from "./runner-client.ts";
 
 export const DEFAULT_CONFIG: RepoConfig = {
@@ -55,6 +56,10 @@ const TRUNK_READ_TTL = 3600;
 const RUNNER_LEASE_MS = 30 * 60_000;
 const KICK_DELAY_MS = 2_500;
 const MAX_ATTEMPTS = 3;
+/** E4: infrastructure retries are separate from failures and capped higher (they are not the agent's fault). */
+const MAX_INFRA_ATTEMPTS = 6;
+/** E6 (review L4): events kept per repo; older rows are pruned in the alarm. */
+const EVENTS_RETAINED = 20_000;
 
 interface Meta {
   repo: string;
@@ -62,13 +67,18 @@ interface Meta {
   config: RepoConfig;
   seq: number;
   trunkHead: string | null;
-  trunkFiles: { head: string; files: string[] } | null;
+  /** `truncated`: the repo has more files than listFiles' cap; the forecast then also uses prefix overlap (E5). */
+  trunkFiles: { head: string; files: string[]; truncated?: boolean } | null;
   /** Legacy single-lane field (pre FR-26); migrated into activeBatches on read. */
   activeBatch?: { id: string; workflowId: string; since: number } | null;
   /** FR-26: one entry per lane in flight, with the (merge-relevant) files its changesets touch. */
   activeBatches?: ActiveBatch[];
   paused: string | null;
   createdAt: string;
+  /** D7: Artifacts namespace shard of this repo and its forks (absent = 0, pre-sharding). */
+  shard?: number;
+  /** D5: the last mirror push (authoritative; KV holds the config and is only eventually consistent). */
+  mirrorLast?: { at: string; ok: boolean; pushed: string | null; remoteMain: string | null; error: string | null } | null;
 }
 
 interface ActiveBatch {
@@ -76,6 +86,8 @@ interface ActiveBatch {
   workflowId: string;
   since: number;
   files: string[];
+  /** E1: lane slot — selects this batch's merge-runner instance. */
+  lane?: number;
 }
 
 interface BatchRow {
@@ -154,7 +166,10 @@ export class RepoCoordinator extends DurableObject<Env> {
 
   private metaOrNull(): Meta | null {
     const row = this.sql.exec<{ v: string }>(`SELECT v FROM meta WHERE k = 'meta'`).toArray()[0];
-    return row ? (JSON.parse(row.v) as Meta) : null;
+    if (!row) return null;
+    const m = JSON.parse(row.v) as Meta;
+    registerShard(m.repo, m.shard ?? 0); // every Artifacts call for this repo goes to its namespace shard
+    return m;
   }
   private meta(): Meta {
     const m = this.metaOrNull();
@@ -311,16 +326,18 @@ export class RepoCoordinator extends DurableObject<Env> {
     }
   }
 
-  private async trunkFiles(m: Meta): Promise<{ head: string | null; files: string[] }> {
+  private async trunkFiles(m: Meta): Promise<{ head: string | null; files: string[]; truncated?: boolean }> {
     const head = await headOf(this.env, m.repo);
     if (!head) return { head: null, files: [] };
     if (m.trunkFiles && m.trunkFiles.head === head) return m.trunkFiles;
-    const files = await listFiles(this.env, m.repo, head);
+    const listed = await listFiles(this.env, m.repo, head);
+    const files = listed.files;
     const fresh = this.meta();
-    fresh.trunkFiles = { head, files };
-    fresh.trunkHead = head;
+    // E6 (review L1): a landing during the await may have advanced trunkHead; never move it backwards.
+    if (fresh.trunkHead === m.trunkHead || fresh.trunkHead === null) fresh.trunkHead = head;
+    if (!fresh.trunkFiles || fresh.trunkHead === head) fresh.trunkFiles = { head, files, ...(listed.truncated ? { truncated: true } : {}) };
     this.saveMeta(fresh);
-    return { head, files };
+    return { head, files, truncated: listed.truncated };
   }
 
   private scheduleKick(delayMs = KICK_DELAY_MS): void {
@@ -335,8 +352,10 @@ export class RepoCoordinator extends DurableObject<Env> {
 
   // ------------------------------------------------------------ repo lifecycle
 
-  init(input: { repo: string; config: Partial<RepoConfig>; actor: string; import?: { url: string; branch?: string } | null }): Promise<{ repo: string; remote: string; token: string; config: RepoConfig; adopted: boolean; imported: { url: string; defaultBranch: string } | null }> {
+  init(input: { repo: string; config: Partial<RepoConfig>; actor: string; import?: { url: string; branch?: string } | null; shard?: number }): Promise<{ repo: string; remote: string; token: string; config: RepoConfig; adopted: boolean; imported: { url: string; defaultBranch: string } | null; shard: number }> {
     return this.guard(async () => {
+      const shard = input.shard ?? 0;
+      registerShard(input.repo, shard);
       if (!/^[a-z0-9][a-z0-9._-]{0,40}$/.test(input.repo)) throw usage(`invalid repo name: ${input.repo}`, "lowercase letters, digits, . _ - (max 41 chars)");
       if (this.metaOrNull()) throw new WeftError("ALREADY_EXISTS", `repo already exists: ${input.repo}`, { hint: `weft status --repo ${input.repo}` });
       let remote: string;
@@ -363,11 +382,11 @@ export class RepoCoordinator extends DurableObject<Env> {
         adopted = true;
       }
       const config: RepoConfig = { ...DEFAULT_CONFIG, ...input.config, judge: { ...DEFAULT_CONFIG.judge, ...(input.config.judge ?? {}) } };
-      const m: Meta = { repo: input.repo, trunkRemote: remote, config, seq: 0, trunkHead: null, trunkFiles: null, activeBatches: [], paused: null, createdAt: now() };
-      this.emit(m, "repo.created", input.actor, { remote, adopted, imported: imported?.url ?? null });
+      const m: Meta = { repo: input.repo, trunkRemote: remote, config, seq: 0, trunkHead: null, trunkFiles: null, activeBatches: [], paused: null, createdAt: now(), shard };
+      this.emit(m, "repo.created", input.actor, { remote, adopted, imported: imported?.url ?? null, shard });
       this.saveMeta(m);
       this.project({ kind: "repo", repo: m.repo, config, createdAt: m.createdAt });
-      return { repo: input.repo, remote, token, config, adopted, imported };
+      return { repo: input.repo, remote, token, config, adopted, imported, shard };
     });
   }
 
@@ -467,7 +486,7 @@ export class RepoCoordinator extends DurableObject<Env> {
       // ---- decision block (no awaits)
       const m = this.meta();
       const live = this.liveWs().filter((o) => !parent || o.id !== parent.ws.id);
-      const fc = forecast(live, { wsId: null, globs: input.globs, touched: [] }, tf.files, m.config, Date.now());
+      const fc = forecast(live, { wsId: null, globs: input.globs, touched: [] }, tf.files, m.config, Date.now(), { truncated: tf.truncated === true });
       if (taskVec) {
         const dups = live
           .filter((o) => o.taskVec && isLive(o, Date.now()))
@@ -635,6 +654,44 @@ export class RepoCoordinator extends DurableObject<Env> {
     });
   }
 
+  /** D8: ownership only (any status) — for reading or closing a workspace's sandbox after it landed. */
+  ownWorkspace(wsId: string, agent: AgentClaims) {
+    return this.guard(async () => {
+      const w = this.own(wsId, agent);
+      return { wsId: w.id, status: w.status };
+    });
+  }
+
+  /** D8: everything a sandbox needs to clone this workspace (ownership checked; fresh fork + trunk tokens). */
+  workspaceGit(wsId: string, agent: AgentClaims) {
+    return this.guard(async () => {
+      const w0 = this.own(wsId, agent);
+      if (w0.status === "landed" || w0.status === "abandoned") throw invalidState(`workspace ${wsId} is ${w0.status}`);
+      const m = this.meta();
+      const forkTok = await mintToken(this.env, w0.forkRepo, "write", FORK_TOKEN_TTL);
+      const trunkTok = await mintToken(this.env, m.repo, "read", TRUNK_READ_TTL);
+      const w = this.ws(wsId);
+      w.forkTokenId = forkTok.id;
+      this.putWs(w);
+      let stackedOn: { branch: string; head: string } | null = null;
+      if (w.after) {
+        const pc = this.cs(w.after);
+        stackedOn = { branch: this.ws(pc.wsId).branch, head: pc.headCommit };
+      }
+      return {
+        repo: m.repo,
+        wsId: w.id,
+        branch: w.branch,
+        baseCommit: w.baseCommit,
+        agentName: w.agentName,
+        status: w.status,
+        fork: { remote: w.forkRemote, token: headerToken(forkTok.plaintext) },
+        trunk: { remote: m.trunkRemote, token: headerToken(trunkTok.plaintext) },
+        stackedOn,
+      };
+    });
+  }
+
   heartbeat(input: { wsId: string; agent: AgentClaims; touched: string[]; symbols?: Record<string, string[]> }) {
     return this.guard(() => this.heartbeatCore({ ...input, source: "cli" }));
   }
@@ -673,7 +730,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         w.expiredNotified = false;
       }
       const others = this.peersOf(w);
-      const fc = forecast(others, { wsId: w.id, globs: w.intent.globs, touched: w.touched, symbols: w.touchedSymbols }, tf.files, m.config, Date.now());
+      const fc = forecast(others, { wsId: w.id, globs: w.intent.globs, touched: w.touched, symbols: w.touchedSymbols }, tf.files, m.config, Date.now(), { truncated: tf.truncated === true });
       const keys = fc.overlaps.filter(isRealOverlap).map((o) => `${o.workspaceId}:${o.strength}:${o.files.join(",")}`);
       const fresh = keys.filter((k) => !w.alertKeys.includes(k));
       w.alertKeys = keys;
@@ -711,7 +768,7 @@ export class RepoCoordinator extends DurableObject<Env> {
       const w = this.own(input.wsId, input.agent);
       if (w.status !== "active" && w.status !== "conflicted") throw invalidState(`workspace ${w.id} is ${w.status}`);
       const next = [...new Set([...w.intent.globs, ...input.globs])];
-      const fc = forecast(this.peersOf(w), { wsId: w.id, globs: next, touched: w.touched }, tf.files, m.config, Date.now());
+      const fc = forecast(this.peersOf(w), { wsId: w.id, globs: next, touched: w.touched }, tf.files, m.config, Date.now(), { truncated: tf.truncated === true });
       const blocking = fc.overlaps.filter((o) => o.mode === "exclusive" && isRealOverlap(o));
       if (blocking.length > 0) throw new WeftError("LEASE_HELD", "widening would overlap an exclusive intent", { retryable: true, details: { blocking } });
       w.intent.globs = next;
@@ -806,7 +863,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         toolCalls: input.toolCalls,
         costUsd: input.costUsd,
       };
-      const fc = forecast(this.peersOf(w), { wsId: w.id, globs: w.intent.globs, touched: input.filesTouched, symbols: w.touchedSymbols }, tf.files, m.config, Date.now());
+      const fc = forecast(this.peersOf(w), { wsId: w.id, globs: w.intent.globs, touched: input.filesTouched, symbols: w.touchedSymbols }, tf.files, m.config, Date.now(), { truncated: tf.truncated === true });
       const overlapping = fc.overlaps.filter(isRealOverlap).length;
       const risk = scoreRisk(m.config, prov, overlapping, input.behind);
       const needsReview = risk.sensitive || risk.score >= m.config.reviewThreshold;
@@ -1000,10 +1057,15 @@ export class RepoCoordinator extends DurableObject<Env> {
       pre[c.id] = { gates: [], judge: null, behind: w.behindAtSubmit, rejections: w.rejections };
     }
     const workflowId = `${m.repo.replace(/[^a-zA-Z0-9_-]/g, "_")}-${batchId}`;
+    // E1: the lowest free lane slot; each slot is its own merge-runner instance, so lanes really run in parallel.
+    const usedSlots = new Set(this.actives(m).map((b) => b.lane ?? 0));
+    let lane = 0;
+    while (usedSlots.has(lane)) lane += 1;
+    claim.lane = lane;
     this.putBatch({ id: batchId, state: "claimed", claim, pre });
     const laneFilesSet = [...new Set(queued.flatMap((c) => this.laneFiles(m, c.provenance.filesTouched)))];
-    this.actives(m).push({ id: batchId, workflowId, since: Date.now(), files: laneFilesSet });
-    this.emit(m, "queue.batch_started", actor, { batchId, changesets: members.map((x) => x.id), trunkHead: head, lane: this.actives(m).length, lanesInFlight: this.actives(m).map((b) => b.id) });
+    this.actives(m).push({ id: batchId, workflowId, since: Date.now(), files: laneFilesSet, lane });
+    this.emit(m, "queue.batch_started", actor, { batchId, changesets: members.map((x) => x.id), trunkHead: head, lane: lane + 1, runner: lane > 0 ? `lane-${lane}` : "lane-0", lanesInFlight: this.actives(m).map((b) => b.id) });
     this.saveMeta(m);
 
     try {
@@ -1012,7 +1074,7 @@ export class RepoCoordinator extends DurableObject<Env> {
       if (this.actives(this.meta()).length < this.lanesOf(m)) this.scheduleKick(300);
       return batchId;
     } catch (err: unknown) {
-      await this.requeueInternal(batchId, `workflow create failed: ${toWeftError(err).message}`);
+      await this.requeueInternal(batchId, `workflow create failed: ${toWeftError(err).message}`, "infra");
       return null;
     }
   }
@@ -1045,7 +1107,7 @@ export class RepoCoordinator extends DurableObject<Env> {
   }
 
   /** Store pre-check rubric results; if a hold rule fires, route the changeset to a human. */
-  recordJudgement(batchId: string, csId: string, gates: GateResult[], judge: JudgeAnswers | null, hold: string | null) {
+  recordJudgement(batchId: string, csId: string, gates: GateResult[], judge: JudgeAnswers | null, judgeHold: string | null, actual?: { files: string[]; added: number; deleted: number }) {
     return this.guard(async () => {
       const m = this.meta();
       const b = this.batch(batchId);
@@ -1056,6 +1118,24 @@ export class RepoCoordinator extends DurableObject<Env> {
       p.judge = judge;
       this.putBatch(b);
       const c = this.cs(csId);
+      let hold = judgeHold;
+      // E3: re-score risk from the runner's authoritative diff (not the agent's claim) before speculation.
+      // Stacked children carry their parent's commits in the fork diff, so they keep the claimed stats.
+      if (actual && !c.provenance.claimed && !c.after) {
+        // Same live-overlap count and drift as at submit, so an honest claim re-scores identically and only
+        // the diff-derived factors (breadth, size, sensitive, out-of-intent) can move the score.
+        const submitOverlaps = Math.round((c.risk.find((f) => f.name === "live_overlap")?.weight ?? 0) / 10);
+        const r = reconcileDiff(m.config, c.provenance, actual, submitOverlaps, p.behind);
+        const before = c.riskScore;
+        c.provenance = r.prov;
+        c.riskScore = r.risk.score;
+        c.risk = r.risk.factors;
+        // A human who already approved this changeset has seen it; only an under-reported diff re-holds it.
+        if (!hold && r.hold && (!c.approvedBy || r.underReported)) hold = r.hold;
+        if (r.underReported || r.risk.score !== before) {
+          this.emit(m, "changeset.rescored", "weft", { csId, agentName: c.provenance.agentName, claimedRisk: before, risk: r.risk.score, hiddenFiles: r.hidden.slice(0, 10), underReported: r.underReported, held: hold !== null && hold === r.hold });
+        }
+      }
       const card = composeScorecard({ pre: gates, check: checkGate(null, m.config.checkCommand !== null), judge, process: processGates(p.rejections, p.behind), hold, now: now() });
       c.scorecard = card;
       if (hold && c.status === "validating") {
@@ -1088,6 +1168,9 @@ export class RepoCoordinator extends DurableObject<Env> {
     logKeys: Record<string, string>;
     readmitted?: string[];
     laneRebases?: number;
+    flaky?: string[];
+    /** E1 evidence: when this lane's runner instance speculated (lets anyone check lanes overlapped). */
+    speculation?: { lane: number; startedAt: number; endedAt: number };
   }) {
     return this.guard(async () => {
       const m = this.meta();
@@ -1200,8 +1283,13 @@ export class RepoCoordinator extends DurableObject<Env> {
         bisectSteps: input.bisectSteps,
         readmitted: input.readmitted ?? [],
         laneRebases: input.laneRebases ?? 0,
+        flaky: input.flaky ?? [],
+        speculation: input.speculation ?? null,
         trunkHead: input.trunkAfter ?? b.claim.trunkHead,
       });
+      if ((input.flaky ?? []).length > 0) {
+        this.emit(m, "queue.flaky_check", "weft-merge-queue", { batchId: b.id, changesets: input.flaky, detail: "the merged tip was red once and green on a fresh re-run; it landed and nobody was blamed" });
+      }
       this.saveMeta(m);
       // Landed forks no longer need write access.
       this.ctx.waitUntil(
@@ -1218,24 +1306,37 @@ export class RepoCoordinator extends DurableObject<Env> {
     });
   }
 
-  private async requeueInternal(batchId: string, reason: string, countsAsFailure = true): Promise<void> {
+  /**
+   * Put a batch's members back in the queue. `kind`: "failure" counts toward MAX_ATTEMPTS (a deterministic
+   * problem with the changeset), "infra" counts toward MAX_INFRA_ATTEMPTS (the platform failed; rejected as
+   * `infra`, never `policy`, so agents and judge calibration are not told it was their fault), "none" is free.
+   */
+  private async requeueInternal(batchId: string, reason: string, kind: "failure" | "infra" | "none" = "failure"): Promise<void> {
     const m = this.meta();
     const b = this.batch(batchId);
     if (b && b.state === "claimed") {
       for (const x of b.claim.members) {
         const c = this.cs(x.id);
         if (c.status !== "validating") continue;
-        c.attempts = (c.attempts ?? 0) + (countsAsFailure ? 1 : 0);
+        c.attempts = (c.attempts ?? 0) + (kind === "failure" ? 1 : 0);
+        c.infraAttempts = (c.infraAttempts ?? 0) + (kind === "infra" ? 1 : 0);
         c.batchId = null;
-        if (c.attempts >= MAX_ATTEMPTS) {
-          // A deterministic failure must not loop forever: hand the changeset back with the reason.
+        const exhausted = c.attempts >= MAX_ATTEMPTS ? "policy" : c.infraAttempts >= MAX_INFRA_ATTEMPTS ? "infra" : null;
+        if (exhausted) {
+          // Neither kind may loop forever: hand the changeset back with the reason.
           c.status = "rejected";
-          c.rejection = { reason: "policy", detail: `merge runner failed ${c.attempts} times: ${reason.slice(0, 400)}`, files: [], conflictsWith: [], logKey: null };
+          c.rejection = {
+            reason: exhausted,
+            detail: exhausted === "infra" ? `the platform failed ${c.infraAttempts} times while validating this changeset (not caused by it): ${reason.slice(0, 400)}` : `merge runner failed ${c.attempts} times: ${reason.slice(0, 400)}`,
+            files: [],
+            conflictsWith: [],
+            logKey: null,
+          };
           const w = this.ws(c.wsId);
           w.status = "active";
-          w.rejections += 1;
+          if (exhausted === "policy") w.rejections += 1;
           this.putWs(w);
-          this.emit(m, "changeset.rejected", "weft-merge-queue", { csId: c.id, wsId: c.wsId, agentName: c.provenance.agentName, reason: "policy", files: [], conflictsWith: [], wqs: null }, [`agent:${c.agentId}`]);
+          this.emit(m, "changeset.rejected", "weft-merge-queue", { csId: c.id, wsId: c.wsId, agentName: c.provenance.agentName, reason: exhausted, files: [], conflictsWith: [], wqs: null }, [`agent:${c.agentId}`]);
         } else {
           c.status = "queued";
         }
@@ -1245,22 +1346,62 @@ export class RepoCoordinator extends DurableObject<Env> {
       this.putBatch(b);
     }
     m.activeBatches = this.actives(m).filter((x) => x.id !== batchId);
-    this.emit(m, "queue.requeued", "weft-merge-queue", { batchId, reason });
+    this.emit(m, "queue.requeued", "weft-merge-queue", { batchId, reason, kind });
     this.saveMeta(m);
     this.scheduleKick(15_000);
   }
 
-  requeueBatch(batchId: string, reason: string) {
-    return this.guard(() => this.requeueInternal(batchId, reason, !/trunk moved|verify:/.test(reason)));
+  requeueBatch(batchId: string, reason: string, kind?: "failure" | "infra") {
+    return this.guard(() => this.requeueInternal(batchId, reason, /trunk moved|verify:/.test(reason) ? "none" : (kind ?? "failure")));
+  }
+
+  /** D7: measured usage of this repo against documented platform limits. */
+  limits(): Promise<{ usage: RepoUsage; rows: LimitRow[] }> {
+    return this.guard(async () => {
+      const m = this.meta();
+      const count = (sql: string, ...args: (string | number)[]): number => Number(this.sql.exec<{ n: number }>(sql, ...args).one().n);
+      const usage: RepoUsage = {
+        repo: m.repo,
+        shard: m.shard ?? 0,
+        sqliteBytes: this.ctx.storage.sql.databaseSize,
+        events: count(`SELECT COUNT(*) AS n FROM events`),
+        workspacesLive: count(`SELECT COUNT(*) AS n FROM workspaces WHERE status IN ('provisioning','active','conflicted','submitted')`),
+        forksTotal: count(`SELECT COUNT(*) AS n FROM workspaces`),
+        queued: count(`SELECT COUNT(*) AS n FROM changesets WHERE status = 'queued'`),
+        validating: count(`SELECT COUNT(*) AS n FROM changesets WHERE status = 'validating'`),
+        lanesInFlight: this.actives(m).length,
+        lanesConfigured: this.lanesOf(m),
+        trunkFiles: m.trunkFiles?.files.length ?? 0,
+        trunkTruncated: m.trunkFiles?.truncated === true,
+        artifactsCalls10s: artifactsCalls10s(m.repo),
+      };
+      return { usage, rows: assessRepo(usage) };
+    });
+  }
+
+  mirrorLast() {
+    return this.guard(async () => this.meta().mirrorLast ?? null);
+  }
+
+  /** D5: record a mirror push outcome (the mirror itself is configured in KV by the Worker). */
+  mirrorResult(input: { ok: boolean; pushed: string | null; remoteMain: string | null; error: string | null }) {
+    return this.guard(async () => {
+      const m = this.meta();
+      m.mirrorLast = { at: now(), ...input };
+      this.emit(m, input.ok ? "mirror.pushed" : "mirror.failed", "weft-mirror", { commit: input.pushed, remoteMain: input.remoteMain, error: input.error });
+      this.saveMeta(m);
+      return null;
+    });
   }
 
   trunkRed(batchId: string, detail: string) {
     return this.guard(async () => {
-      await this.requeueInternal(batchId, "trunk is red", false);
+      await this.requeueInternal(batchId, "trunk is red", "none");
       const m = this.meta();
       m.paused = `check fails on trunk ${m.trunkHead ?? ""}`.trim();
       this.emit(m, "queue.trunk_red", "weft-merge-queue", { batchId, detail: detail.slice(-1500) });
       this.saveMeta(m);
+      return null; // RPC results are JSON-cloned by the Workflow; undefined is not JSON
     });
   }
 
@@ -1315,7 +1456,7 @@ export class RepoCoordinator extends DurableObject<Env> {
       const nowMs = Date.now();
       const scope = tf.files.filter((f) => matches(f, w.intent.globs));
       const others = this.liveWs().filter((o) => o.id !== w.id);
-      const fc = forecast(others, { wsId: w.id, globs: w.intent.globs, touched: w.touched }, tf.files, m.config, nowMs);
+      const fc = forecast(others, { wsId: w.id, globs: w.intent.globs, touched: w.touched }, tf.files, m.config, nowMs, { truncated: tf.truncated === true });
       const peers = fc.overlaps.map((o) => {
         const pw = others.find((x) => x.id === o.workspaceId);
         return { agent: o.agentName, workspace: o.workspaceId, task: o.task, mode: o.mode, strength: o.strength, files: o.files, theirIntent: pw?.intent.globs ?? o.globs, theirTouched: pw?.touched ?? [] };
@@ -1393,7 +1534,7 @@ export class RepoCoordinator extends DurableObject<Env> {
       const w = this.own(wsId, agent);
       if (w.status !== "active" && w.status !== "conflicted") throw invalidState(`workspace ${w.id} is ${w.status}; only an active or conflicted workspace can be resumed`, w.status === "submitted" ? `weft show ${w.changesetId ?? ""}` : "weft start  # begin a new workspace");
       const others = this.liveWs().filter((o) => o.id !== w.id);
-      const fc = forecast(others, { wsId: w.id, globs: w.intent.globs, touched: w.touched }, tf.files, m.config, Date.now());
+      const fc = forecast(others, { wsId: w.id, globs: w.intent.globs, touched: w.touched }, tf.files, m.config, Date.now(), { truncated: tf.truncated === true });
       const blocking = blockingOverlaps(fc, w.intent.mode);
       if (blocking.length > 0) {
         throw new WeftError("LEASE_HELD", "another agent holds an exclusive intent over your scope", { retryable: true, hint: "wait for it to land, or narrow your scope with a new workspace", details: { blocking } });
@@ -1788,7 +1929,7 @@ export class RepoCoordinator extends DurableObject<Env> {
     if (!m) return;
     // Stale runner lease: a Workflow that never reported back.
     for (const stale of this.actives(m).filter((x) => Date.now() - x.since > RUNNER_LEASE_MS)) {
-      await this.requeueInternal(stale.id, "runner lease expired", false);
+      await this.requeueInternal(stale.id, "runner lease expired", "infra");
     }
     const m2 = this.meta();
     let changed = false;
@@ -1801,6 +1942,8 @@ export class RepoCoordinator extends DurableObject<Env> {
       }
     }
     if (changed) this.saveMeta(m2);
+    // E6 (review L4): bounded event history per repo (readers already page by seq).
+    this.sql.exec(`DELETE FROM events WHERE seq <= ?`, m2.seq - EVENTS_RETAINED);
     try {
       await this.kick("weft-alarm");
     } catch (err: unknown) {

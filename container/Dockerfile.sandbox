@@ -1,0 +1,10 @@
+# D8 (FR-15): per-workspace sandbox image. Started by the WorkspaceSandbox Durable Object through
+# ctx.container.start() (scheduling_policy "durable_object", the Sandbox SDK 1.0 model): the DO picks the
+# image per start and runs every agent command with ctx.container.exec(). Needs git ≥ 2.40 + node + bash.
+FROM node:24-trixie-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates bash jq python3 ripgrep \
+ && rm -rf /var/lib/apt/lists/* \
+ && git --version
+WORKDIR /workspace
+CMD ["sleep", "infinity"]

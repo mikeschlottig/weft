@@ -54,7 +54,7 @@ const member = (id: string, h: { remote: string; branch: string; head: string },
 });
 
 before(async () => {
-  server = spawn(process.execPath, ["container/server.ts"], { env: { ...process.env, PORT: String(PORT), WEFT_RUNNER_ROOT: join(root, "runner") }, stdio: "ignore" });
+  server = spawn(process.execPath, ["container/server.ts"], { env: { ...process.env, PORT: String(PORT), WEFT_RUNNER_ROOT: join(root, "runner"), WEFT_RUNNER_ALLOW_LOCAL_MIRROR: "1" }, stdio: "ignore" });
   for (let i = 0; i < 50; i += 1) {
     try {
       if ((await fetch(`http://127.0.0.1:${PORT}/healthz`)).ok) return;
@@ -264,4 +264,71 @@ test("runner FR-33/34: trunk commits are SSH-signed, deterministic across rebuil
   assert.equal(v.status, 0, v.stderr);
   assert.match(v.stderr, /Good "git" signature for queue@weft\.dev/);
   assert.match(sh(["--git-dir", trunk, "notes", "--ref=weft", "show", a.tip]), /changeset: s/);
+});
+
+test("runner E2 flake guard: a tip that is red once then green lands, is reported flaky, and nobody is blamed", async () => {
+  const { trunk, base, heads } = setup({ p: { "f.txt": "line1\nP\nline3\n" }, q: { "status.txt": "ok\n# q\n" } });
+  const marker = join(root, `flaky-${Math.random().toString(36).slice(2)}`);
+  // Passes on trunk (no f.txt edit) every time; on the merged tip it fails the first time only.
+  const check = `if grep -q '^P$' f.txt && [ ! -f '${marker}' ]; then touch '${marker}'; exit 1; fi; exit 0`;
+  const r = await call<{ applied: { id: string }[]; rejected: unknown[]; flaky?: string[]; checksRun: number; bisectSteps: number }>("/speculate", {
+    trunk: { remote: trunk, token: "" }, trunkHead: base, claimTime: 1_790_000_100, checkCommand: check, unionGlobs: [],
+    members: [member("p", heads.p!, base, ["f.txt"]), member("q", heads.q!, base, ["status.txt"])],
+  });
+  assert.deepEqual(r.applied.map((a) => a.id), ["p", "q"]);
+  assert.deepEqual(r.rejected, []);
+  assert.deepEqual(r.flaky, ["p", "q"]);
+  assert.equal(r.bisectSteps, 0);
+  assert.equal(r.checksRun, 3, "trunk + red tip + fresh re-run");
+});
+
+test("runner E2: a deterministic red tip still bisects to the culprit (re-run stays red)", async () => {
+  const { trunk, base, heads } = setup({ g: { "f.txt": "line1\nG\nline3\n" }, h: { "status.txt": "broken\n" } });
+  const r = await call<{ applied: { id: string }[]; rejected: { id: string; rejection: { reason: string } }[]; flaky?: string[] }>("/speculate", {
+    trunk: { remote: trunk, token: "" }, trunkHead: base, claimTime: 1_790_000_200, checkCommand: "grep -q '^ok$' status.txt", unionGlobs: [],
+    members: [member("g", heads.g!, base, ["f.txt"]), member("h", heads.h!, base, ["status.txt"])],
+  });
+  assert.deepEqual(r.applied.map((a) => a.id), ["g"]);
+  assert.deepEqual(r.rejected.map((x) => [x.id, x.rejection.reason]), [["h", "check_failed"]]);
+  assert.deepEqual(r.flaky, []);
+});
+
+test("runner E2: a non-monotonic check (culprit passes on re-run) is CHECK_FLAKY, not a blame", async () => {
+  const { trunk, base, heads } = setup({ u: { "f.txt": "line1\nU\nline3\n" }, v: { "status.txt": "ok\n# v\n" } });
+  const n = join(root, `count-${Math.random().toString(36).slice(2)}`);
+  // Counts runs on any tree that contains U: run 1 (tip) red, run 2 (tip re-run) red, run 3 (bisect probe) red,
+  // run 4 (fresh culprit confirmation) green → non-deterministic.
+  const check = `grep -q '^U$' f.txt || exit 0; c=$(cat '${n}' 2>/dev/null || echo 0); c=$((c+1)); echo $c > '${n}'; [ $c -ge 4 ]`;
+  await assert.rejects(
+    call("/speculate", {
+      trunk: { remote: trunk, token: "" }, trunkHead: base, claimTime: 1_790_000_300, checkCommand: check, unionGlobs: [],
+      members: [member("u", heads.u!, base, ["f.txt"]), member("v", heads.v!, base, ["status.txt"])],
+    }),
+    /CHECK_FLAKY/,
+  );
+});
+
+test("runner D5 mirror: trunk main + provenance notes are force-pushed to the mirror; https-only otherwise", async () => {
+  const { trunk, base } = setup({});
+  const work = mkdtempSync(join(root, "m-"));
+  sh(["clone", "-q", trunk, work]);
+  sh(["notes", "--ref=weft", "add", "-m", "weft-provenance v1", base], work);
+  sh(["push", "-q", trunk, "refs/notes/weft:refs/notes/weft"], work);
+  const target = join(root, `mirror-${Math.random().toString(36).slice(2)}.git`);
+  sh(["init", "-q", "--bare", "-b", "main", target]);
+  const r = await call<{ pushed: string; notes: boolean; remoteMain: string | null }>("/mirror", { trunk: { remote: trunk, token: "" }, trunkHead: base, target: { url: target, authHeader: "Authorization: Bearer test" } });
+  assert.equal(r.pushed, base);
+  assert.equal(r.remoteMain, base);
+  assert.equal(r.notes, true);
+  assert.equal(sh(["--git-dir", target, "rev-parse", "refs/heads/main"]), base);
+  assert.match(sh(["--git-dir", target, "notes", "--ref=weft", "show", base]), /weft-provenance v1/);
+  await assert.rejects(call("/mirror", { trunk: { remote: trunk, token: "" }, trunkHead: base, target: { url: "https://user:pw@github.com/o/r.git", authHeader: "x" } }), /BAD_MIRROR/);
+});
+
+test("runner: a check killed by a signal is CHECK_INTERRUPTED (infra), never a red trunk or a blamed changeset", async () => {
+  const { trunk, base, heads } = setup({ k: { "f.txt": "line1\nK\nline3\n" } });
+  await assert.rejects(
+    call("/speculate", { trunk: { remote: trunk, token: "" }, trunkHead: base, claimTime: 1_790_000_400, checkCommand: "kill -TERM $$", unionGlobs: [], members: [member("k", heads.k!, base, ["f.txt"])] }),
+    /CHECK_INTERRUPTED/,
+  );
 });

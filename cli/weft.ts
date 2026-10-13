@@ -6,7 +6,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -33,6 +33,13 @@ const OPTIONS = {
   name: { type: "string" },
   model: { type: "string" },
   "ttl-hours": { type: "string" },
+  "long-lived": { type: "boolean" },
+  sandbox: { type: "boolean" },
+  shard: { type: "string" },
+  timeout: { type: "string" },
+  "token-env": { type: "string" },
+  url: { type: "string" },
+  bearer: { type: "boolean" },
   task: { type: "string" },
   touch: { type: "string", multiple: true },
   exclusive: { type: "boolean" },
@@ -79,7 +86,11 @@ Admin
   weft init <repo> [--from DIR | --import https://github.com/owner/repo [--branch B]] [--check CMD] [--batch N] [--batch-window MS] [--sensitive GLOBS] [--union GLOBS] [--driver GLOB=DRIVER] [--no-judge]
                                       drivers: union · json-merge (3-way by key) · sorted-lines
   weft config [--check CMD] [--batch N] [--review-threshold N] [--sensitive GLOBS] [--no-judge]
-  weft agent register --name NAME --model MODEL [--ttl-hours N]   weft agent show|kill|revive --name NAME
+  weft agent register --name NAME --model MODEL [--ttl-hours N --long-lived]   weft agent show|kill|revive --name NAME
+  weft agent refresh                  re-issue your own agent token (tokens live 1 h; EdDSA, see /.well-known/jwks.json)
+  weft keys list|rotate               agent-token signing keys (rotation keeps the previous key verifying)
+  weft mirror set --url URL --token-env VAR [--bearer]   mirror trunk (main + provenance notes) after every landing
+  weft mirror show|sync|remove
   weft agent budget --name NAME [--changesets-per-day N] [--cost-per-day USD] [--open-workspaces N]
   weft approve <cs> [--by NAME]       weft reject <cs> [--reason R]       weft revert <cs> [--by NAME]       weft queue run
   weft calibration [--repo R]         judge threshold sweep vs outcome labels (reverted, hotfixed, human-rejected)
@@ -88,6 +99,8 @@ Agent loop (inside a workspace dir, or --ws)
   weft start --task "..." --touch GLOB [--touch GLOB] [--exclusive] [--after cs-x] [--wait [--wait-timeout S]] [--dir PATH]
                                       --wait: queue fairly (FIFO) for a scope held under an exclusive lease (FR-10)
                                       --after: stack on a queued changeset (FR-27); --touch path#Symbol for symbol intents
+  weft start ... --sandbox             D8: clone the fork in a cloud sandbox (no local checkout); then:
+  weft exec -- "<cmd>" [--timeout S]  run a command in the sandbox      weft sandbox [status|open|close]
   weft status                         heartbeat: touched, drift, live overlaps, forecast
   weft widen --touch GLOB
   weft checkpoint [-m MSG]            commit + push to your fork
@@ -183,6 +196,20 @@ const loadWs = (flags: Flags): { cwd: string; w: WsFile } => {
   const p = wsFilePath(cwd);
   if (!existsSync(p)) throw usage("this git repo is not a weft workspace", "run `weft start` first");
   return { cwd: out(["rev-parse", "--show-toplevel"], { cwd }), w: JSON.parse(readFileSync(p, "utf8")) as WsFile };
+};
+
+// ---- D8 sandbox workspaces: no local clone; the directory holds only .weft-sandbox.json (repo, ws, branch).
+interface SandboxFile {
+  repo: string;
+  ws: string;
+  branch: string;
+}
+const sandboxPath = (dir: string): string => join(dir, ".weft-sandbox.json");
+const loadSandbox = (flags: Flags): SandboxFile | null => {
+  const dir = flags.dir ? resolve(flags.dir) : process.cwd();
+  if (existsSync(sandboxPath(dir))) return JSON.parse(readFileSync(sandboxPath(dir), "utf8")) as SandboxFile;
+  if (flags.ws && (flags.repo || process.env.WEFT_REPO)) return { repo: repoOf(flags), ws: flags.ws, branch: "" };
+  return null;
 };
 
 const saveWs = (cwd: string, w: WsFile): void => {
@@ -333,19 +360,21 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
         repo,
         config: configPatch(f),
         ...(f.import ? { import: { url: f.import, ...(f.branch ? { branch: f.branch } : {}) } } : {}),
+        ...(f.shard !== undefined ? { shard: intOf(f.shard, "shard") } : {}),
       });
       let head: string | null = null;
       if (f.from) head = pushInitial(resolve(f.from), r.data.remote, r.data.token, repo);
       if (r.data.imported) head = ensureMain(r.data.remote, r.data.token, r.data.imported.defaultBranch);
-      return { data: { repo, remote: r.data.remote, initialCommit: head, imported: r.data.imported, config: r.data.config, adopted: r.data.adopted }, hints: ["weft agent register --name <agent> --model <model>"] };
+      return { data: { repo, remote: r.data.remote, initialCommit: head, imported: r.data.imported, config: r.data.config, adopted: r.data.adopted, shard: (r.data as { shard?: number }).shard ?? 0 }, hints: ["weft agent register --name <agent> --model <model>"] };
     }
     case "config":
       return api("PATCH", `/v1/repos/${repoOf(f)}/config`, configPatch(f));
     case "agent": {
       if (pos[0] === "register") {
         if (!f.name || !f.model) throw usage("weft agent register --name NAME --model MODEL");
-        return api("POST", "/v1/agents", { name: f.name, model: f.model, ttlHours: intOf(f["ttl-hours"], "ttl-hours") });
+        return api("POST", "/v1/agents", { name: f.name, model: f.model, ttlHours: intOf(f["ttl-hours"], "ttl-hours"), longLived: f["long-lived"] === true });
       }
+      if (pos[0] === "refresh") return api("POST", "/v1/agents/token/refresh", {});
       if (pos[0] === "list") return api("GET", "/v1/agents");
       if (pos[0] === "show" || pos[0] === "kill" || pos[0] === "revive" || pos[0] === "budget") {
         if (!f.name) throw usage(`weft agent ${pos[0]} --name NAME`);
@@ -359,7 +388,27 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
           openWorkspacesPerRepo: intOf(f["open-workspaces"], "open-workspaces") ?? null,
         });
       }
-      throw usage("weft agent register|list|show|budget|kill|revive");
+      throw usage("weft agent register|refresh|list|show|budget|kill|revive");
+    }
+    case "mirror": {
+      const repo = repoOf(f);
+      if (pos[0] === "set") {
+        // The token comes from an environment variable, never argv (keeps it out of shell history and ps).
+        const envName = f["token-env"];
+        if (!f.url || !envName) throw usage("weft mirror set --url https://github.com/owner/repo.git --token-env VAR [--bearer]");
+        const token = process.env[envName];
+        if (!token) throw usage(`environment variable ${envName} is empty`);
+        return api("PUT", `/v1/repos/${repo}/mirror`, { url: f.url, token, kind: f.bearer === true ? "bearer" : "github" });
+      }
+      if (pos[0] === "sync") return api("POST", `/v1/repos/${repo}/mirror/sync`, {});
+      if (pos[0] === "remove") return api("DELETE", `/v1/repos/${repo}/mirror`);
+      if (pos[0] === "show" || pos[0] === undefined) return api("GET", `/v1/repos/${repo}/mirror`);
+      throw usage("weft mirror set|show|sync|remove");
+    }
+    case "keys": {
+      if (pos[0] === "rotate") return api("POST", "/v1/admin/keys/rotate", {});
+      if (pos[0] === "list" || pos[0] === undefined) return api("GET", "/v1/admin/keys");
+      throw usage("weft keys list|rotate");
     }
     case "start": {
       const repo = repoOf(f);
@@ -388,6 +437,14 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
       const started = r as { data: Started; hints: string[] };
       const ws = started.data.workspace;
       const dir = resolve(f.dir ?? ws.id);
+      if (f.sandbox === true) {
+        // D8: clone the fork inside a cloud sandbox instead of here.
+        mkdirSync(dir, { recursive: true });
+        const opened = await api<{ head: string; branch: string; ms: number; exec: string }>("POST", `/v1/repos/${repo}/workspaces/${ws.id}/sandbox`, {});
+        writeFileSync(sandboxPath(dir), JSON.stringify({ repo, ws: ws.id, branch: ws.branch } satisfies SandboxFile, null, 2));
+        const data = { workspace: ws, forecast: started.data.forecast, stackedOn: started.data.stackedOn, sandbox: opened.data, path: dir };
+        return { data, hints: [`cd ${dir}`, 'weft exec -- "ls && npm test"', 'weft submit -m "..."'] };
+      }
       git(["clone", "-q", started.data.fork.remote, dir], { token: started.data.fork.token });
       git(["remote", "add", "trunk", started.data.trunk.remote], { cwd: dir });
       if (started.data.stackedOn) {
@@ -480,6 +537,12 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
       });
     }
     case "submit": {
+      const sb = git(["rev-parse", "--is-inside-work-tree"], { cwd: f.dir ? resolve(f.dir) : process.cwd(), allow: [128] }).code === 0 ? null : loadSandbox(f);
+      if (sb) {
+        if (!f.message) throw usage("submit needs -m <message>");
+        const promptSha = f["prompt-file"] ? createHash("sha256").update(readFileSync(f["prompt-file"])).digest("hex") : null;
+        return api("POST", `/v1/repos/${sb.repo}/workspaces/${sb.ws}/sandbox/submit`, { message: f.message, promptSha256: promptSha, toolCalls: intOf(f["tool-calls"], "tool-calls") ?? null, costUsd: f.cost !== undefined ? Number(f.cost) : null, resolves: f.resolves ?? null });
+      }
       const { cwd, w: w0 } = loadWs(f);
       const w = await fresh(cwd, w0);
       if (!f.message) throw usage("submit needs -m <message>");
@@ -514,6 +577,21 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
         resolves: f.resolves ?? null,
         recipe: f.recipe ? { name: f.recipe, args: f.arg ?? [] } : null,
       });
+    }
+    case "exec": {
+      // D8: run a command in this workspace's cloud sandbox. `weft exec -- npm test`
+      const sb = loadSandbox(f);
+      if (!sb) throw usage("not a sandbox workspace", "weft start --sandbox ... (or pass --repo R --ws ID)");
+      const cmdline = pos.join(" ").trim();
+      if (!cmdline) throw usage('weft exec -- "<command>"');
+      return api("POST", `/v1/repos/${sb.repo}/workspaces/${sb.ws}/exec`, { cmd: cmdline, timeoutMs: (intOf(f.timeout, "timeout") ?? 300) * 1000 });
+    }
+    case "sandbox": {
+      const sb = loadSandbox(f);
+      if (!sb) throw usage("not a sandbox workspace", "weft start --sandbox ...");
+      if (pos[0] === "close") return api("DELETE", `/v1/repos/${sb.repo}/workspaces/${sb.ws}/sandbox`);
+      if (pos[0] === "open") return api("POST", `/v1/repos/${sb.repo}/workspaces/${sb.ws}/sandbox`, {});
+      return api("GET", `/v1/repos/${sb.repo}/workspaces/${sb.ws}/sandbox`);
     }
     case "abandon": {
       const { w } = loadWs(f);

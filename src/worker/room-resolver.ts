@@ -12,7 +12,7 @@ import { NonRetryableError } from "cloudflare:workflows";
 import { WeftError, decodeFromRpc } from "../core/errors.ts";
 import { MAX_ROOM_ATTEMPTS, RESOLVER_MODEL, parseProposal, resolverMessages, responseText } from "../core/resolve.ts";
 import type { MergeDriverRule, Room, RoomAttempt, RoomFile } from "../core/types.ts";
-import { headOf, headerToken, mintToken } from "./artifacts.ts";
+import { headOf, headerToken, mintToken, resolveShard } from "./artifacts.ts";
 import { runner } from "./runner-client.ts";
 
 interface Params {
@@ -41,7 +41,9 @@ const LONG = { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" 
 
 const rpc = async <T>(fn: () => Promise<unknown>): Promise<T> => {
   try {
-    return JSON.parse(JSON.stringify(await fn())) as T;
+    // DO RPC results carry a Disposable marker; step outputs must be plain JSON (a void method → null).
+    const v: unknown = await fn();
+    return (v === undefined ? null : JSON.parse(JSON.stringify(v))) as T;
   } catch (err: unknown) {
     const e = err instanceof WeftError ? err : decodeFromRpc(err);
     if (!e.retryable) throw new NonRetryableError(`${e.code}: ${e.message}`);
@@ -54,6 +56,7 @@ export class RoomResolver extends WorkflowEntrypoint<Env, Params> {
     const { repo, roomId } = event.payload;
     const coord = this.env.REPO.getByName(repo);
     try {
+      await resolveShard(this.env, repo); // D7
       const input = await step.do("load", STEP, () => rpc<RoomInput>(() => coord.roomInput(roomId)));
       if (input.room.status === "accepted" || input.room.status === "verified") return { skipped: input.room.status };
 
