@@ -4,6 +4,7 @@
 import { WeftError, decodeFromRpc, usage } from "../core/errors.ts";
 import { type ContextPack, contextMarkdown } from "../core/context.ts";
 import { DUPLICATE_THRESHOLD, EMBED_MODEL, cosine } from "../core/similarity.ts";
+import { BAD_OUTCOMES, type LabeledRow, calibrate } from "../core/calibration.ts";
 import { signJwt } from "../core/jwt.ts";
 import type { AgentClaims, Envelope, ErrorEnvelope, IntentMode, RepoConfig } from "../core/types.ts";
 import { trunkLog } from "./artifacts.ts";
@@ -316,6 +317,37 @@ route("POST", "/v1/repos/:repo/changesets/:cs/approve", "approve", "admin", asyn
   hints: ["the queue runs automatically"],
 }));
 
+route("POST", "/v1/repos/:repo/changesets/:cs/reject", "reject", "admin", async (c) => {
+  const b = await c.body();
+  return { data: await coord(c.env, c.params.repo ?? "").reject(c.params.cs ?? "", String(b.by ?? claimsOf(c).name), String(b.reason ?? "rejected in review")) };
+});
+
+// FR-48: per-signal threshold sweep of the judge against outcome labels (reverted / hotfixed / human_rejected).
+route("GET", "/v1/calibration", "calibration", "read", async (c) => {
+  const repo = c.url.searchParams.get("repo");
+  const sql = `SELECT repo, cs_id, status, hold, outcome, intent_alignment, test_adequacy, security_concern, data, updated_at FROM scorecards ${repo ? "WHERE repo = ?" : ""} ORDER BY updated_at DESC LIMIT 5000`;
+  const res = await (repo ? c.env.DB.prepare(sql).bind(repo) : c.env.DB.prepare(sql)).all<{ status: string; hold: string | null; outcome: string | null; intent_alignment: number | null; test_adequacy: number | null; security_concern: number | null; data: string; updated_at: number }>();
+  const weekAgo = Date.now() - 7 * 86_400_000;
+  const rows: LabeledRow[] = [];
+  for (const r of res.results) {
+    const bad = r.outcome !== null && (BAD_OUTCOMES as readonly string[]).includes(r.outcome);
+    const good = !bad && r.status === "landed" && r.updated_at < weekAgo;
+    if (!bad && !good) continue; // unlabeled (too recent, or rejected for non-quality reasons)
+    let second: number | null = null;
+    let disagreement: number | null = null;
+    try {
+      const card = JSON.parse(r.data) as { judge?: { second?: { intentAlignment?: number | null } | null; disagreement?: number | null } | null };
+      second = card.judge?.second?.intentAlignment ?? null;
+      disagreement = card.judge?.disagreement ?? null;
+    } catch (err: unknown) {
+      console.log(JSON.stringify({ level: "warn", msg: "calibration: bad scorecard json", err: String(err) }));
+    }
+    rows.push({ bad, held: r.hold !== null, signals: { intentAlignment: r.intent_alignment, testAdequacy: r.test_adequacy, securityConcern: r.security_concern, secondIntentAlignment: second, judgeDisagreement: disagreement } });
+  }
+  const report = calibrate(rows);
+  return { data: { repo: repo ?? "all", scanned: res.results.length, ...report }, hints: [report.note] };
+});
+
 route("POST", "/v1/repos/:repo/changesets/:cs/revert", "revert", "admin", async (c) => ({
   data: await coord(c.env, c.params.repo ?? "").revert(c.params.cs ?? "", String((await c.body()).by ?? claimsOf(c).name)),
 }));
@@ -391,14 +423,15 @@ const projection = async (batch: MessageBatch<Record<string, unknown>>, env: Env
     const j = msg.body;
     try {
       if (j.kind === "scorecard") {
-        const cs = j.cs as { id: string; agentId: string; agentName: string; model: string; status: string; wqs: number | null; scorecard: { judge: { intentAlignment: number | null; testAdequacy: number | null; securityConcern: number | null } | null; hold: string | null } };
+        const cs = j.cs as { id: string; agentId: string; agentName: string; model: string; status: string; wqs: number | null; outcome?: string | null; scorecard: { judge: { intentAlignment: number | null; testAdequacy: number | null; securityConcern: number | null } | null; hold: string | null } };
         await env.DB.prepare(
           `INSERT INTO scorecards (repo, cs_id, agent_id, agent_name, model, status, wqs, intent_alignment, test_adequacy, security_concern, hold, outcome, data, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(repo, cs_id) DO UPDATE SET status = excluded.status, wqs = excluded.wqs, intent_alignment = excluded.intent_alignment,
-             test_adequacy = excluded.test_adequacy, security_concern = excluded.security_concern, hold = excluded.hold, data = excluded.data, updated_at = excluded.updated_at`,
+             test_adequacy = excluded.test_adequacy, security_concern = excluded.security_concern, hold = excluded.hold,
+             outcome = COALESCE(excluded.outcome, scorecards.outcome), data = excluded.data, updated_at = excluded.updated_at`,
         )
-          .bind(String(j.repo), cs.id, cs.agentId, cs.agentName, cs.model, cs.status, cs.wqs, cs.scorecard.judge?.intentAlignment ?? null, cs.scorecard.judge?.testAdequacy ?? null, cs.scorecard.judge?.securityConcern ?? null, cs.scorecard.hold, JSON.stringify(cs.scorecard), Date.now())
+          .bind(String(j.repo), cs.id, cs.agentId, cs.agentName, cs.model, cs.status, cs.wqs, cs.scorecard.judge?.intentAlignment ?? null, cs.scorecard.judge?.testAdequacy ?? null, cs.scorecard.judge?.securityConcern ?? null, cs.scorecard.hold, cs.outcome ?? null, JSON.stringify(cs.scorecard), Date.now())
           .run();
       } else if (j.kind === "outcome") {
         await env.DB.prepare("UPDATE scorecards SET outcome = ?, updated_at = ? WHERE repo = ? AND cs_id = ?").bind(String(j.outcome), Date.now(), String(j.repo), String(j.csId)).run();

@@ -4,7 +4,15 @@
 export type IntentMode = "soft" | "exclusive";
 export type WorkspaceStatus = "provisioning" | "active" | "conflicted" | "submitted" | "landed" | "abandoned";
 export type ChangesetStatus = "queued" | "needs_review" | "validating" | "landed" | "rejected" | "reverted";
-export type RejectionReason = "conflict" | "check_failed" | "policy" | "judge_hold" | "dependency" | "recipe_failed";
+export type RejectionReason = "conflict" | "check_failed" | "policy" | "judge_hold" | "dependency" | "recipe_failed" | "human";
+
+/** FR-47: lagging outcome labels used to calibrate the judge (FR-48). */
+export interface OutcomeLabel {
+  label: "reverted" | "hotfixed" | "human_rejected";
+  at: string;
+  by: string | null;
+  ref: string | null; // e.g. the hotfix changeset or revert commit
+}
 
 export interface AgentClaims {
   sub: string; // agent id
@@ -112,6 +120,7 @@ export interface Changeset {
   after?: string | null;
   /** FR-25: replayed on the current trunk at landing instead of merging the fork's text. */
   recipe?: RecipeRef | null;
+  outcome?: OutcomeLabel | null;
 }
 
 export interface RecipeRef {
@@ -135,7 +144,7 @@ export interface RepoConfig {
   recipes?: Record<string, { command: string; description?: string }>;
   /** FR-26: batches validated concurrently when their file scopes are disjoint (default 2). */
   lanes?: number;
-  judge: { enabled: boolean; model: string; holdOnSecurity: number; holdOnAlignment: number };
+  judge: { enabled: boolean; model: string; holdOnSecurity: number; holdOnAlignment: number; secondOpinion?: string | null; disagreementHold?: number };
 }
 
 export type MergeDriverName = "union" | "json-merge" | "sorted-lines";
@@ -196,7 +205,8 @@ export type EventType =
   | "room.accepted"
   | "workspace.resumed"
   | "workspace.waiting"
-  | "agent.killed";
+  | "agent.killed"
+  | "changeset.outcome";
 
 export interface WeftEvent {
   seq: number;
@@ -227,6 +237,9 @@ export interface JudgeAnswers {
   correctnessRisk: "low" | "medium" | "high" | null;
   correctnessRiskP: Record<string, number> | null;
   error: string | null;
+  /** FR-48: an independent second judge (default clef-flash); its intent score and the disagreement. */
+  second?: { model: string; intentAlignment: number | null; securityConcern: number | null; error: string | null } | null;
+  disagreement?: number | null;
 }
 
 export interface Scorecard {

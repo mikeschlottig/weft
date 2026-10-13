@@ -85,13 +85,19 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
         if (!stats) continue;
         const res = await step.do(`judge-${m.id}`, STEP, async () => {
           const gates = preCheckGates(stats, m.intentGlobs, claim.config);
-          const judge = claim.config.judge.enabled
-            ? await judgeChangeset(this.env.AI as unknown as { run(model: string, input: Record<string, unknown>): Promise<unknown> }, claim.config.judge.model, {
-                task: m.task,
-                intentGlobs: m.intentGlobs,
-                message: m.message,
-                stats,
-              })
+          const ai = this.env.AI as unknown as { run(model: string, input: Record<string, unknown>): Promise<unknown> };
+          const jin = { task: m.task, intentGlobs: m.intentGlobs, message: m.message, stats };
+          const primary = claim.config.judge.enabled ? await judgeChangeset(ai, claim.config.judge.model, jin) : null;
+          // FR-48: an independent second opinion (default clef-flash; JEV-compatible System One API).
+          const secondModel = claim.config.judge.enabled ? (claim.config.judge.secondOpinion === undefined ? "@cf/cloudflare/clef-flash" : claim.config.judge.secondOpinion) : null;
+          const second = primary && secondModel ? await judgeChangeset(ai, secondModel, jin) : null;
+          const judge = primary
+            ? {
+                ...primary,
+                second: second ? { model: second.model, intentAlignment: second.intentAlignment, securityConcern: second.securityConcern, error: second.error } : null,
+                disagreement:
+                  second && primary.intentAlignment !== null && second.intentAlignment !== null ? Math.round(Math.abs(primary.intentAlignment - second.intentAlignment) * 100) / 100 : null,
+              }
             : null;
           const hold = holdReason(gates, judge, claim.config);
           return rpc<{ held: boolean }>(() => coord.recordJudgement(batchId, m.id, gates, judge, hold));

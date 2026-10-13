@@ -47,7 +47,7 @@ export const DEFAULT_CONFIG: RepoConfig = {
   unionGlobs: ["CHANGELOG.md", "**/CHANGELOG.md"],
   leaseTtlSeconds: 1800,
   batchWindowMs: 2500,
-  judge: { enabled: true, model: "@cf/cloudflare/clef", holdOnSecurity: 0.7, holdOnAlignment: 1.0 },
+  judge: { enabled: true, model: "@cf/cloudflare/clef", holdOnSecurity: 0.7, holdOnAlignment: 1.0, secondOpinion: "@cf/cloudflare/clef-flash", disagreementHold: 1.0 },
 };
 
 const FORK_TOKEN_TTL = 3600;
@@ -875,6 +875,31 @@ export class RepoCoordinator extends DurableObject<Env> {
     });
   }
 
+  /** FR-47: a human rejects a held or queued changeset; labelled `human_rejected` for calibration. */
+  reject(csId: string, by: string, reason: string) {
+    return this.guard(async () => {
+      const m = this.meta();
+      const c = this.cs(csId);
+      if (c.status !== "needs_review" && c.status !== "queued") throw invalidState(`changeset ${csId} is ${c.status}; only held or queued changesets can be rejected`);
+      c.status = "rejected";
+      c.rejection = { reason: "human", detail: `rejected by ${oneLine(by)}: ${oneLine(reason).slice(0, 300)}`, files: [], conflictsWith: [], logKey: null };
+      c.outcome = { label: "human_rejected", at: now(), by: oneLine(by), ref: null };
+      this.putCs(c);
+      const w = this.ws(c.wsId);
+      if (w.status === "submitted") {
+        w.status = "active";
+        w.rejections += 1;
+        this.putWs(w);
+      }
+      this.emit(m, "changeset.rejected", by, { csId, wsId: c.wsId, agentName: c.provenance.agentName, reason: "human", files: [], conflictsWith: [], wqs: c.scorecard?.total ?? null }, [`agent:${c.agentId}`]);
+      this.emit(m, "changeset.outcome", by, { csId, label: "human_rejected", agentName: c.provenance.agentName });
+      this.saveMeta(m);
+      // One message carries the label, so queue ordering cannot drop it.
+      this.project({ kind: "scorecard", repo: m.repo, cs: { id: c.id, agentId: c.agentId, agentName: c.provenance.agentName, model: c.provenance.model, status: c.status, wqs: c.scorecard?.total ?? null, outcome: "human_rejected", scorecard: c.scorecard ?? { judge: null, hold: null }, landedCommit: null } });
+      return c;
+    });
+  }
+
   abandon(wsId: string, agent: AgentClaims) {
     return this.guard(async () => {
       const m = this.meta();
@@ -1096,6 +1121,23 @@ export class RepoCoordinator extends DurableObject<Env> {
         this.emit(m, "changeset.landed", "weft-merge-queue", { csId: c.id, wsId: c.wsId, agentName: c.provenance.agentName, commit: a.commit, wqs: c.scorecard.total }, [`agent:${c.agentId}`]);
         this.project({ kind: "scorecard", repo: m.repo, cs: { id: c.id, agentId: c.agentId, agentName: c.provenance.agentName, model: c.provenance.model, status: c.status, wqs: c.scorecard.total, scorecard: c.scorecard, landedCommit: a.commit } });
       }
+      // FR-47: a fix-style change landing on files another changeset landed on in the last 7 days labels the
+      // earlier one `hotfixed` (a lagging signal that it was wrong), for judge calibration (FR-48).
+      const FIX = /\b(fix|fixes|fixed|hotfix|bug|regression|broken|revert)\b/i;
+      const weekAgo = Date.now() - 7 * 86_400_000;
+      for (const id of landedIds) {
+        const fix = this.cs(id);
+        if (!FIX.test(fix.message)) continue;
+        for (const prev of this.csByStatus("landed", 2000)) {
+          if (prev.id === fix.id || prev.outcome || Date.parse(prev.updatedAt) < weekAgo || Date.parse(prev.updatedAt) > Date.parse(fix.updatedAt)) continue;
+          if (prev.resolves === fix.id || fix.resolves === prev.id || prev.after === fix.id || fix.after === prev.id) continue;
+          if (!prev.provenance.filesTouched.some((f) => fix.provenance.filesTouched.includes(f) && !matches(f, m.config.unionGlobs))) continue;
+          prev.outcome = { label: "hotfixed", at: now(), by: "weft", ref: fix.id };
+          this.putCs(prev);
+          this.emit(m, "changeset.outcome", "weft", { csId: prev.id, label: "hotfixed", by: fix.id, agentName: prev.provenance.agentName });
+          this.project({ kind: "outcome", repo: m.repo, csId: prev.id, outcome: "hotfixed" });
+        }
+      }
       for (const r of input.rejected) {
         const c = this.cs(r.id);
         const rejection = { ...r.rejection, logKey: input.logKeys[r.id] ?? r.rejection.logKey };
@@ -1247,6 +1289,7 @@ export class RepoCoordinator extends DurableObject<Env> {
       const m = this.meta();
       const c = this.cs(csId);
       c.status = "reverted";
+      c.outcome = { label: "reverted", at: now(), by: oneLine(actor), ref: res.commit };
       this.putCs(c);
       m.trunkHead = res.commit;
       this.emit(m, "changeset.reverted", actor, { csId, revertCommit: res.commit, agentName: c.provenance.agentName });

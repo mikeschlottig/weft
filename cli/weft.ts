@@ -47,6 +47,7 @@ const OPTIONS = {
   recipe: { type: "string" },
   import: { type: "string" },
   wait: { type: "boolean" },
+  reason: { type: "string" },
   "changesets-per-day": { type: "string" },
   "cost-per-day": { type: "string" },
   "open-workspaces": { type: "string" },
@@ -80,7 +81,8 @@ Admin
   weft config [--check CMD] [--batch N] [--review-threshold N] [--sensitive GLOBS] [--no-judge]
   weft agent register --name NAME --model MODEL [--ttl-hours N]   weft agent show|kill|revive --name NAME
   weft agent budget --name NAME [--changesets-per-day N] [--cost-per-day USD] [--open-workspaces N]
-  weft approve <cs> [--by NAME]       weft revert <cs> [--by NAME]       weft queue run
+  weft approve <cs> [--by NAME]       weft reject <cs> [--reason R]       weft revert <cs> [--by NAME]       weft queue run
+  weft calibration [--repo R]         judge threshold sweep vs outcome labels (reverted, hotfixed, human-rejected)
 
 Agent loop (inside a workspace dir, or --ws)
   weft start --task "..." --touch GLOB [--touch GLOB] [--exclusive] [--after cs-x] [--wait [--wait-timeout S]] [--dir PATH]
@@ -530,6 +532,11 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
     case "logs":
       if (!pos[0]) throw usage("weft logs <cs>");
       return api("GET", `/v1/repos/${repoOf(f)}/changesets/${pos[0]}/log`);
+    case "reject":
+      if (!pos[0]) throw usage("weft reject <cs> [--reason TEXT] [--by NAME]");
+      return api("POST", `/v1/repos/${repoOf(f)}/changesets/${pos[0]}/reject`, { by: f.by ?? "admin", reason: f.reason ?? "rejected in review" });
+    case "calibration":
+      return api("GET", `/v1/calibration${f.repo ? `?repo=${encodeURIComponent(f.repo)}` : ""}`);
     case "approve":
       if (!pos[0]) throw usage("weft approve <cs>");
       return api("POST", `/v1/repos/${repoOf(f)}/changesets/${pos[0]}/approve`, { by: f.by ?? "admin" });

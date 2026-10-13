@@ -200,7 +200,12 @@ export const holdReason = (pre: GateResult[], j: JudgeAnswers | null, config: Re
       return `judge: security concern p=${j.securityConcern.toFixed(2)} ≥ ${config.judge.holdOnSecurity}`;
     }
     if (j.intentAlignment !== null && j.intentAlignment < config.judge.holdOnAlignment) {
-      return `judge: intent alignment ${j.intentAlignment.toFixed(2)}/3 < ${config.judge.holdOnAlignment}`;
+      return `judge: intent alignment ${j.intentAlignment.toFixed(2)}/3 < ${config.judge.holdOnAlignment}${j.second && j.second.intentAlignment !== null ? ` (second opinion ${j.second.intentAlignment.toFixed(2)})` : ""}`;
+    }
+    // FR-48: two independent judges that disagree by ≥ 1.0 on intent → a human decides.
+    const limit = config.judge.disagreementHold ?? 1.0;
+    if (j.disagreement != null && j.disagreement >= limit) {
+      return `judges disagree on intent by ${j.disagreement.toFixed(2)} (≥ ${limit}): ${j.model} vs ${j.second?.model ?? "second"}`;
     }
   }
   return null;
