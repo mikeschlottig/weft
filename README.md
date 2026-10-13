@@ -28,6 +28,13 @@ Live: **https://weft.ceo-a53.workers.dev** (Mission Control; open a repo such as
 | No signal for agents to improve against | **WQS-1 quality rubric**: deterministic gates + the **Cloudflare CLEF** decision-model judge + process; scores go back to the agent and are ranked by agent and by model | Workers AI (`@cf/cloudflare/clef`), D1 |
 | Humans can't review everything | Risk-routed review: sensitive paths and judge holds go to a human, the rest auto-lands on green | Policy in the coordinator |
 | Trying it needs a migration | **GitHub import**: `weft init shop --import https://github.com/owner/repo` | Artifacts `import()` |
+| Teams still live on GitHub | **Mirror-out**: after every landing, trunk + provenance notes are pushed to a mirror (`weft mirror set`), credential sealed | merge-runner + KV (AES-GCM sealed) |
+| Throughput stalls behind one merge | **Parallel lanes**: disjoint batches validate at the same time, each on its **own** merge-runner instance; trunk stays single-writer by CAS push + read-back | One Container instance per lane |
+| A flaky test blames an innocent agent | **Flake guard**: a red tip (and a red trunk) is re-run before anyone is blamed; non-deterministic checks are reported as infra, never as the agent's fault | merge-runner |
+| An agent can under-report its diff to dodge review | **Authoritative re-scoring**: risk is recomputed from the runner's own diff; hidden files or under-counted lines hold the change for a human | Coordinator + Container |
+| Long-lived agent credentials | **EdDSA agent tokens** (1 h, `weft agent refresh`), public JWKS, weekly key rotation with overlap; humans via **Cloudflare Access** roles | D1 key store, Cron Trigger, `ctx.access` |
+| Agents need somewhere to run code | **Sandbox per workspace**: `weft start --sandbox` clones the fork into a container the workspace owns; `weft exec`, `weft submit` from there | Durable Object container API (Sandbox SDK 1.0 model) |
+| One namespace's rate limit caps the platform | **Namespace sharding** + a **Limits** dashboard of measured usage against documented limits | Multiple Artifacts namespaces |
 
 ## Architecture
 
@@ -48,7 +55,9 @@ Code map: `src/worker/coordinator.ts` (decisions), `src/worker/merge-queue.ts` (
 `src/worker/room-resolver.ts` (Conflict Rooms), `src/worker/push-observer.ts` (push heartbeats),
 `container/server.ts` (the only trunk writer: merges, checks, recipes, drivers, signing), `src/core/rubric.ts` (WQS-1),
 `src/core/symbols.ts` + `cli/symbols.ts` (tree-sitter symbol intents), `cli/weft.ts` (agent CLI),
-`src/worker/mcp.ts` (MCP tools), `web/index.html` (Mission Control: Swarm, Queue, Changesets, Agents, Conflicts, Quality, Events).
+`src/worker/mcp.ts` (MCP tools), `src/worker/keystore.ts` + `src/core/keys.ts` (EdDSA keys, JWKS, Access roles),
+`src/worker/mirror.ts` (mirror-out), `src/worker/sandbox.ts` (sandbox per workspace), `src/core/limits.ts` (limits),
+`web/index.html` (Mission Control: Swarm, Queue, Changesets, Agents, Conflicts, Quality, Limits, Events).
 
 ## Run it
 
@@ -57,12 +66,12 @@ Containers), and Docker with buildx for deploys.
 
 ```bash
 npm install
-npm run typecheck && npm test            # strict TS; 31 tests incl. the real merge-runner against local git
+npm run typecheck && npm test            # strict TS; 50 tests incl. the real merge-runner against local git
 npx wrangler d1 create weft-index        # put the ids below in wrangler.jsonc
 npx wrangler r2 bucket create weft-blobs
 npx wrangler kv namespace create weft-config
 npx wrangler queues create weft-jobs && npx wrangler queues create weft-artifacts-events
-npx wrangler d1 migrations apply weft-index --remote
+npx wrangler d1 migrations apply weft-index --remote   # 0001–0004 (keys, token grants, shards)
 printf %s "$ADMIN_TOKEN" | npx wrangler secret put ADMIN_TOKEN
 printf %s "$JWT_SECRET"  | npx wrangler secret put JWT_SIGNING_SECRET
 ssh-keygen -t ed25519 -N "" -C queue@weft.dev -f weft-signing && npx wrangler secret put WEFT_SIGNING_KEY < weft-signing
@@ -110,11 +119,14 @@ lands, zero CHANGELOG conflicts, the quality leaderboard and a one-command rever
 
 Feature acceptance scripts (each runs against a live deployment and exits non-zero on failure):
 `live-symbols`, `live-stacks`, `live-recipes-drivers`, `live-push-heartbeat`, `live-context-resume`,
-`live-provenance`, `live-import` (all in `scripts/`), plus `loadtest_V-0.01.mjs`.
+`live-provenance`, `live-import`, `live-lanes` (V-0.02: proves lanes overlap in time), `live-flake-rescore`,
+`live-auth-keys`, `live-mirror`, `live-sandbox`, `live-shards-limits` (all in `scripts/`), plus `loadtest_V-0.01.mjs`
+and `swarm_V-0.01.mjs` (N real CLI agents; measures collision catch rate, resolver green rate and trunk red rate).
 
 MCP: point any MCP client at `https://<worker>/mcp` with `Authorization: Bearer <agent token>`.
 The tools are `weft_start`, `weft_heartbeat`, `weft_submit`, `weft_show`, `weft_who`, `weft_queue`,
-`weft_context`, `weft_resume`, `weft_rooms`, `weft_room_show`, `weft_room_accept` and `weft_leaderboard`.
+`weft_context`, `weft_resume`, `weft_rooms`, `weft_room_show`, `weft_room_accept`, `weft_sandbox_open`, `weft_exec`,
+`weft_limits` and `weft_leaderboard`. Agent tokens are EdDSA JWTs; verify them against `/.well-known/jwks.json`.
 
 ## The agent contract
 
@@ -126,10 +138,13 @@ JSON is printed automatically when stdout is not a TTY. Exit codes: `0` ok · `2
 
 - Artifacts is in open beta. Repos are capped at 1 GB and files at 32 MB. We saw concurrent forks of
   one trunk occasionally report success and never exist; Weft serializes forks per trunk and re-forks.
-- Humans authenticate with an admin token in this build (Cloudflare Access is planned). Read
-  endpoints are public on this demo deployment (`PUBLIC_READ=true`).
+- Humans: Cloudflare Access roles are built (`ctx.access`, roles in KV `access/roles`) but Access must be
+  switched on for the Worker in the dashboard; until then the admin token is the human credential. Read
+  endpoints are public on the demo deployments (`PUBLIC_READ=true`) so judges need no account.
 - Rubric thresholds are not calibrated yet. Calibration needs labeled outcomes (reverted, hotfixed,
-  human-rejected), which Weft is now recording.
+  human-rejected), which Weft records; precision targets need ≥ 150 real labels.
+- Tier D/E (lanes on separate runners, flake guard, re-scoring, EdDSA keys, mirror-out, sharding, sandboxes)
+  is live on `weft-dev`; production runs Tiers A–C until it is promoted.
 - Load test (single repo coordinator): 3,000 req/min → p95 260 ms; 6,000 req/min → p95 384 ms; zero 5xx.
 - Symbol intents cover TS/JS/Python; other languages fall back to whole-file overlap. Conflict Room
   proposals come from a model: only proposals that pass the repo's check are offered, and the agent

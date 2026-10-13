@@ -155,3 +155,12 @@ test("D6 Access roles: email, domain and group entries; admin beats reviewer; un
   assert.equal(accessRole({ email: "ann@example.com.evil.io" }, roles), null);
   assert.equal(accessRole({}, roles), null);
 });
+
+import { toWeftError } from "../src/core/errors.ts";
+test("transient platform errors are retryable UPSTREAM_PLATFORM; constraint errors stay INTERNAL", () => {
+  const t = toWeftError(new Error("D1_ERROR: Network connection lost."));
+  assert.equal(t.code, "UPSTREAM_PLATFORM");
+  assert.equal(t.retryable, true);
+  assert.equal(toWeftError(new Error("D1_ERROR: UNIQUE constraint failed: SQLITE_CONSTRAINT")).code, "INTERNAL");
+  assert.equal(toWeftError(new Error("D1_ERROR: no such column: shard")).code, "INTERNAL");
+});

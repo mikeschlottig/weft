@@ -412,7 +412,7 @@ const fmtNum = (n, unit) => n === null ? "not measurable" : unit === "bytes" ? (
 const LSTAT = { ok: ["ok", "s-ok"], watch: ["watch", "s-warn"], near: ["near limit", "s-bad"], unknown: ["unmeasured", "s-mut"] };
 function renderLimits() {
   if (!LIM) return;
-  $("shardKpis").innerHTML = LIM.shards.map((s) => `<div class="kpi"><div class="k">Shard ${s.shard} · <span class="mono">${esc(s.binding)}</span></div><div class="v">${s.repos}</div><div class="k">repos${LIM.repo && LIM.repo.usage.shard === s.shard ? " · <b>this repo</b>" : ""}</div></div>`).join("");
+  $("shardKpis").innerHTML = LIM.shards.map((s) => `<div class="kpi"><div class="k">Shard ${s.shard} · <span class="mono">${esc(s.binding)}</span></div><div class="v">${s.repos}</div><div class="k">repos ${LIM.repo && LIM.repo.usage.shard === s.shard ? pill("this repo", "s-info") : ""}</div></div>`).join("");
   if (!LIM.repo) { $("limitRows").innerHTML = '<tr><td colspan="6"><div class="empty">Open a repo to see its usage.</div></td></tr>'; return; }
   const u = LIM.repo.usage;
   $("limitsMeta").textContent = `${u.workspacesLive} live workspaces · ${u.forksTotal} forks · shard ${u.shard}`;

@@ -35,6 +35,7 @@ const HTTP: Record<string, number> = {
   UPSTREAM_RUNNER: 502,
   UPSTREAM_MIRROR: 502,
   UPSTREAM_SANDBOX: 502,
+  UPSTREAM_PLATFORM: 503,
   INTERNAL: 500,
 };
 
@@ -82,11 +83,18 @@ export const unauthenticated = (message: string, hint = "set WEFT_TOKEN to an ag
 
 export const forbidden = (message: string): WeftError => new WeftError("FORBIDDEN", message, { exitCode: EXIT.usage });
 
+/**
+ * Transient platform failures (seen live 2026-10-13: `D1_ERROR: Network connection lost.` during a 500-agent
+ * registration burst). They say nothing about the request, so they are retryable, never INTERNAL.
+ */
+export const TRANSIENT_PLATFORM = /network connection lost|connection reset|ECONNRESET|socket hang up|timed? ?out|overloaded|too many requests|internal error; reference|Durable Object reset|storage operation exceeded|D1_ERROR: (?!.*(SQLITE_CONSTRAINT|no such|syntax error))/i;
+
 export const toWeftError = (err: unknown): WeftError => {
   if (err instanceof WeftError) return err;
   if (isWeftErrorShape(err)) {
     return new WeftError(err.code, err.message, { retryable: err.retryable, hint: err.hint, details: err.details });
   }
+  if (err instanceof Error && TRANSIENT_PLATFORM.test(err.message)) return new WeftError("UPSTREAM_PLATFORM", err.message, { retryable: true, hint: "transient platform error: retry" });
   if (err instanceof Error) return new WeftError("INTERNAL", err.message);
   return new WeftError("INTERNAL", String(err));
 };
@@ -151,7 +159,7 @@ const isWeftErrorShape = (
 // ---- E4 (review M3): infrastructure vs. changeset failures
 
 /** Codes that describe the platform, not the changeset: retried without counting toward MAX_ATTEMPTS. */
-const INFRA_CODES = /\b(UPSTREAM_RUNNER|UPSTREAM_ARTIFACTS|GIT_FAILED|SPAWN_FAILED|CHECKOUT_FAILED|TIP_DIVERGED|CHECK_FLAKY|CHECK_INTERRUPTED|BISECT_LOST|INTERNAL|TIMEOUT)\b|\bcontainer\b|\bnetwork\b|timed? ?out|ECONNRESET|\b50[234]\b/i;
+const INFRA_CODES = /\b(UPSTREAM_RUNNER|UPSTREAM_ARTIFACTS|GIT_FAILED|SPAWN_FAILED|CHECKOUT_FAILED|TIP_DIVERGED|CHECK_FLAKY|CHECK_INTERRUPTED|UPSTREAM_PLATFORM|BISECT_LOST|INTERNAL|TIMEOUT)\b|\bcontainer\b|\bnetwork\b|timed? ?out|ECONNRESET|\b50[234]\b/i;
 export const infraFailure = (err: unknown): boolean => {
   if (err instanceof WeftError) return err.retryable || INFRA_CODES.test(err.code);
   return INFRA_CODES.test(err instanceof Error ? `${err.name} ${err.message}` : String(err));

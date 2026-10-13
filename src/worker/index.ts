@@ -2,6 +2,7 @@
 // RepoCoordinator DO; git data never flows through here (agents talk to Artifacts directly).
 
 import { WeftError, decodeFromRpc, invalidState as invalidStateErr, usage } from "../core/errors.ts";
+import { withRetry } from "../core/retry.ts";
 import { type ContextPack, contextMarkdown } from "../core/context.ts";
 import { DUPLICATE_THRESHOLD, EMBED_MODEL, cosine } from "../core/similarity.ts";
 import { BAD_OUTCOMES, type LabeledRow, calibrate } from "../core/calibration.ts";
@@ -645,7 +646,8 @@ export default {
           return cached;
         },
       };
-      const res = await r.fn(ctx);
+      // Idempotent reads ride out a transient platform error server-side (writes are retried by the client).
+      const res = req.method === "GET" ? await withRetry(() => r.fn(ctx), { attempts: 3, baseMs: 150, retryable: (err) => decodeFromRpc(err).code === "UPSTREAM_PLATFORM" }) : await r.fn(ctx);
       console.log(JSON.stringify({ level: "info", msg: "api", requestId, command: r.command, repo: params.repo, ws: params.ws, cs: params.cs, actor: claims?.name ?? "public", ms: Date.now() - started }));
       return json(200, { ok: true, command: r.command, data: res.data, hints: res.hints ?? [] }, requestId);
     } catch (err: unknown) {
