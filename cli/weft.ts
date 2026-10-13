@@ -47,6 +47,9 @@ const OPTIONS = {
   recipe: { type: "string" },
   import: { type: "string" },
   wait: { type: "boolean" },
+  "changesets-per-day": { type: "string" },
+  "cost-per-day": { type: "string" },
+  "open-workspaces": { type: "string" },
   "wait-timeout": { type: "string" },
   branch: { type: "string" },
   arg: { type: "string", multiple: true },
@@ -75,7 +78,8 @@ Admin
   weft init <repo> [--from DIR | --import https://github.com/owner/repo [--branch B]] [--check CMD] [--batch N] [--batch-window MS] [--sensitive GLOBS] [--union GLOBS] [--driver GLOB=DRIVER] [--no-judge]
                                       drivers: union · json-merge (3-way by key) · sorted-lines
   weft config [--check CMD] [--batch N] [--review-threshold N] [--sensitive GLOBS] [--no-judge]
-  weft agent register --name NAME --model MODEL [--ttl-hours N]
+  weft agent register --name NAME --model MODEL [--ttl-hours N]   weft agent show|kill|revive --name NAME
+  weft agent budget --name NAME [--changesets-per-day N] [--cost-per-day USD] [--open-workspaces N]
   weft approve <cs> [--by NAME]       weft revert <cs> [--by NAME]       weft queue run
 
 Agent loop (inside a workspace dir, or --ws)
@@ -341,7 +345,19 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
         return api("POST", "/v1/agents", { name: f.name, model: f.model, ttlHours: intOf(f["ttl-hours"], "ttl-hours") });
       }
       if (pos[0] === "list") return api("GET", "/v1/agents");
-      throw usage("weft agent register|list");
+      if (pos[0] === "show" || pos[0] === "kill" || pos[0] === "revive" || pos[0] === "budget") {
+        if (!f.name) throw usage(`weft agent ${pos[0]} --name NAME`);
+        const n = encodeURIComponent(f.name);
+        if (pos[0] === "show") return api("GET", `/v1/agents/${n}`);
+        if (pos[0] === "kill") return api("POST", `/v1/agents/${n}/kill`, { by: f.by ?? "admin" });
+        if (pos[0] === "revive") return api("POST", `/v1/agents/${n}/revive`, {});
+        return api("PATCH", `/v1/agents/${n}/budget`, {
+          changesetsPerDay: intOf(f["changesets-per-day"], "changesets-per-day") ?? null,
+          costUsdPerDay: f["cost-per-day"] !== undefined ? Number(f["cost-per-day"]) : null,
+          openWorkspacesPerRepo: intOf(f["open-workspaces"], "open-workspaces") ?? null,
+        });
+      }
+      throw usage("weft agent register|list|show|budget|kill|revive");
     }
     case "start": {
       const repo = repoOf(f);

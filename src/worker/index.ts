@@ -38,6 +38,50 @@ const route = (method: string, path: string, command: string, auth: "public" | "
 };
 
 const coord = (env: Env, repo: string) => env.REPO.getByName(repo);
+
+// ---- FR-40: budgets + kill switch (D1: consistent on every request)
+interface Budget {
+  changesetsPerDay?: number | null;
+  costUsdPerDay?: number | null;
+  openWorkspacesPerRepo?: number | null;
+}
+const today = (): string => new Date().toISOString().slice(0, 10);
+const agentRow = (env: Env, id: string) =>
+  env.DB.prepare("SELECT id, name, model, budget_json, killed_at, killed_by FROM agents WHERE id = ?").bind(id).first<{ id: string; name: string; model: string; budget_json: string | null; killed_at: number | null; killed_by: string | null }>();
+const budgetOf = (row: { budget_json: string | null } | null): Budget => (row?.budget_json ? (JSON.parse(row.budget_json) as Budget) : {});
+
+/** Refuse a killed agent on every request (the JWT alone is not enough once the kill switch is thrown). */
+const gateAgent = async (env: Env, claims: AgentClaims | null): Promise<void> => {
+  if (!claims || claims.role !== "agent") return;
+  const row = await agentRow(env, claims.sub);
+  if (row?.killed_at) throw new WeftError("FORBIDDEN", `agent ${claims.name} was disabled by ${row.killed_by ?? "an admin"}`, { hint: "ask an admin to run `weft agent revive`" });
+};
+
+/** Atomic check-and-increment of today's usage. Returns a compensation callback for a failed submit. */
+const chargeSubmit = async (env: Env, claims: AgentClaims, costUsd: number): Promise<(() => Promise<void>) | null> => {
+  const b = budgetOf(await agentRow(env, claims.sub));
+  if (b.changesetsPerDay == null && b.costUsdPerDay == null) return null;
+  const day = today();
+  await env.DB.prepare("INSERT OR IGNORE INTO agent_usage (agent_id, day, changesets, cost_usd) VALUES (?, ?, 0, 0)").bind(claims.sub, day).run();
+  const row = await env.DB.prepare(
+    `UPDATE agent_usage SET changesets = changesets + 1, cost_usd = cost_usd + ?
+       WHERE agent_id = ? AND day = ? AND changesets < ? AND cost_usd + ? <= ?
+       RETURNING changesets, cost_usd`,
+  )
+    .bind(costUsd, claims.sub, day, b.changesetsPerDay ?? 1e9, costUsd, b.costUsdPerDay ?? 1e12)
+    .first<{ changesets: number; cost_usd: number }>();
+  if (!row) {
+    const u = await env.DB.prepare("SELECT changesets, cost_usd FROM agent_usage WHERE agent_id = ? AND day = ?").bind(claims.sub, day).first<{ changesets: number; cost_usd: number }>();
+    throw new WeftError("BUDGET_EXCEEDED", `budget exceeded for ${claims.name} today: ${u?.changesets ?? 0} changesets / $${(u?.cost_usd ?? 0).toFixed(2)} (limits ${b.changesetsPerDay ?? "∞"} / $${b.costUsdPerDay ?? "∞"})`, {
+      exitCode: 7,
+      hint: "wait until tomorrow (UTC) or ask an admin to raise the budget (weft agent budget)",
+      details: { usage: u, budget: b },
+    });
+  }
+  return async () => {
+    await env.DB.prepare("UPDATE agent_usage SET changesets = MAX(0, changesets - 1), cost_usd = MAX(0, cost_usd - ?) WHERE agent_id = ? AND day = ?").bind(costUsd, claims.sub, day).run();
+  };
+};
 const str = (v: unknown, name: string): string => {
   if (typeof v !== "string" || v.length === 0) throw usage(`missing ${name}`);
   return v;
@@ -96,6 +140,44 @@ route("GET", "/v1/agents", "agent list", "admin", async (c) => {
   return { data: rows.results };
 });
 
+route("GET", "/v1/agents/:name", "agent show", "admin", async (c) => {
+  const row = await c.env.DB.prepare("SELECT id, name, model, budget_json, killed_at, killed_by FROM agents WHERE name = ?").bind(c.params.name ?? "").first<{ id: string; name: string; model: string; budget_json: string | null; killed_at: number | null; killed_by: string | null }>();
+  if (!row) throw new WeftError("NOT_FOUND", `agent not found: ${c.params.name ?? ""}`);
+  const usage = await c.env.DB.prepare("SELECT changesets, cost_usd FROM agent_usage WHERE agent_id = ? AND day = ?").bind(row.id, today()).first();
+  return { data: { id: row.id, name: row.name, model: row.model, budget: budgetOf(row), usageToday: usage ?? { changesets: 0, cost_usd: 0 }, killed: row.killed_at ? { at: new Date(row.killed_at).toISOString(), by: row.killed_by } : null } };
+});
+
+route("PATCH", "/v1/agents/:name/budget", "agent budget", "admin", async (c) => {
+  const b = await c.body();
+  const pick = (k: string): number | null => (typeof b[k] === "number" && Number.isFinite(b[k]) && (b[k] as number) >= 0 ? (b[k] as number) : null);
+  const budget: Budget = { changesetsPerDay: pick("changesetsPerDay"), costUsdPerDay: pick("costUsdPerDay"), openWorkspacesPerRepo: pick("openWorkspacesPerRepo") };
+  const r = await c.env.DB.prepare("UPDATE agents SET budget_json = ? WHERE name = ? RETURNING id").bind(JSON.stringify(budget), c.params.name ?? "").first<{ id: string }>();
+  if (!r) throw new WeftError("NOT_FOUND", `agent not found: ${c.params.name ?? ""}`);
+  return { data: { name: c.params.name, budget } };
+});
+
+route("POST", "/v1/agents/:name/kill", "agent kill", "admin", async (c) => {
+  const started = Date.now();
+  const body: Record<string, unknown> = await c.body().catch(() => ({}));
+  const actor = String(body.by ?? claimsOf(c).name);
+  const row = await c.env.DB.prepare("UPDATE agents SET killed_at = ?, killed_by = ? WHERE name = ? RETURNING id").bind(Date.now(), actor, c.params.name ?? "").first<{ id: string }>();
+  if (!row) throw new WeftError("NOT_FOUND", `agent not found: ${c.params.name ?? ""}`);
+  // Fan out to every repo coordinator in parallel: revoke fork tokens, abandon workspaces, reject queued work.
+  const repos = (await c.env.DB.prepare("SELECT id FROM repos").all<{ id: string }>()).results;
+  const settled = await Promise.allSettled(repos.map((r) => coord(c.env, r.id).killAgent(row.id, actor)));
+  const per = settled.flatMap((s) => (s.status === "fulfilled" && s.value.workspaces > 0 ? [s.value] : []));
+  return {
+    data: { agent: c.params.name, agentId: row.id, ms: Date.now() - started, reposScanned: repos.length, affected: per, failures: settled.filter((s) => s.status === "rejected").length },
+    hints: ["the agent's JWT is refused from now on; `weft agent revive` re-enables it"],
+  };
+});
+
+route("POST", "/v1/agents/:name/revive", "agent revive", "admin", async (c) => {
+  const r = await c.env.DB.prepare("UPDATE agents SET killed_at = NULL, killed_by = NULL WHERE name = ? RETURNING id").bind(c.params.name ?? "").first<{ id: string }>();
+  if (!r) throw new WeftError("NOT_FOUND", `agent not found: ${c.params.name ?? ""}`);
+  return { data: { agent: c.params.name, revived: true } };
+});
+
 route("GET", "/v1/leaderboard", "leaderboard", "read", async (c) => {
   const rows = await c.env.DB.prepare(
     `SELECT agent_name AS agent, model, COUNT(*) AS submitted, SUM(status = 'landed') AS landed, SUM(status = 'rejected') AS rejected,
@@ -127,7 +209,9 @@ route("GET", "/v1/repos/:repo/snapshot", "snapshot", "read", async (c) => ({ dat
 route("POST", "/v1/repos/:repo/workspaces", "start", "agent", async (c) => {
   const b = await c.body();
   const mode: IntentMode = b.mode === "exclusive" ? "exclusive" : "soft";
-  const res = await coord(c.env, c.params.repo ?? "").start({ agent: claimsOf(c), task: str(b.task, "task"), globs: strs(b.touch, "touch"), mode, ttl: numOr(b.ttl, null), after: typeof b.after === "string" && b.after ? b.after : null, wait: b.wait === true });
+  const claims = claimsOf(c);
+  const budget = claims.role === "agent" ? budgetOf(await agentRow(c.env, claims.sub)) : {};
+  const res = await coord(c.env, c.params.repo ?? "").start({ agent: claims, task: str(b.task, "task"), globs: strs(b.touch, "touch"), mode, ttl: numOr(b.ttl, null), after: typeof b.after === "string" && b.after ? b.after : null, wait: b.wait === true, maxOpenWorkspaces: budget.openWorkspacesPerRepo ?? null });
   if ("waiting" in res) return { data: res, hints: [`waiting: #${res.position} in line for this scope; poll again with --wait`] };
   const hints = ["weft status", 'weft submit -m "..."'];
   const dup = res.forecast.duplicates?.[0];
@@ -169,6 +253,7 @@ route("POST", "/v1/repos/:repo/workspaces/:ws/sync-report", "sync", "agent", asy
 
 route("POST", "/v1/repos/:repo/workspaces/:ws/changesets", "submit", "agent", async (c) => {
   const b = await c.body();
+  const refund = claimsOf(c).role === "agent" ? await chargeSubmit(c.env, claimsOf(c), numOr(b.costUsd, 0) ?? 0) : null;
   const res = await coord(c.env, c.params.repo ?? "").submit({
     wsId: c.params.ws ?? "",
     agent: claimsOf(c),
@@ -185,6 +270,9 @@ route("POST", "/v1/repos/:repo/workspaces/:ws/changesets", "submit", "agent", as
     costUsd: numOr(b.costUsd, null),
     resolves: typeof b.resolves === "string" ? b.resolves : null,
     recipe: b.recipe && typeof b.recipe === "object" ? { name: str((b.recipe as Record<string, unknown>).name, "recipe.name"), args: strs((b.recipe as Record<string, unknown>).args ?? [], "recipe.args") } : null,
+  }).catch(async (err: unknown) => {
+    if (refund) await refund();
+    throw err;
   });
   const cs = res.changeset;
   return {
@@ -338,6 +426,7 @@ export default {
     if (url.pathname === "/mcp") {
       try {
         const claims = await authenticate(req, env);
+        await gateAgent(env, claims);
         return await handleMcp(req, env, exec, claims);
       } catch (err: unknown) {
         const e = decodeFromRpc(err);
@@ -371,6 +460,7 @@ export default {
       const claims = r.auth === "public" ? null : r.auth === "read" ? await optionalAuth(req, env) : await authenticate(req, env);
       if (r.auth === "read" && !claims && env.PUBLIC_READ !== "true") throw new WeftError("UNAUTHENTICATED", "missing bearer token");
       if (r.auth === "admin" && claims) requireAdmin(claims);
+      await gateAgent(env, claims);
       const ctx: Ctx = {
         req,
         env,

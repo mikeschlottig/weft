@@ -36,7 +36,7 @@ import type {
   WeftEvent,
   Workspace,
 } from "../core/types.ts";
-import { awaitImported, changedPaths, createTrunk, forkName, headOf, headerToken, importTrunk, listFiles, mintToken, provisionFork, repoInfo, revokeToken } from "./artifacts.ts";
+import { awaitImported, changedPaths, createTrunk, forkName, headOf, headerToken, importTrunk, listFiles, mintToken, provisionFork, repoInfo, revokeAllTokens, revokeToken } from "./artifacts.ts";
 import { runner, signingKey } from "./runner-client.ts";
 
 export const DEFAULT_CONFIG: RepoConfig = {
@@ -406,7 +406,40 @@ export class RepoCoordinator extends DurableObject<Env> {
     }
   }
 
-  start(input: { agent: AgentClaims; task: string; globs: string[]; mode: IntentMode; ttl: number | null; after?: string | null; wait?: boolean }) {
+  /**
+   * FR-40 kill switch: revoke every token on the agent's forks (git access ends immediately), abandon its
+   * workspaces and reject its queued or held changesets. Idempotent.
+   */
+  killAgent(agentId: string, actor: string) {
+    return this.guard(async () => {
+      const mineLive = this.liveWs().filter((w) => w.agentId === agentId);
+      const revoked = await Promise.all(mineLive.map((w) => revokeAllTokens(this.env, w.forkRepo).catch(() => 0)));
+      const m = this.meta();
+      let rejected = 0;
+      for (const w0 of mineLive) {
+        const w = this.ws(w0.id);
+        if (w.changesetId) {
+          const c = this.cs(w.changesetId);
+          if (c.status === "queued" || c.status === "needs_review") {
+            c.status = "rejected";
+            c.rejection = { reason: "policy", detail: `agent disabled by ${oneLine(actor)} (kill switch)`, files: [], conflictsWith: [], logKey: null };
+            this.putCs(c);
+            rejected += 1;
+          }
+        }
+        w.status = "abandoned";
+        w.forkTokenId = null;
+        this.putWs(w);
+      }
+      if (mineLive.length > 0) {
+        this.emit(m, "agent.killed", actor, { agentId, agentName: mineLive[0]?.agentName ?? agentId, workspaces: mineLive.map((w) => w.id), tokensRevoked: revoked.reduce((a, b) => a + b, 0), changesetsRejected: rejected }, [`agent:${agentId}`]);
+      }
+      this.saveMeta(m);
+      return { repo: m.repo, workspaces: mineLive.length, tokensRevoked: revoked.reduce((a, b) => a + b, 0), changesetsRejected: rejected };
+    });
+  }
+
+  start(input: { agent: AgentClaims; task: string; globs: string[]; mode: IntentMode; ttl: number | null; after?: string | null; wait?: boolean; maxOpenWorkspaces?: number | null }) {
     return this.guard(async () => {
       if (input.globs.length === 0) throw usage("an intent needs at least one --touch glob", "e.g. --touch 'src/auth/**'");
       if (!input.task.trim()) throw usage('start needs --task "..."');
@@ -423,6 +456,12 @@ export class RepoCoordinator extends DurableObject<Env> {
         parent = { cs: pc, ws: this.ws(pc.wsId) };
       }
 
+      if (input.maxOpenWorkspaces) {
+        const open = this.liveWs().filter((w) => w.agentId === input.agent.sub).length;
+        if (open >= input.maxOpenWorkspaces) {
+          throw new WeftError("BUDGET_EXCEEDED", `budget: ${open} open workspaces in this repo (limit ${input.maxOpenWorkspaces})`, { exitCode: 7, hint: "land or abandon a workspace first (weft abandon)" });
+        }
+      }
       const taskVec = await this.embedTask(input.task);
 
       // ---- decision block (no awaits)

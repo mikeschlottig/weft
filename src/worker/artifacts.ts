@@ -119,6 +119,16 @@ export const revokeToken = (env: Env, name: string, tokenId: string): Promise<bo
     return r.revokeToken(tokenId);
   });
 
+/** FR-40 kill switch: revoke every active token on a repo (agents may hold several after refreshes). */
+export const revokeAllTokens = (env: Env, name: string): Promise<number> =>
+  call(`revoke-all ${name}`, async () => {
+    using r = await env.ARTIFACTS.get(name);
+    const list = await r.listTokens();
+    let n = 0;
+    for (const t of list.tokens.filter((x) => x.state === "active")) if (await r.revokeToken(t.id)) n += 1;
+    return n;
+  });
+
 export const headOf = (env: Env, name: string, ref = "main"): Promise<string | null> =>
   call(`log ${name}`, async () => {
     using r = await env.ARTIFACTS.get(name);

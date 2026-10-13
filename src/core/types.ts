@@ -195,7 +195,8 @@ export type EventType =
   | "room.failed"
   | "room.accepted"
   | "workspace.resumed"
-  | "workspace.waiting";
+  | "workspace.waiting"
+  | "agent.killed";
 
 export interface WeftEvent {
   seq: number;

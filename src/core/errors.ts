@@ -27,6 +27,8 @@ const HTTP: Record<string, number> = {
   NOTHING_TO_SUBMIT: 409,
   TRUNK_RED: 409,
   QUEUE_BUSY: 429,
+  BUDGET_EXCEEDED: 429,
+  WAIT_TIMEOUT: 429,
   COORDINATOR_BUSY: 503,
   TRUNK_MOVED: 503,
   UPSTREAM_ARTIFACTS: 502,
@@ -119,7 +121,11 @@ export const exitFor = (code: string): ExitCode => {
     case "LEASE_HELD":
       return EXIT.leaseHeld;
     case "TRUNK_RED":
+    case "RECIPE_FAILED":
       return EXIT.checkFailed;
+    case "BUDGET_EXCEEDED":
+    case "WAIT_TIMEOUT":
+      return EXIT.busy;
     case "NOT_FOUND":
       return EXIT.notFound;
     case "QUEUE_BUSY":
