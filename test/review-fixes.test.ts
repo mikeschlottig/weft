@@ -164,3 +164,4 @@ test("transient platform errors are retryable UPSTREAM_PLATFORM; constraint erro
   assert.equal(toWeftError(new Error("D1_ERROR: UNIQUE constraint failed: SQLITE_CONSTRAINT")).code, "INTERNAL");
   assert.equal(toWeftError(new Error("D1_ERROR: no such column: shard")).code, "INTERNAL");
 });
+

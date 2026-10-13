@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.node.json",
+  "compilerOptions": { "types": ["node", "./worker-configuration.d.ts"] },
+  "include": ["test/worker-*.test.ts"],
+  "exclude": []
+}

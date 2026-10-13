@@ -41,12 +41,13 @@ const accessRoles = async (env: Env): Promise<AccessRoles> => {
 };
 
 /** A human authenticated by Cloudflare Access, mapped to a Weft role. Null when Access did not run. */
-export const accessPrincipal = async (env: Env, exec: ExecutionContext | undefined): Promise<AgentClaims | null> => {
+export const accessPrincipal = async (env: Env, exec: ExecutionContext | undefined, strict = true): Promise<AgentClaims | null> => {
   const access = (exec as (ExecutionContext & { access?: CloudflareAccessContext }) | undefined)?.access;
   if (!access) return null;
   const id = await access.getIdentity();
   if (!id?.email) throw unauthenticated("Cloudflare Access identity has no email");
   const role = accessRole(id, await accessRoles(env));
+  if (!role && !strict) return null; // signed in, but no Weft role: anonymous for public reads
   if (!role) throw forbidden(`${id.email} is signed in through Access but has no Weft role (ask an admin to add it to access/roles)`);
   const nowSec = Math.floor(Date.now() / 1000);
   return { sub: `human:${id.email.toLowerCase()}`, name: id.email.toLowerCase(), model: "human", role, iat: nowSec, exp: nowSec + 300 };
@@ -66,7 +67,7 @@ export const authenticate = async (req: Request, env: Env, exec?: ExecutionConte
 
 export const optionalAuth = async (req: Request, env: Env, exec?: ExecutionContext): Promise<AgentClaims | null> => {
   if (bearer(req)) return authenticate(req, env, exec);
-  return accessPrincipal(env, exec);
+  return accessPrincipal(env, exec, false);
 };
 
 export const requireAdmin = (c: AgentClaims): void => {

@@ -158,6 +158,10 @@ export class RepoCoordinator extends DurableObject<Env> {
       this.sql.exec(`CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, at INTEGER NOT NULL, type TEXT NOT NULL, actor TEXT NOT NULL, data TEXT NOT NULL)`);
       this.sql.exec(`CREATE TABLE IF NOT EXISTS waiters (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent_name TEXT NOT NULL, task TEXT NOT NULL, globs_json TEXT NOT NULL, mode TEXT NOT NULL, enqueued_at INTEGER NOT NULL, last_poll INTEGER NOT NULL)`);
       this.sql.exec(`CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, cs_id TEXT NOT NULL, ws_id TEXT NOT NULL, status TEXT NOT NULL, updated_at INTEGER NOT NULL, data TEXT NOT NULL)`);
+      // FR-09 task embeddings live in their own table as Float32 blobs, NOT in the workspace JSON: at ~390 live
+      // workspaces the JSON copies (768 floats each, parsed several times per start) exceeded the isolate's
+      // memory limit (found by the 500-agent swarm, 2026-10-13).
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS task_vecs (ws_id TEXT PRIMARY KEY, vec BLOB NOT NULL)`);
       this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     });
   }
@@ -186,6 +190,11 @@ export class RepoCoordinator extends DurableObject<Env> {
   }
   private putWs(w: StoredWorkspace): void {
     w.updatedAt = now();
+    if (w.taskVec) {
+      // Legacy rows carried the embedding inline: move it to task_vecs on the next write.
+      this.sql.exec(`INSERT OR IGNORE INTO task_vecs (ws_id, vec) VALUES (?, ?)`, w.id, new Float32Array(w.taskVec).buffer);
+      delete w.taskVec;
+    }
     this.sql.exec(
       `INSERT INTO workspaces (id, status, agent_id, updated_at, data) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at, data = excluded.data`,
       w.id,
@@ -488,9 +497,18 @@ export class RepoCoordinator extends DurableObject<Env> {
       const live = this.liveWs().filter((o) => !parent || o.id !== parent.ws.id);
       const fc = forecast(live, { wsId: null, globs: input.globs, touched: [] }, tf.files, m.config, Date.now(), { truncated: tf.truncated === true });
       if (taskVec) {
-        const dups = live
-          .filter((o) => o.taskVec && isLive(o, Date.now()))
-          .map((o) => ({ workspaceId: o.id, agentName: o.agentName, task: o.task, similarity: Math.round(cosine(taskVec, o.taskVec ?? []) * 1000) / 1000 }))
+        const liveById = new Map(live.filter((o) => isLive(o, Date.now())).map((o) => [o.id, o]));
+        const scored: { workspaceId: string; agentName: string; task: string; similarity: number }[] = [];
+        // Stream the vectors (one Float32Array at a time) instead of holding them all as JSON arrays.
+        for (const row of this.sql.exec<{ ws_id: string; vec: ArrayBuffer }>(`SELECT ws_id, vec FROM task_vecs`)) {
+          const o = liveById.get(row.ws_id);
+          if (!o) continue;
+          scored.push({ workspaceId: o.id, agentName: o.agentName, task: o.task, similarity: Math.round(cosine(taskVec, Array.from(new Float32Array(row.vec))) * 1000) / 1000 });
+        }
+        for (const o of liveById.values()) {
+          if (o.taskVec) scored.push({ workspaceId: o.id, agentName: o.agentName, task: o.task, similarity: Math.round(cosine(taskVec, o.taskVec) * 1000) / 1000 }); // legacy inline rows
+        }
+        const dups = scored
           .filter((d) => d.similarity >= DUPLICATE_THRESHOLD)
           .sort((a, b) => b.similarity - a.similarity)
           .slice(0, 5);
@@ -548,7 +566,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         status: "provisioning",
         intent: { globs: input.globs, mode: input.mode, task: input.task, createdAt: now(), expiresAt: plusSeconds(ttl) },
         touched: [],
-        ...(taskVec ? { taskVec } : {}),
+        ...(taskVec ? { taskVec } : {}), // moved to task_vecs by putWs
         createdAt: now(),
         updatedAt: now(),
         changesetId: null,

@@ -175,10 +175,26 @@ interface WsFile {
   trunk: Tok;
 }
 
+// Transient remote failures seen live (2026-10-13, 500-agent swarm: `RPC failed; HTTP 500 … expected 'packfile'`).
+const GIT_TRANSIENT = /RPC failed|HTTP (5\d\d|429)|returned error: (5\d\d|429)|expected 'packfile'|early EOF|Connection reset|Could not resolve host|Operation timed out|SSL_ERROR|unexpected disconnect/i;
+const NETWORK_OPS = new Set(["clone", "fetch", "push", "ls-remote", "pull"]);
+
 const git = (args: string[], opts: { cwd?: string; token?: string; allow?: number[]; input?: string; env?: Record<string, string> } = {}): { code: number; stdout: string; stderr: string } => {
   const auth = opts.token ? ["-c", `http.extraHeader=Authorization: Bearer ${opts.token}`] : [];
-  const r = spawnSync("git", [...auth, ...args], { cwd: opts.cwd, encoding: "utf8", input: opts.input, timeout: TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...(opts.env ?? {}) } });
-  const res = { code: r.status ?? -1, stdout: r.stdout ?? "", stderr: (r.stderr ?? "").replace(/Bearer [A-Za-z0-9_\-.]+/g, "Bearer <redacted>") };
+  let res = { code: -1, stdout: "", stderr: "" };
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    const r = spawnSync("git", [...auth, ...args], { cwd: opts.cwd, encoding: "utf8", input: opts.input, timeout: TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...(opts.env ?? {}) } });
+    res = { code: r.status ?? -1, stdout: r.stdout ?? "", stderr: (r.stderr ?? "").replace(/Bearer [A-Za-z0-9_\-.]+/g, "Bearer <redacted>") };
+    const failed = res.code !== 0 && !(opts.allow ?? []).includes(res.code);
+    if (!failed || !NETWORK_OPS.has(args[0] ?? "") || !GIT_TRANSIENT.test(res.stderr) || attempt === 4) break;
+    // A failed clone may leave a partial directory behind; git refuses to clone into it.
+    if (args[0] === "clone") {
+      const target = args[args.length - 1];
+      if (target && !target.startsWith("-") && !target.includes("://")) rmSync(resolve(opts.cwd ?? process.cwd(), target), { recursive: true, force: true });
+    }
+    const cap = Math.min(8_000, 500 * 2 ** attempt);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, cap / 2 + Math.random() * (cap / 2));
+  }
   if (res.code !== 0 && !(opts.allow ?? []).includes(res.code)) {
     throw new WeftError("GIT_FAILED", `git ${args.slice(0, 2).join(" ")} exited ${res.code}: ${res.stderr.trim().slice(0, 400)}`);
   }
