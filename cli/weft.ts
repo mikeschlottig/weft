@@ -45,6 +45,8 @@ const OPTIONS = {
   after: { type: "string" },
   driver: { type: "string", multiple: true },
   recipe: { type: "string" },
+  import: { type: "string" },
+  branch: { type: "string" },
   arg: { type: "string", multiple: true },
   "recipe-def": { type: "string", multiple: true },
   continue: { type: "boolean" },
@@ -68,7 +70,7 @@ const HELP = `weft — coordination-first version control for many agents (Cloud
 Env: WEFT_REMOTE (default ${DEFAULT_REMOTE}), WEFT_TOKEN (agent token or admin token), WEFT_REPO
 
 Admin
-  weft init <repo> [--from DIR] [--check CMD] [--batch N] [--batch-window MS] [--sensitive GLOBS] [--union GLOBS] [--driver GLOB=DRIVER] [--no-judge]
+  weft init <repo> [--from DIR | --import https://github.com/owner/repo [--branch B]] [--check CMD] [--batch N] [--batch-window MS] [--sensitive GLOBS] [--union GLOBS] [--driver GLOB=DRIVER] [--no-judge]
                                       drivers: union · json-merge (3-way by key) · sorted-lines
   weft config [--check CMD] [--batch N] [--review-threshold N] [--sensitive GLOBS] [--no-judge]
   weft agent register --name NAME --model MODEL [--ttl-hours N]
@@ -288,15 +290,45 @@ const pushInitial = (dir: string, remoteUrl: string, token: string, repo: string
   }
 };
 
+/** FR-39: Weft's trunk is `main`. If an imported repo's default branch is another name, create `main` from it. */
+const ensureMain = (remoteUrl: string, token: string, reportedDefault: string): string => {
+  let defaultBranch = reportedDefault;
+  const tok = token.split("?expires=")[0] ?? token;
+  const heads = out(["ls-remote", "--heads", remoteUrl], { token: tok });
+  const main = /^([0-9a-f]{40})\trefs\/heads\/main$/m.exec(heads);
+  if (main?.[1]) return main[1];
+  const all = [...heads.matchAll(/^([0-9a-f]{40})\trefs\/heads\/(.+)$/gm)].map((x) => ({ sha: x[1] ?? "", name: x[2] ?? "" }));
+  const pick = all.find((h) => h.name === defaultBranch) ?? all.find((h) => h.name === "master") ?? (all.length === 1 ? all[0] : undefined);
+  if (!pick) throw new WeftError("IMPORT_EMPTY", `imported repo has no ${defaultBranch} branch to use as trunk`, { hint: `pass --branch <name>; branches: ${all.map((h) => h.name).join(", ") || "(none)"}` });
+  defaultBranch = pick.name;
+  const src: [string, string] = ["", pick.sha];
+  const tmp = mkdtempSync(join(tmpdir(), "weft-import-"));
+  try {
+    const gd = join(tmp, "g.git");
+    git(["init", "-q", "--bare", gd]);
+    git([`--git-dir=${gd}`, "fetch", "-q", remoteUrl, `+refs/heads/${defaultBranch}:refs/heads/${defaultBranch}`], { token: tok });
+    git([`--git-dir=${gd}`, "push", "-q", remoteUrl, `refs/heads/${defaultBranch}:refs/heads/main`], { token: tok });
+    return src[1];
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+};
+
 const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
   switch (cmd) {
     case "init": {
       const repo = pos[0];
       if (!repo) throw usage("weft init <repo> [--from DIR]");
-      const r = await api<{ repo: string; remote: string; token: string; config: unknown; adopted: boolean }>("POST", "/v1/repos", { repo, config: configPatch(f) });
+      if (f.from && f.import) throw usage("use --from DIR or --import URL, not both");
+      const r = await api<{ repo: string; remote: string; token: string; config: unknown; adopted: boolean; imported: { url: string; defaultBranch: string } | null }>("POST", "/v1/repos", {
+        repo,
+        config: configPatch(f),
+        ...(f.import ? { import: { url: f.import, ...(f.branch ? { branch: f.branch } : {}) } } : {}),
+      });
       let head: string | null = null;
       if (f.from) head = pushInitial(resolve(f.from), r.data.remote, r.data.token, repo);
-      return { data: { repo, remote: r.data.remote, initialCommit: head, config: r.data.config, adopted: r.data.adopted }, hints: ["weft agent register --name <agent> --model <model>"] };
+      if (r.data.imported) head = ensureMain(r.data.remote, r.data.token, r.data.imported.defaultBranch);
+      return { data: { repo, remote: r.data.remote, initialCommit: head, imported: r.data.imported, config: r.data.config, adopted: r.data.adopted }, hints: ["weft agent register --name <agent> --model <model>"] };
     }
     case "config":
       return api("PATCH", `/v1/repos/${repoOf(f)}/config`, configPatch(f));

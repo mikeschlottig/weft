@@ -41,6 +41,25 @@ export const headerToken = (plaintext: string): string => plaintext.split("?expi
 export const createTrunk = (env: Env, repo: string, description: string): Promise<ArtifactsCreateRepoResult> =>
   call(`create ${repo}`, () => env.ARTIFACTS.create(repo, { setDefaultBranch: "main", description }));
 
+/** FR-39: import an external git remote (public HTTPS) as the trunk repo. */
+export const importTrunk = (env: Env, repo: string, url: string, branch: string | undefined, description: string): Promise<ArtifactsCreateRepoResult> =>
+  call(`import ${url} -> ${repo}`, () => env.ARTIFACTS.import({ source: { url, ...(branch ? { branch } : {}) }, target: { name: repo, opts: { description } } }));
+
+/** An import is asynchronous: `get()` throws IMPORT_IN_PROGRESS until it is ready. Wait (≈ 60 s budget). */
+export const awaitImported = async (env: Env, name: string): Promise<ArtifactsRepoInfo> => {
+  for (let i = 1; ; i += 1) {
+    try {
+      using r = await env.ARTIFACTS.get(name);
+      return await r.info();
+    } catch (err: unknown) {
+      const c = codeOf(err);
+      if (c !== "IMPORT_IN_PROGRESS" && c !== "NOT_FOUND" && c !== null) throw wrap(err, `import ${name}`);
+      if (i >= 30) throw new WeftError("UPSTREAM_ARTIFACTS", `import of ${name} did not finish in time`, { retryable: true, hint: "retry `weft init --import` in a minute" });
+      await new Promise((res) => setTimeout(res, Math.min(4_000, 500 * i) * (0.75 + Math.random() * 0.5)));
+    }
+  }
+};
+
 export const repoInfo = (env: Env, name: string, fresh = false): Promise<ArtifactsRepoInfo> =>
   call(`info ${name}`, async () => {
     using r = await env.ARTIFACTS.get(name);

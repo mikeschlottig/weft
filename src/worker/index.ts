@@ -107,7 +107,13 @@ route("GET", "/v1/leaderboard", "leaderboard", "read", async (c) => {
 route("POST", "/v1/repos", "init", "admin", async (c) => {
   const b = await c.body();
   const repo = str(b.repo, "repo");
-  const data = await coord(c.env, repo).init({ repo, config: (b.config ?? {}) as Partial<RepoConfig>, actor: claimsOf(c).name });
+  const imp = b.import && typeof b.import === "object" ? (b.import as Record<string, unknown>) : null;
+  const data = await coord(c.env, repo).init({
+    repo,
+    config: (b.config ?? {}) as Partial<RepoConfig>,
+    actor: claimsOf(c).name,
+    import: imp ? { url: str(imp.url, "import.url"), ...(typeof imp.branch === "string" && imp.branch ? { branch: imp.branch } : {}) } : null,
+  });
   return { data, hints: ["push an initial commit to the returned remote (the CLI does this with --from DIR)", "weft agent register --name <agent> --model <model>"] };
 });
 

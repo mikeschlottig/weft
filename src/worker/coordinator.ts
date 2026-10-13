@@ -35,7 +35,7 @@ import type {
   WeftEvent,
   Workspace,
 } from "../core/types.ts";
-import { changedPaths, createTrunk, forkName, headOf, headerToken, listFiles, mintToken, provisionFork, repoInfo, revokeToken } from "./artifacts.ts";
+import { awaitImported, changedPaths, createTrunk, forkName, headOf, headerToken, importTrunk, listFiles, mintToken, provisionFork, repoInfo, revokeToken } from "./artifacts.ts";
 import { runner, signingKey } from "./runner-client.ts";
 
 export const DEFAULT_CONFIG: RepoConfig = {
@@ -292,17 +292,27 @@ export class RepoCoordinator extends DurableObject<Env> {
 
   // ------------------------------------------------------------ repo lifecycle
 
-  init(input: { repo: string; config: Partial<RepoConfig>; actor: string }): Promise<{ repo: string; remote: string; token: string; config: RepoConfig; adopted: boolean }> {
+  init(input: { repo: string; config: Partial<RepoConfig>; actor: string; import?: { url: string; branch?: string } | null }): Promise<{ repo: string; remote: string; token: string; config: RepoConfig; adopted: boolean; imported: { url: string; defaultBranch: string } | null }> {
     return this.guard(async () => {
       if (!/^[a-z0-9][a-z0-9._-]{0,40}$/.test(input.repo)) throw usage(`invalid repo name: ${input.repo}`, "lowercase letters, digits, . _ - (max 41 chars)");
       if (this.metaOrNull()) throw new WeftError("ALREADY_EXISTS", `repo already exists: ${input.repo}`, { hint: `weft status --repo ${input.repo}` });
       let remote: string;
       let token: string;
       let adopted = false;
+      let imported: { url: string; defaultBranch: string } | null = null;
       try {
-        const created = await createTrunk(this.env, input.repo, `weft trunk for ${input.repo}`);
-        remote = created.remote;
-        token = created.token;
+        if (input.import) {
+          if (!/^https:\/\/[^\s]+$/.test(input.import.url)) throw usage("import needs a public https:// git URL", "e.g. weft init shop --import https://github.com/owner/repo");
+          const created = await importTrunk(this.env, input.repo, input.import.url, input.import.branch, `weft trunk for ${input.repo} (imported from ${input.import.url})`);
+          const info = await awaitImported(this.env, input.repo);
+          remote = created.remote;
+          token = created.token;
+          imported = { url: input.import.url, defaultBranch: input.import.branch ?? info.defaultBranch };
+        } else {
+          const created = await createTrunk(this.env, input.repo, `weft trunk for ${input.repo}`);
+          remote = created.remote;
+          token = created.token;
+        }
       } catch (err: unknown) {
         if (!(err instanceof WeftError && err.code === "ALREADY_EXISTS")) throw err;
         remote = (await repoInfo(this.env, input.repo)).remote;
@@ -311,10 +321,10 @@ export class RepoCoordinator extends DurableObject<Env> {
       }
       const config: RepoConfig = { ...DEFAULT_CONFIG, ...input.config, judge: { ...DEFAULT_CONFIG.judge, ...(input.config.judge ?? {}) } };
       const m: Meta = { repo: input.repo, trunkRemote: remote, config, seq: 0, trunkHead: null, trunkFiles: null, activeBatch: null, paused: null, createdAt: now() };
-      this.emit(m, "repo.created", input.actor, { remote, adopted });
+      this.emit(m, "repo.created", input.actor, { remote, adopted, imported: imported?.url ?? null });
       this.saveMeta(m);
       this.project({ kind: "repo", repo: m.repo, config, createdAt: m.createdAt });
-      return { repo: input.repo, remote, token, config, adopted };
+      return { repo: input.repo, remote, token, config, adopted, imported };
     });
   }
 
