@@ -285,7 +285,7 @@ function render() {
   const mean = scored.length ? Math.round(scored.reduce((s, c) => s + c.scorecard.total, 0) / scored.length) : "—";
   const k = [[live.length, "live agents"], [inQueue.length, "in queue"], [cs.filter((c) => c.status === "landed").length, "landed"], [cs.filter((c) => c.status === "rejected").length, "rejected (returned to agent)"], [mean, "mean WQS"], [S.paused ? "paused" : "running", "queue"]];
   $("kpis").innerHTML = k.map(([b, s]) => `<div class="kpi"><b>${esc(b)}</b><span>${esc(s)}</span></div>`).join("");
-  $("nb-agents").textContent = live.length; $("nb-queue").textContent = inQueue.length; $("nb-cs").textContent = cs.length;
+  $("nb-agents").textContent = live.length; $("nb-queue").textContent = inQueue.length; $("nb-cs").textContent = cs.length >= 100 ? "100+" : cs.length; // the snapshot lists the newest 100
 
   const files = [...new Set(ws.flatMap((w) => w.touched).concat(cs.flatMap((c) => c.provenance.filesTouched)))].sort();
   $("files").innerHTML = files.map((f) => {

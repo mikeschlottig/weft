@@ -320,6 +320,9 @@ export interface SpeculationResult {
   readmitted?: string[]; // FR-28: conflict-rejected, then re-admitted after their only peers were culprits
   /** E2 flake guard: the merged tip was red once and green on a fresh re-run (these changesets landed anyway). */
   flaky?: string[];
+  /** Idempotency: members whose `Weft-Changeset` trailer is already on trunk (an earlier attempt pushed them
+   *  but did not get to record the landing). They are never applied twice; their existing commit is reported. */
+  alreadyLanded?: { id: string; commit: string }[];
 }
 
 export interface Envelope<T> {

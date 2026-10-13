@@ -332,3 +332,31 @@ test("runner: a check killed by a signal is CHECK_INTERRUPTED (infra), never a r
     /CHECK_INTERRUPTED/,
   );
 });
+
+test("runner idempotency: a changeset already on trunk (by its Weft-Changeset trailer) is reported, never re-applied", async () => {
+  const { trunk, base, heads } = setup({ x: { "f.txt": "line1\nX\nline3\n" }, y: { "status.txt": "ok\n# y\n" } });
+  // Simulate an earlier attempt that pushed x to trunk but never recorded the landing.
+  const work = mkdtempSync(join(root, "idem-"));
+  sh(["clone", "-q", trunk, work]);
+  writeFileSync(join(work, "f.txt"), "line1\nX\nline3\n");
+  sh(["commit", "-q", "-am", "change x\n\nWeft-Changeset: x\nWeft-Agent: x"], work);
+  sh(["push", "-q", "origin", "HEAD:main"], work);
+  const onTrunk = sh(["rev-parse", "HEAD"], work);
+  const r = await call<{ applied: { id: string }[]; alreadyLanded?: { id: string; commit: string }[] }>("/speculate", {
+    trunk: { remote: trunk, token: "" }, trunkHead: onTrunk, claimTime: 1_790_000_500, checkCommand: null, unionGlobs: [],
+    members: [member("x", heads.x!, base, ["f.txt"]), member("y", heads.y!, base, ["status.txt"])],
+  });
+  assert.deepEqual(r.alreadyLanded, [{ id: "x", commit: onTrunk }]);
+  assert.deepEqual(r.applied.map((a) => a.id), ["y"], "only the changeset not yet on trunk is applied");
+});
+
+test("runner idempotency: re-pushing a tip that already landed succeeds instead of reporting TRUNK_MOVED", async () => {
+  const { trunk, base, heads } = setup({ z: { "f.txt": "line1\nZ\nline3\n" } });
+  const spec = { trunk: { remote: trunk, token: "" }, trunkHead: base, claimTime: 1_790_000_600, checkCommand: null, unionGlobs: [], members: [member("z", heads.z!, base, ["f.txt"])] };
+  const s = await call<{ tip: string }>("/speculate", spec);
+  const push = { trunk: { remote: trunk, token: "", writeToken: "" }, expectedOld: base, tip: s.tip, rebuild: spec };
+  await call("/push", push);
+  const again = await call<{ pushed: boolean; tip: string }>("/push", push); // the reply to the first push was "lost"
+  assert.equal(again.tip, s.tip);
+  assert.equal(sh(["--git-dir", trunk, "rev-parse", "refs/heads/main"]), s.tip);
+});

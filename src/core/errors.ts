@@ -87,7 +87,7 @@ export const forbidden = (message: string): WeftError => new WeftError("FORBIDDE
  * Transient platform failures (seen live 2026-10-13: `D1_ERROR: Network connection lost.` during a 500-agent
  * registration burst). They say nothing about the request, so they are retryable, never INTERNAL.
  */
-export const TRANSIENT_PLATFORM = /network connection lost|connection reset|ECONNRESET|socket hang up|timed? ?out|overloaded|too many requests|internal error; reference|Durable Object reset|storage operation exceeded|D1_ERROR: (?!.*(SQLITE_CONSTRAINT|no such|syntax error))/i;
+export const TRANSIENT_PLATFORM = /network connection lost|connection reset|ECONNRESET|socket hang up|timed? ?out|overloaded|too many requests|internal error; reference|Durable Object reset|Connection closed|no longer active|Durable Object is overloaded|object to be reset|storage operation exceeded|D1_ERROR: (?!.*(SQLITE_CONSTRAINT|no such|syntax error))/i;
 
 export const toWeftError = (err: unknown): WeftError => {
   if (err instanceof WeftError) return err;

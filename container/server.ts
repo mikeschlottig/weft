@@ -405,10 +405,30 @@ const runCheck = async (gitDir: string, commit: string, command: string): Promis
 
 const speculate = (body: SpecInput): Promise<SpeculationResult> => withSigning(body.signingKey, (sign) => speculateSigned(body, sign));
 
+/** Changesets already on trunk, by their server-written `Weft-Changeset` trailer (newest 5,000 first-parent commits). */
+const landedOnTrunk = async (gitDir: string, trunkHead: string, ids: readonly string[]): Promise<Map<string, string>> => {
+  const want = new Set(ids);
+  const found = new Map<string, string>();
+  if (want.size === 0) return found;
+  const log = (await git(gitDir, ["log", "--first-parent", "-n", "5000", "--format=%H%x1f%(trailers:key=Weft-Changeset,valueonly,separator=%x2c)%x1e", trunkHead])).stdout;
+  for (const rec of log.split("\x1e")) {
+    const [hash, ids2] = rec.trim().split("\x1f");
+    for (const id of (ids2 ?? "").split(",").map((x) => x.trim()).filter((x) => x.length > 0)) {
+      if (hash && want.has(id) && !found.has(id)) found.set(id, hash.trim());
+    }
+  }
+  return found;
+};
+
 const speculateSigned = async (body: SpecInput, sign: { pre: string[]; flag: string[] }): Promise<SpeculationResult> => {
   const gitDir = await repoDir(body.trunk.remote);
   writeAttributes(gitDir, body.unionGlobs, body.drivers ?? []);
   await fetchTrunk(gitDir, body.trunk, body.trunkHead);
+  // Idempotency (found live, 500-agent swarm 2026-10-13): a batch whose push succeeded but whose landing was
+  // never recorded was requeued and re-applied. Members already on trunk are reported, never applied again.
+  const onTrunk = await landedOnTrunk(gitDir, body.trunkHead, body.members.map((m) => m.id));
+  const alreadyLanded = [...onTrunk.entries()].map(([id, commit]) => ({ id, commit }));
+  body = { ...body, members: body.members.filter((m) => !onTrunk.has(m.id)) };
   for (const m of body.members) await fetchFork(gitDir, m);
 
   const cache = new Map<string, CheckOutcome>();
@@ -473,7 +493,7 @@ const speculateSigned = async (body: SpecInput, sign: { pre: string[]; flag: str
     }
     candidates = chain.applied.map((a) => a.m);
     const last = chain.applied[chain.applied.length - 1];
-    if (!last) return { tip: body.trunkHead, applied: [], rejected, checkPassed, checksRun, bisectSteps, logs, readmitted, flaky };
+    if (!last) return { tip: body.trunkHead, applied: [], rejected, checkPassed, checksRun, bisectSteps, logs, readmitted, flaky, alreadyLanded };
     let tipOutcome = await check(last.commit, last.tree);
     // E2 (PRD §10 "check flakiness → wrong culprit"): a red tip is re-run once before anyone is blamed.
     // Red then green means the check is flaky on this tree, so the batch lands and the flake is reported.
@@ -486,7 +506,7 @@ const speculateSigned = async (body: SpecInput, sign: { pre: string[]; flag: str
     }
     if (tipOutcome.pass) {
       for (const a of chain.applied) checkPassed[a.m.id] = true;
-      return { tip: chain.tip, applied: chain.applied.map((a) => ({ id: a.m.id, commit: a.commit, tree: a.tree })), rejected, checkPassed, checksRun, bisectSteps, logs, readmitted, flaky };
+      return { tip: chain.tip, applied: chain.applied.map((a) => ({ id: a.m.id, commit: a.commit, tree: a.tree })), rejected, checkPassed, checksRun, bisectSteps, logs, readmitted, flaky, alreadyLanded };
     }
     let lo = 1;
     let hi = chain.applied.length;
@@ -566,7 +586,11 @@ const push = async (body: { trunk: TrunkRef & { writeToken: string }; expectedOl
     token: body.trunk.writeToken,
     allow: [1],
   });
-  if (r.code !== 0) throw new RunnerError("TRUNK_MOVED", `push rejected: ${redact(r.stderr || r.stdout).slice(0, 400)}`, 409, true);
+  if (r.code !== 0) {
+    // Idempotent retry: if trunk is already at our tip, an earlier attempt's push succeeded (its reply was lost).
+    const ls = await git(gitDir, ["ls-remote", body.trunk.remote, "refs/heads/main"], { token: body.trunk.writeToken, allow: [1, 128] });
+    if ((ls.stdout.split("\t")[0] ?? "").trim() !== body.tip) throw new RunnerError("TRUNK_MOVED", `push rejected: ${redact(r.stderr || r.stdout).slice(0, 400)}`, 409, true);
+  }
   const notesPushed = body.notes && body.notes.length > 0 ? await pushNotes(gitDir, body.trunk, body.notes, body.rebuild.claimTime).catch(() => false) : false;
   return { pushed: true, tip: body.tip, notesPushed };
 };

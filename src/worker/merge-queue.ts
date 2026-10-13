@@ -63,6 +63,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
   async run(event: WorkflowEvent<Params>, step: WorkflowStep): Promise<Record<string, unknown>> {
     const { repo, batchId } = event.payload;
     const coord = this.env.REPO.getByName(repo);
+    let landed: Parameters<typeof coord.landBatch>[0] | null = null;
     try {
       await resolveShard(this.env, repo); // D7: Artifacts calls below go to this repo's namespace shard
       const claim = await step.do("claim", STEP, () => rpc<Claim | null>(() => coord.claimBatch(batchId)));
@@ -129,10 +130,10 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
             await this.env.BLOBS.put(key, l.text, { httpMetadata: { contentType: "text/plain; charset=utf-8" } });
             for (const rej of r.rejected) if (rej.rejection.logKey === `commit:${l.commit}`) logKeys[rej.id] = key;
           }
-          return { trunkRed: null as string | null, tip: r.tip, applied: r.applied, rejected: r.rejected, checkPassed: r.checkPassed, checksRun: r.checksRun, bisectSteps: r.bisectSteps, logKeys, readmitted: r.readmitted ?? [], flaky: r.flaky ?? [], speculation: { lane, startedAt, endedAt } };
+          return { trunkRed: null as string | null, tip: r.tip, applied: r.applied, rejected: r.rejected, checkPassed: r.checkPassed, checksRun: r.checksRun, bisectSteps: r.bisectSteps, logKeys, readmitted: r.readmitted ?? [], flaky: r.flaky ?? [], alreadyLanded: r.alreadyLanded ?? [], speculation: { lane, startedAt, endedAt } };
         } catch (err: unknown) {
           if (err instanceof WeftError && err.code === "TRUNK_RED") {
-            return { trunkRed: String(err.details.log ?? err.message), tip: claim.trunkHead, applied: [], rejected: [] as { id: string; rejection: Rejection }[], checkPassed: {}, checksRun: 1, bisectSteps: 0, logKeys: {}, readmitted: [] as string[], flaky: [] as string[], speculation: { lane, startedAt, endedAt: Date.now() } };
+            return { trunkRed: String(err.details.log ?? err.message), tip: claim.trunkHead, applied: [], rejected: [] as { id: string; rejection: Rejection }[], checkPassed: {}, checksRun: 1, bisectSteps: 0, logKeys: {}, readmitted: [] as string[], flaky: [] as string[], alreadyLanded: [] as { id: string; commit: string }[], speculation: { lane, startedAt, endedAt: Date.now() } };
           }
           // A deterministic runner verdict (e.g. CHECK_FLAKY, HEAD_MISSING) must not be retried by Workflows.
           if (err instanceof WeftError && !err.retryable) throw new NonRetryableError(`${err.code}: ${err.message}`);
@@ -148,7 +149,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
       // 4. the single trunk write, with a compare-and-swap lease (verified against Artifacts 2026-10-12).
       //    FR-26: if another lane landed first (TRUNK_MOVED), re-speculate this lane on the new trunk —
       //    full chain + one check on the new merged tip — and push again, instead of requeueing.
-      let final = { trunkHead: claim.trunkHead, tip: spec.tip, applied: spec.applied, rejected: spec.rejected, checkPassed: spec.checkPassed, checksRun: spec.checksRun, bisectSteps: spec.bisectSteps, logKeys: spec.logKeys, readmitted: spec.readmitted, flaky: spec.flaky };
+      let final = { trunkHead: claim.trunkHead, tip: spec.tip, applied: spec.applied, rejected: spec.rejected, checkPassed: spec.checkPassed, checksRun: spec.checksRun, bisectSteps: spec.bisectSteps, logKeys: spec.logKeys, readmitted: spec.readmitted, flaky: spec.flaky, alreadyLanded: spec.alreadyLanded };
       let rebases = 0;
       if (final.applied.length > 0) {
         for (let attempt = 1; ; attempt += 1) {
@@ -198,6 +199,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
             logKeys: final.logKeys,
             readmitted: [...final.readmitted, ...(r.readmitted ?? [])],
             flaky: [...new Set([...final.flaky, ...(r.flaky ?? [])])],
+            alreadyLanded: [...final.alreadyLanded, ...(r.alreadyLanded ?? []).filter((x) => !final.alreadyLanded.some((y) => y.id === x.id))],
           };
           if (final.applied.length === 0) break;
         }
@@ -208,6 +210,24 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
             return { requeued: "verify mismatch" };
           }
         }
+      }
+
+      // From here on the batch IS on trunk: a later failure must record the landing, never requeue (requeueing
+      // re-applied 16 already-landed changesets in the 500-agent swarm, 2026-10-13).
+      if (final.applied.length > 0 || final.alreadyLanded.length > 0) {
+        landed = {
+          batchId,
+          trunkAfter: final.applied.length > 0 ? final.tip : null,
+          applied: [...final.applied.map((a) => ({ id: a.id, commit: a.commit })), ...final.alreadyLanded],
+          rejected: final.rejected,
+          checkPassed: final.checkPassed,
+          checksRun: final.checksRun,
+          bisectSteps: final.bisectSteps,
+          logKeys: final.logKeys,
+          readmitted: final.readmitted,
+          laneRebases: rebases,
+          flaky: final.flaky,
+        };
       }
 
       // 5. FR-34 provenance bundles in R2 (content-addressed by sha256), linked from trunk by git notes.
@@ -238,7 +258,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
           coord.landBatch({
             batchId,
             trunkAfter: final.applied.length > 0 ? final.tip : null,
-            applied: final.applied.map((a) => ({ id: a.id, commit: a.commit })),
+            applied: [...final.applied.map((a) => ({ id: a.id, commit: a.commit })), ...final.alreadyLanded],
             rejected: final.rejected,
             checkPassed: final.checkPassed,
             checksRun: final.checksRun,
@@ -265,6 +285,12 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
       return { landed: final.applied.length, rejected: final.rejected.length, held: held.length, checksRun: final.checksRun, laneRebases: rebases };
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);
+      if (landed) {
+        // Pushed but not recorded: record it (landBatch is idempotent on batchId). Never requeue a landed batch.
+        const input = landed;
+        await step.do("land-after-failure", { retries: { limit: 10, delay: "10 seconds", backoff: "exponential" }, timeout: "10 minutes" }, () => rpc<{ idempotent: boolean }>(() => coord.landBatch(input)));
+        return { landed: input.applied.length, recoveredFrom: reason.slice(0, 300) };
+      }
       // E4 (review M3): transient infrastructure failures never count against a changeset's attempts.
       const kind = infraFailure(err) ? "infra" : "failure";
       await step.do("requeue-on-failure", STEP, () => rpc<null>(() => coord.requeueBatch(batchId, `workflow failed: ${reason.slice(0, 300)}`, kind)));
