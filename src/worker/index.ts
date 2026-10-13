@@ -109,7 +109,7 @@ route("GET", "/v1/repos/:repo/snapshot", "snapshot", "read", async (c) => ({ dat
 route("POST", "/v1/repos/:repo/workspaces", "start", "agent", async (c) => {
   const b = await c.body();
   const mode: IntentMode = b.mode === "exclusive" ? "exclusive" : "soft";
-  const res = await coord(c.env, c.params.repo ?? "").start({ agent: claimsOf(c), task: str(b.task, "task"), globs: strs(b.touch, "touch"), mode, ttl: numOr(b.ttl, null) });
+  const res = await coord(c.env, c.params.repo ?? "").start({ agent: claimsOf(c), task: str(b.task, "task"), globs: strs(b.touch, "touch"), mode, ttl: numOr(b.ttl, null), after: typeof b.after === "string" && b.after ? b.after : null });
   const hints = ["weft status", 'weft submit -m "..."'];
   if (res.forecast.risk === "medium" || res.forecast.risk === "high") hints.unshift("weft who <path>  # another agent is in scope");
   return { data: res, hints };

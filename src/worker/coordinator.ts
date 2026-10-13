@@ -328,7 +328,7 @@ export class RepoCoordinator extends DurableObject<Env> {
 
   // ------------------------------------------------------------ workspaces
 
-  start(input: { agent: AgentClaims; task: string; globs: string[]; mode: IntentMode; ttl: number | null }) {
+  start(input: { agent: AgentClaims; task: string; globs: string[]; mode: IntentMode; ttl: number | null; after?: string | null }) {
     return this.guard(async () => {
       if (input.globs.length === 0) throw usage("an intent needs at least one --touch glob", "e.g. --touch 'src/auth/**'");
       if (!input.task.trim()) throw usage('start needs --task "..."');
@@ -336,9 +336,18 @@ export class RepoCoordinator extends DurableObject<Env> {
       const tf = await this.trunkFiles(m0);
       if (!tf.head) throw invalidState("trunk is empty", "push an initial commit to trunk (weft init --from DIR)");
 
+      // FR-27: a stacked workspace forks the parent changeset's fork, so it starts on top of unlanded work.
+      let parent: { cs: Changeset; ws: StoredWorkspace } | null = null;
+      if (input.after) {
+        const pc = this.cs(input.after);
+        if (pc.status === "landed") throw usage(`${pc.id} already landed; start normally — trunk contains it`, "weft start --task ...");
+        if (pc.status === "rejected" || pc.status === "reverted") throw invalidState(`${pc.id} is ${pc.status}; you cannot stack on it`);
+        parent = { cs: pc, ws: this.ws(pc.wsId) };
+      }
+
       // ---- decision block (no awaits)
       const m = this.meta();
-      const live = this.liveWs();
+      const live = this.liveWs().filter((o) => !parent || o.id !== parent.ws.id);
       const fc = forecast(live, { wsId: null, globs: input.globs, touched: [] }, tf.files, m.config, Date.now());
       const blocking = blockingOverlaps(fc, input.mode);
       if (blocking.length > 0) {
@@ -363,7 +372,8 @@ export class RepoCoordinator extends DurableObject<Env> {
         forkRepo: forkName(m.repo, wsId),
         forkRemote: "",
         forkTokenId: null,
-        baseCommit: tf.head,
+        baseCommit: parent ? parent.cs.headCommit : tf.head,
+        after: parent ? parent.cs.id : null,
         status: "provisioning",
         intent: { globs: input.globs, mode: input.mode, task: input.task, createdAt: now(), expiresAt: plusSeconds(ttl) },
         touched: [],
@@ -381,7 +391,8 @@ export class RepoCoordinator extends DurableObject<Env> {
       // ---- provisioning I/O
       try {
         // Forks of one trunk are issued one at a time (concurrent forks were seen to vanish, see provisionFork).
-        const prov = this.forkChain.then(() => provisionFork(this.env, m.repo, ws.forkRepo, `weft workspace ${wsId} (${input.agent.name})`, FORK_TOKEN_TTL));
+        const source = parent ? parent.ws.forkRepo : m.repo;
+        const prov = this.forkChain.then(() => provisionFork(this.env, source, ws.forkRepo, `weft workspace ${wsId} (${input.agent.name})${parent ? ` stacked on ${parent.cs.id}` : ""}`, FORK_TOKEN_TTL, parent !== null));
         this.forkChain = prov.catch(() => undefined);
         const { token: forkTok, ...fork } = await prov;
         const trunkTok = await mintToken(this.env, m.repo, "read", TRUNK_READ_TTL);
@@ -400,10 +411,12 @@ export class RepoCoordinator extends DurableObject<Env> {
           mode: input.mode,
           forecast: fc.risk,
           peers: fc.overlaps.map((o) => o.agentName),
+          after: parent?.cs.id ?? null,
         }, fc.overlaps.map((o) => `agent:${o.agentId}`));
         this.saveMeta(m2);
         return {
           workspace: this.publicWs(live2),
+          stackedOn: parent ? { changeset: parent.cs.id, branch: parent.ws.branch, head: parent.cs.headCommit } : null,
           forecast: fc,
           fork: { remote: fork.remote, token: headerToken(forkTok.plaintext), expiresAt: forkTok.expiresAt },
           trunk: { remote: m2.trunkRemote, token: headerToken(trunkTok.plaintext), expiresAt: trunkTok.expiresAt, head: tf.head },
@@ -435,7 +448,13 @@ export class RepoCoordinator extends DurableObject<Env> {
       changesetId: w.changesetId,
       intent: w.intent,
       touched: w.touched,
+      after: w.after ?? null,
     };
+  }
+
+  /** Live workspaces this one should be forecast against (never its own stack parent). */
+  private peersOf(w: StoredWorkspace): StoredWorkspace[] {
+    return this.liveWs().filter((o) => o.id !== w.id && !(w.after && o.changesetId === w.after));
   }
 
   private own(wsId: string, agent: AgentClaims): StoredWorkspace {
@@ -474,7 +493,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         w.intent.expiresAt = plusSeconds(m.config.leaseTtlSeconds);
         w.expiredNotified = false;
       }
-      const others = this.liveWs().filter((o) => o.id !== w.id);
+      const others = this.peersOf(w);
       const fc = forecast(others, { wsId: w.id, globs: w.intent.globs, touched: w.touched, symbols: w.touchedSymbols }, tf.files, m.config, Date.now());
       const keys = fc.overlaps.filter(isRealOverlap).map((o) => `${o.workspaceId}:${o.strength}:${o.files.join(",")}`);
       const fresh = keys.filter((k) => !w.alertKeys.includes(k));
@@ -513,7 +532,7 @@ export class RepoCoordinator extends DurableObject<Env> {
       const w = this.own(input.wsId, input.agent);
       if (w.status !== "active" && w.status !== "conflicted") throw invalidState(`workspace ${w.id} is ${w.status}`);
       const next = [...new Set([...w.intent.globs, ...input.globs])];
-      const fc = forecast(this.liveWs().filter((o) => o.id !== w.id), { wsId: w.id, globs: next, touched: w.touched }, tf.files, m.config, Date.now());
+      const fc = forecast(this.peersOf(w), { wsId: w.id, globs: next, touched: w.touched }, tf.files, m.config, Date.now());
       const blocking = fc.overlaps.filter((o) => o.mode === "exclusive" && isRealOverlap(o));
       if (blocking.length > 0) throw new WeftError("LEASE_HELD", "widening would overlap an exclusive intent", { retryable: true, details: { blocking } });
       w.intent.globs = next;
@@ -607,7 +626,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         toolCalls: input.toolCalls,
         costUsd: input.costUsd,
       };
-      const fc = forecast(this.liveWs().filter((o) => o.id !== w.id), { wsId: w.id, globs: w.intent.globs, touched: input.filesTouched, symbols: w.touchedSymbols }, tf.files, m.config, Date.now());
+      const fc = forecast(this.peersOf(w), { wsId: w.id, globs: w.intent.globs, touched: input.filesTouched, symbols: w.touchedSymbols }, tf.files, m.config, Date.now());
       const overlapping = fc.overlaps.filter(isRealOverlap).length;
       const risk = scoreRisk(m.config, prov, overlapping, input.behind);
       const needsReview = risk.sensitive || risk.score >= m.config.reviewThreshold;
@@ -633,14 +652,19 @@ export class RepoCoordinator extends DurableObject<Env> {
         resolves: input.resolves,
         scorecard: null,
         attempts: 0,
+        after: w.after ?? null,
       };
+      if (c.after) {
+        const pc = this.cs(c.after);
+        if (pc.status === "rejected" || pc.status === "reverted") throw invalidState(`your stack parent ${pc.id} was ${pc.status}`, "re-stack: weft start --after <new parent> (or start fresh from trunk)");
+      }
       this.putCs(c);
       w.status = "submitted";
       w.changesetId = id;
       w.touched = input.filesTouched;
       w.behindAtSubmit = input.behind;
       this.putWs(w);
-      this.emit(m, "changeset.submitted", w.agentId, { csId: id, wsId: w.id, agentName: w.agentName, message: c.message, files: input.filesTouched.length, risk: risk.score, status: c.status });
+      this.emit(m, "changeset.submitted", w.agentId, { csId: id, wsId: w.id, agentName: w.agentName, message: c.message, files: input.filesTouched.length, risk: risk.score, status: c.status, after: c.after ?? null });
       if (needsReview) this.emit(m, "changeset.needs_review", "weft", { csId: id, agentName: w.agentName, risk: risk.score, reason: risk.sensitive ? "sensitive path" : "risk threshold" });
       this.saveMeta(m);
       if (!needsReview) this.scheduleKick(m.config.batchWindowMs ?? KICK_DELAY_MS);
@@ -706,7 +730,18 @@ export class RepoCoordinator extends DurableObject<Env> {
     // ---- decision block
     const m = this.meta();
     if (m.activeBatch || m.paused) return null;
-    const queued = this.csByStatus("queued", m.config.batchSize);
+    // FR-27: a stacked changeset is eligible only when its parent has landed or rides earlier in this batch.
+    const queued: Changeset[] = [];
+    const picked = new Set<string>();
+    for (const c of this.csByStatus("queued", 500)) {
+      if (queued.length >= m.config.batchSize) break;
+      if (c.after && !picked.has(c.after)) {
+        const ps = this.cs(c.after).status;
+        if (ps !== "landed") continue;
+      }
+      queued.push(c);
+      picked.add(c.id);
+    }
     if (queued.length === 0) return null;
     const batchId = `b-${pad(this.nextSeq(m))}`;
     const members: BatchMember[] = queued.map((c) => {
@@ -726,6 +761,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         agentName: c.provenance.agentName,
         task: c.provenance.task,
         intentGlobs: c.provenance.intentGlobs,
+        after: c.after ?? null,
       };
     });
     const claim: BatchClaim = {
@@ -886,6 +922,24 @@ export class RepoCoordinator extends DurableObject<Env> {
         }, [`agent:${c.agentId}`]);
         this.project({ kind: "scorecard", repo: m.repo, cs: { id: c.id, agentId: c.agentId, agentName: c.provenance.agentName, model: c.provenance.model, status: c.status, wqs: c.scorecard.total, scorecard: c.scorecard, landedCommit: null } });
         if (rejection.reason === "conflict") roomsToStart.push(this.openRoom(m, c, rejection).id);
+      }
+      // FR-27: children (queued or held) of a rejected parent cannot land: reject them with the reason.
+      const rejectedIds = new Set(input.rejected.map((r) => r.id));
+      let frontier = [...rejectedIds];
+      while (frontier.length > 0) {
+        const next: string[] = [];
+        for (const child of this.allCs(2000).filter((c) => c.after && frontier.includes(c.after) && (c.status === "queued" || c.status === "needs_review"))) {
+          child.status = "rejected";
+          child.rejection = { reason: "dependency", detail: `stack parent ${child.after} was rejected`, files: [], conflictsWith: [], logKey: null };
+          this.putCs(child);
+          const cw = this.ws(child.wsId);
+          cw.status = "active";
+          cw.rejections += 1;
+          this.putWs(cw);
+          this.emit(m, "changeset.rejected", "weft-merge-queue", { csId: child.id, wsId: child.wsId, agentName: child.provenance.agentName, reason: "dependency", files: [], conflictsWith: [child.after], wqs: null }, [`agent:${child.agentId}`]);
+          next.push(child.id);
+        }
+        frontier = next;
       }
       // Anything still validating in this batch (e.g. dropped by a rebuild) goes back to the queue.
       for (const x of b.claim.members) {

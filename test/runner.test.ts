@@ -122,3 +122,38 @@ test("runner rooms: verify refuses leftover markers, builds a merge commit and r
   const parents = sh(["rev-list", "--parents", "-n", "1", green.candidate], heads.b!.remote).split(" ").slice(1);
   assert.deepEqual(parents, [aHead, heads.b!.head]);
 });
+
+/** A child fork whose branch is the parent's head plus one more commit (what `weft start --after` produces). */
+const stackChild = (parent: { remote: string; branch: string; head: string }, id: string, files: Record<string, string>) => {
+  const work = mkdtempSync(join(root, "s-"));
+  sh(["clone", "-q", parent.remote, work]);
+  sh(["checkout", "-q", "-B", `weft/${id}`, parent.head], work);
+  for (const [p, c] of Object.entries(files)) writeFileSync(join(work, p), c);
+  sh(["commit", "-q", "-am", `change ${id}`], work);
+  const fork = join(root, `fork-${id}-${Math.random().toString(36).slice(2)}.git`);
+  sh(["init", "-q", "--bare", "-b", "main", fork]);
+  sh(["push", "-q", fork, `weft/${id}`], work);
+  return { remote: fork, branch: `weft/${id}`, head: sh(["rev-parse", "HEAD"], work) };
+};
+
+test("runner FR-27: a stacked child lands on top of its parent in one batch", async () => {
+  const { trunk, base, heads } = setup({ p: { "f.txt": "line1\nP\nline3\n" } });
+  const child = stackChild(heads.p!, "c", { "status.txt": "ok\nchild\n" });
+  const r = await call<{ applied: { id: string; commit: string }[]; rejected: { id: string }[]; tip: string }>("/speculate", {
+    trunk: { remote: trunk, token: "" }, trunkHead: base, claimTime: 1_790_000_100, checkCommand: "grep -q '^ok$' status.txt", unionGlobs: [],
+    members: [member("p", heads.p!, base, ["f.txt"]), { ...member("c", child, heads.p!.head, ["status.txt"]), after: "p" }],
+  });
+  assert.deepEqual(r.applied.map((a) => a.id), ["p", "c"]);
+  assert.deepEqual(r.rejected, []);
+});
+
+test("runner FR-27: when the parent fails the check, its stacked child is rejected as a dependency", async () => {
+  const { trunk, base, heads } = setup({ p: { "status.txt": "broken\n" }, z: { "f.txt": "line1\nZ\nline3\n" } });
+  const child = stackChild(heads.p!, "c", { "f.txt": "line1\nline2\nline3\nchild\n" });
+  const r = await call<{ applied: { id: string }[]; rejected: { id: string; rejection: { reason: string } }[] }>("/speculate", {
+    trunk: { remote: trunk, token: "" }, trunkHead: base, claimTime: 1_790_000_200, checkCommand: "grep -q '^ok$' status.txt", unionGlobs: [],
+    members: [member("p", heads.p!, base, ["status.txt"]), { ...member("c", child, heads.p!.head, ["f.txt"]), after: "p" }, member("z", heads.z!, base, ["f.txt"])],
+  });
+  assert.deepEqual(r.applied.map((a) => a.id), ["z"]);
+  assert.deepEqual(r.rejected.map((x) => [x.id, x.rejection.reason]).sort(), [["c", "dependency"], ["p", "check_failed"]]);
+});

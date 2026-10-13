@@ -47,11 +47,11 @@ export const repoInfo = (env: Env, name: string, fresh = false): Promise<Artifac
     return r.info();
   }, fresh);
 
-export const forkFrom = async (env: Env, trunk: string, name: string, description: string): Promise<{ remote: string }> => {
+export const forkFrom = async (env: Env, trunk: string, name: string, description: string, allBranches = false): Promise<{ remote: string }> => {
   try {
     const res = await call(`fork ${trunk} -> ${name}`, async () => {
       using r = await env.ARTIFACTS.get(trunk);
-      return r.fork(name, { defaultBranchOnly: true, description });
+      return r.fork(name, { defaultBranchOnly: !allBranches, description });
     });
     return { remote: res.remote };
   } catch (err: unknown) {
@@ -70,11 +70,12 @@ export const provisionFork = async (
   name: string,
   description: string,
   ttl: number,
+  allBranches = false,
 ): Promise<{ remote: string; token: ArtifactsCreateTokenResult; forkAttempts: number }> => {
   let last: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      const fork = await forkFrom(env, trunk, name, description);
+      const fork = await forkFrom(env, trunk, name, description, allBranches);
       const token = await mintToken(env, name, "write", ttl, true);
       return { remote: fork.remote, token, forkAttempts: attempt };
     } catch (err: unknown) {

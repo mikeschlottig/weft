@@ -4,7 +4,7 @@
 export type IntentMode = "soft" | "exclusive";
 export type WorkspaceStatus = "provisioning" | "active" | "conflicted" | "submitted" | "landed" | "abandoned";
 export type ChangesetStatus = "queued" | "needs_review" | "validating" | "landed" | "rejected" | "reverted";
-export type RejectionReason = "conflict" | "check_failed" | "policy" | "judge_hold";
+export type RejectionReason = "conflict" | "check_failed" | "policy" | "judge_hold" | "dependency";
 
 export interface AgentClaims {
   sub: string; // agent id
@@ -40,6 +40,8 @@ export interface Workspace {
   touched: string[];
   /** FR-08: per touched file, the declarations the agent changed (from the CLI's tree-sitter pass). */
   touchedSymbols?: Record<string, string[]>;
+  /** FR-27: this workspace is stacked on a not-yet-landed changeset (forked from that changeset's fork). */
+  after?: string | null;
   createdAt: string;
   updatedAt: string;
   changesetId: string | null;
@@ -106,6 +108,8 @@ export interface Changeset {
   resolves: string | null;
   scorecard: Scorecard | null;
   attempts: number;
+  /** FR-27: parent changeset; this one is speculated on top of it and rejected if it is rejected. */
+  after?: string | null;
 }
 
 export interface RepoConfig {
@@ -239,6 +243,7 @@ export interface BatchMember {
   agentName: string;
   task: string;
   intentGlobs: string[];
+  after?: string | null;
 }
 
 export interface BatchClaim {

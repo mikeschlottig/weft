@@ -42,6 +42,7 @@ const OPTIONS = {
   "tool-calls": { type: "string" },
   cost: { type: "string" },
   resolves: { type: "string" },
+  after: { type: "string" },
   continue: { type: "boolean" },
   abort: { type: "boolean" },
   by: { type: "string" },
@@ -69,7 +70,8 @@ Admin
   weft approve <cs> [--by NAME]       weft revert <cs> [--by NAME]       weft queue run
 
 Agent loop (inside a workspace dir, or --ws)
-  weft start --task "..." --touch GLOB [--touch GLOB] [--exclusive] [--dir PATH]
+  weft start --task "..." --touch GLOB [--touch GLOB] [--exclusive] [--after cs-x] [--dir PATH]
+                                      --after: stack on a queued changeset (FR-27); --touch path#Symbol for symbol intents
   weft status                         heartbeat: touched, drift, live overlaps, forecast
   weft widen --touch GLOB
   weft checkpoint [-m MSG]            commit + push to your fork
@@ -285,15 +287,23 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
       if (!f.task) throw usage('weft start needs --task "..."');
       const r = await api<{
         workspace: { id: string; branch: string; baseCommit: string };
+        stackedOn: { changeset: string; branch: string; head: string } | null;
         forecast: unknown;
         fork: Tok;
         trunk: Tok & { head: string };
-      }>("POST", `/v1/repos/${repo}/workspaces`, { task: f.task, touch: f.touch ?? [], mode: f.exclusive ? "exclusive" : "soft" });
+      }>("POST", `/v1/repos/${repo}/workspaces`, { task: f.task, touch: f.touch ?? [], mode: f.exclusive ? "exclusive" : "soft", after: f.after ?? null });
       const ws = r.data.workspace;
       const dir = resolve(f.dir ?? ws.id);
       git(["clone", "-q", r.data.fork.remote, dir], { token: r.data.fork.token });
       git(["remote", "add", "trunk", r.data.trunk.remote], { cwd: dir });
-      git(["checkout", "-q", "-B", ws.branch], { cwd: dir });
+      if (r.data.stackedOn) {
+        // FR-27: the fork was forked from the parent's fork, so the parent's branch is here; build on its head.
+        const p = r.data.stackedOn;
+        git(["fetch", "-q", "origin", `+refs/heads/${p.branch}:refs/remotes/origin/${p.branch}`], { cwd: dir, token: r.data.fork.token });
+        git(["checkout", "-q", "-B", ws.branch, p.head], { cwd: dir });
+      } else {
+        git(["checkout", "-q", "-B", ws.branch], { cwd: dir });
+      }
       git(["config", "user.name", process.env.WEFT_AGENT_NAME ?? ws.id.split("-").slice(2).join("-")], { cwd: dir });
       git(["config", "user.email", `${ws.id}@agents.weft.dev`], { cwd: dir });
       git(["config", "weft.repo", repo], { cwd: dir });

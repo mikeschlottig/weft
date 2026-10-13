@@ -207,7 +207,14 @@ const buildChain = async (gitDir: string, start: string, members: BatchMember[],
   let tip = start;
   const applied: Applied[] = [];
   const conflicts: { m: BatchMember; files: string[]; peers: ConflictPeer[] }[] = [];
+  const dependents: { m: BatchMember; parent: string }[] = [];
+  const inBatch = new Set(members.map((x) => x.id));
   for (const m of members) {
+    // FR-27: a stacked child rides on its parent; if the parent is in this batch but did not apply, neither can it.
+    if (m.after && inBatch.has(m.after) && !applied.some((a) => a.m.id === m.after)) {
+      dependents.push({ m, parent: m.after });
+      continue;
+    }
     const base = await out(gitDir, ["merge-base", tip, m.headCommit]);
     const merged = await mergeTree(gitDir, base, tip, m.headCommit);
     if (!merged.clean) {
@@ -232,7 +239,7 @@ const buildChain = async (gitDir: string, start: string, members: BatchMember[],
     applied.push({ m, commit, tree: merged.tree });
     tip = commit;
   }
-  return { tip, applied, conflicts };
+  return { tip, applied, conflicts, dependents };
 };
 
 interface CheckOutcome {
@@ -303,6 +310,10 @@ const speculate = async (body: SpecInput): Promise<SpeculationResult> => {
       const peerIds = c.peers.map((p) => p.changesetId).filter((x): x is string => x !== null);
       if (peerIds.length > 0) conflictOnly.set(c.m.id, { m: c.m, peerIds });
     }
+    for (const d of chain.dependents) {
+      if (rejected.some((r) => r.id === d.m.id)) continue;
+      rejected.push({ id: d.m.id, rejection: { reason: "dependency", detail: `stack parent ${d.parent} did not apply`, files: [], conflictsWith: [], logKey: null } });
+    }
     candidates = chain.applied.map((a) => a.m);
     const last = chain.applied[chain.applied.length - 1];
     if (!last) return { tip: body.trunkHead, applied: [], rejected, checkPassed, checksRun, bisectSteps, logs, readmitted };
@@ -337,6 +348,14 @@ const speculate = async (body: SpecInput): Promise<SpeculationResult> => {
     });
     candidates = candidates.filter((c) => c.id !== culprit.m.id);
     culprits.add(culprit.m.id);
+    // FR-27: stacked descendants of a culprit contain its commits, so they leave with it.
+    let gone = [culprit.m.id];
+    while (gone.length > 0) {
+      const kids = candidates.filter((c) => c.after && gone.includes(c.after));
+      for (const k of kids) rejected.push({ id: k.id, rejection: { reason: "dependency", detail: `stack parent ${k.after ?? ""} failed the check`, files: [], conflictsWith: [], logKey: null } });
+      candidates = candidates.filter((c) => !kids.some((k) => k.id === c.id));
+      gone = kids.map((k) => k.id);
+    }
     const readmit = [...conflictOnly.values()].filter((x) => x.peerIds.every((p) => culprits.has(p)));
     if (readmit.length > 0) {
       const ids = new Set(readmit.map((x) => x.m.id));
