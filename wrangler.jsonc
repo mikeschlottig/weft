@@ -5,7 +5,7 @@
   "compatibility_date": "2026-10-08",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
-  "assets": { "directory": "./web", "binding": "ASSETS", "run_worker_first": ["/v1/*", "/mcp", "/healthz"] },
+  "assets": { "directory": "./web", "binding": "ASSETS", "run_worker_first": ["/v1/*", "/mcp", "/healthz", "/.well-known/*"] },
 
   // Artifacts: trunk + one fork per workspace, all in the "weft" namespace.
   "artifacts": [{ "binding": "ARTIFACTS", "namespace": "weft" }],
@@ -33,14 +33,59 @@
 
   "queues": {
     "producers": [{ "binding": "JOBS", "queue": "weft-jobs" }],
-    "consumers": [{ "queue": "weft-jobs", "max_batch_size": 50, "max_batch_timeout": 2 }]
+    "consumers": [
+      { "queue": "weft-jobs", "max_batch_size": 50, "max_batch_timeout": 2 },
+      { "queue": "weft-artifacts-events", "max_batch_size": 50, "max_batch_timeout": 2 }
+    ]
   },
 
   "d1_databases": [{ "binding": "DB", "database_name": "weft-index", "database_id": "c9956b9e-91ce-4812-b7a2-070a6ffcc7d5", "migrations_dir": "migrations" }],
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "weft-blobs" }],
+  // JWKS (agent token keys), kill-switch flags, policy cache (spec §4.4).
+  "kv_namespaces": [{ "binding": "CONFIG", "id": "03ac94046fcc46c7839a0524a2e547f8" }],
   "ai": { "binding": "AI" },
   "analytics_engine_datasets": [{ "binding": "METRICS", "dataset": "weft_events" }],
 
   "secrets": { "required": ["ADMIN_TOKEN", "JWT_SIGNING_SECRET"] },
-  "vars": { "PUBLIC_READ": "true" }
+  "vars": { "PUBLIC_READ": "true", "WEFT_ENV": "production", "ARTIFACTS_EVENTS_QUEUE": "weft-artifacts-events" },
+
+  // ---------------------------------------------------------------- weft-dev
+  // M1–M3 development. A separate Worker (weft-dev) with its own Artifacts namespace, D1, R2, KV,
+  // queues, Workflow and Container, so the production contest entry is never touched.
+  // Deploy: npx wrangler deploy --env dev
+  "env": {
+    "dev": {
+      "artifacts": [{ "binding": "ARTIFACTS", "namespace": "weft-dev" }],
+      "durable_objects": {
+        "bindings": [
+          { "name": "REPO", "class_name": "RepoCoordinator" },
+          { "name": "MERGE_RUNNER", "class_name": "MergeRunner" }
+        ]
+      },
+      "containers": [
+        {
+          "class_name": "MergeRunner",
+          "image": "./container/Dockerfile",
+          "image_build_context": ".",
+          "max_instances": 10,
+          "instance_type": "basic"
+        }
+      ],
+      "workflows": [{ "name": "weft-merge-queue-dev", "binding": "MERGE_QUEUE", "class_name": "MergeQueue" }],
+      "queues": {
+        "producers": [{ "binding": "JOBS", "queue": "weft-jobs-dev" }],
+        "consumers": [
+          { "queue": "weft-jobs-dev", "max_batch_size": 50, "max_batch_timeout": 2 },
+          { "queue": "weft-artifacts-events-dev", "max_batch_size": 50, "max_batch_timeout": 2 }
+        ]
+      },
+      "d1_databases": [{ "binding": "DB", "database_name": "weft-index-dev", "database_id": "b90a0f67-a9c5-4942-bc91-bdfb283fdf12", "migrations_dir": "migrations" }],
+      "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "weft-blobs-dev" }],
+      "kv_namespaces": [{ "binding": "CONFIG", "id": "952df7f226f74a70a7e71a382a2b6d1f" }],
+      "ai": { "binding": "AI" },
+      "analytics_engine_datasets": [{ "binding": "METRICS", "dataset": "weft_events_dev" }],
+      "secrets": { "required": ["ADMIN_TOKEN", "JWT_SIGNING_SECRET"] },
+      "vars": { "PUBLIC_READ": "true", "WEFT_ENV": "dev", "ARTIFACTS_EVENTS_QUEUE": "weft-artifacts-events-dev" }
+    }
+  }
 }
