@@ -17,26 +17,38 @@ Live: **https://weft.ceo-a53.workers.dev** (Mission Control; open a repo such as
 | Collisions surface at merge time, after the work is done | **Intent Ledger**: agents declare scope before editing; overlap forecasts and live alerts; soft and exclusive leases with TTLs | Durable Object per repo (SQLite, alarms, hibernating WebSockets) |
 | Many writers race on `main` | **Changesets, not branches**: every workspace is an Artifacts fork with a fork-scoped token; agents never write trunk | Artifacts `fork()` + `createToken()` |
 | Green branches produce a red trunk | **Speculative Weave queue**: batch, merge in memory (`git merge-tree`), check the merged tip once, bisect on red, land with a compare-and-swap push | Workflows + Containers (real git) |
-| Hot files (changelogs) always conflict | Merge-driver registry (union) | merge-runner `.gitattributes` |
-| Forgeable attribution | Server-written trailers on every trunk commit (`Weft-Agent`, `Weft-Model`, `Weft-Task`, `Weft-Risk`, …) | Only the queue writes trunk |
+| Hot files (changelogs, `package.json`, allow-lists) always conflict | **Merge-driver registry v2**: `union`, `json-merge` (3-way by key), `sorted-lines` | merge-runner `.gitattributes` + registered drivers |
+| A conflict stops an agent cold | **Conflict Rooms**: Workers AI proposes a resolution, the merge-runner builds it on current trunk and runs the check; only a **green** proposal is offered (`weft room accept`) | RoomResolver Workflow + Workers AI (`kimi-k2.7-code`) + Container |
+| Two agents in one file are flagged as colliding even in different functions | **Symbol-level intents**: tree-sitter (TS/JS/Python) reports the declarations each agent changed; same file + different symbols = no alert | CLI-side tree-sitter; DO forecast |
+| Collisions are only seen when an agent asks | **Push-derived heartbeats**: a plain `git push` to a fork triggers a forecast and live alerts within seconds | Artifacts `cf.artifacts.repo.pushed` Workflow trigger |
+| A crashed or new agent session loses its context | **Context packs + resume**: a token-budgeted, prompt-ready pack (peers, rejections + advice, recent landings, house rules); `weft resume` re-acquires an expired workspace, even on another machine | DO event log + Artifacts forks |
+| Codemods (renames) break code that landed meanwhile | **Recipe changesets**: an admin-defined codemod is replayed on the newest trunk instead of merging text | merge-runner |
+| Dependent work waits for review | **Stacked changesets** (`--after cs-x`): the child forks the parent's fork and lands right after it | Artifacts fork-of-fork |
+| Forgeable attribution | Server-written trailers on every trunk commit (`Weft-Agent`, `Weft-Model`, `Weft-Task`, `Weft-Risk`, …), **SSH-signed** trunk commits, and a **provenance bundle** (prompt hash, tool calls, cost, risk, judge) linked by `refs/notes/weft` | Only the queue writes trunk; R2 |
 | No signal for agents to improve against | **WQS-1 quality rubric**: deterministic gates + the **Cloudflare CLEF** decision-model judge + process; scores go back to the agent and are ranked by agent and by model | Workers AI (`@cf/cloudflare/clef`), D1 |
 | Humans can't review everything | Risk-routed review: sensitive paths and judge holds go to a human, the rest auto-lands on green | Policy in the coordinator |
+| Trying it needs a migration | **GitHub import**: `weft init shop --import https://github.com/owner/repo` | Artifacts `import()` |
 
 ## Architecture
 
 ```
-agent (weft CLI / MCP) ──► weft Worker ──► RepoCoordinator DO (1 per repo: intents, leases, queue, events)
-        │                                        │ fork() · createToken()            │ create batch
+agent (weft CLI / MCP) ──► weft Worker ──► RepoCoordinator DO (1 per repo: intents, leases, queue, rooms, events)
+        │                                        │ fork() · createToken()            │ create batch / open room
         └── git push to OWN fork ──► Artifacts ◄─┘                                    ▼
-                                         ▲                         MergeQueue Workflow
-                                         │  push trunk (lease)     prepare → judge (Workers AI CLEF)
-                                         └────── merge-runner ◄──── speculate · check · bisect → push → verify → land
-                                                 Container (git 2.47)
+              │ cf.artifacts.repo.pushed ▲                         MergeQueue Workflow
+              ▼                          │  push trunk (lease,      prepare → judge (Workers AI CLEF) → provenance (R2)
+        PushObserver Workflow            │  signed, + notes)        → speculate · check · bisect · recipes · drivers
+        (heartbeat + alerts)             └────── merge-runner ◄──── → push → verify → land
+                                                 Container (git 2.47)  ▲
+                                                                       │ build + check candidate
+                                         RoomResolver Workflow ────────┘ (Workers AI proposes, only green is offered)
 ```
 
 Code map: `src/worker/coordinator.ts` (decisions), `src/worker/merge-queue.ts` (Workflow),
-`container/server.ts` (the only trunk writer), `src/core/rubric.ts` (WQS-1), `cli/weft.ts` (agent CLI),
-`src/worker/mcp.ts` (MCP tools), `web/index.html` (Mission Control).
+`src/worker/room-resolver.ts` (Conflict Rooms), `src/worker/push-observer.ts` (push heartbeats),
+`container/server.ts` (the only trunk writer: merges, checks, recipes, drivers, signing), `src/core/rubric.ts` (WQS-1),
+`src/core/symbols.ts` + `cli/symbols.ts` (tree-sitter symbol intents), `cli/weft.ts` (agent CLI),
+`src/worker/mcp.ts` (MCP tools), `web/index.html` (Mission Control: Swarm, Queue, Changesets, Agents, Conflicts, Quality, Events).
 
 ## Run it
 
@@ -45,14 +57,17 @@ Containers), and Docker with buildx for deploys.
 
 ```bash
 npm install
-npm run typecheck && npm test            # strict TS (worker + node configs), 9 core unit tests
-npx wrangler d1 create weft-index        # put the id in wrangler.jsonc
+npm run typecheck && npm test            # strict TS; 31 tests incl. the real merge-runner against local git
+npx wrangler d1 create weft-index        # put the ids below in wrangler.jsonc
 npx wrangler r2 bucket create weft-blobs
-npx wrangler queues create weft-jobs
+npx wrangler kv namespace create weft-config
+npx wrangler queues create weft-jobs && npx wrangler queues create weft-artifacts-events
 npx wrangler d1 migrations apply weft-index --remote
 printf %s "$ADMIN_TOKEN" | npx wrangler secret put ADMIN_TOKEN
 printf %s "$JWT_SECRET"  | npx wrangler secret put JWT_SIGNING_SECRET
-npx wrangler deploy
+ssh-keygen -t ed25519 -N "" -C queue@weft.dev -f weft-signing && npx wrangler secret put WEFT_SIGNING_KEY < weft-signing
+# set vars.WEFT_SIGNING_PUBKEY to the contents of weft-signing.pub (optional: unsigned without it)
+npx wrangler deploy                       # (`--env dev` deploys the separate weft-dev stack)
 ```
 
 Use the CLI against your deployment:
@@ -60,13 +75,26 @@ Use the CLI against your deployment:
 ```bash
 export WEFT_REMOTE=https://<your-worker>.workers.dev
 WEFT_TOKEN=$ADMIN_TOKEN node cli/weft.ts init shop --from examples/shop --check 'node --test test/*.test.js' --sensitive 'src/auth/**'
+#   or bring your own repo:  init shop --import https://github.com/owner/repo
 WEFT_TOKEN=$ADMIN_TOKEN node cli/weft.ts agent register --name atlas --model claude-opus-5-5   # prints an agent token
 export WEFT_TOKEN=<agent token> WEFT_REPO=shop
 node cli/weft.ts start --task "add sales tax" --touch 'src/billing/**' --dir atlas && cd atlas
+node ../cli/weft.ts context --md  # prompt-ready context pack: peers, rules, what landed in your scope
 # … edit …
-node ../cli/weft.ts status        # heartbeat: touched files, overlaps with other agents, drift
+node ../cli/weft.ts status        # heartbeat: touched files + symbols, overlaps with other agents, drift
 node ../cli/weft.ts submit -m "Add 8% sales tax"
 node ../cli/weft.ts show cs-0005  # scorecard, provenance, improvement advice
+node ../cli/weft.ts room list     # if it was rejected for a conflict: a check-verified AI resolution
+node ../cli/weft.ts room accept r-0007
+node ../cli/weft.ts resume ws-0004-atlas --dir atlas2   # pick a workspace back up on another machine
+```
+
+Verify trunk yourself:
+
+```bash
+curl -s $WEFT_REMOTE/v1/signing-key | jq -r .data.allowedSigners > allowed_signers
+git -c gpg.ssh.allowedSignersFile=allowed_signers verify-commit <sha>      # Good "git" signature for queue@weft.dev
+git fetch trunk 'refs/notes/weft:refs/notes/weft' && git notes --ref=weft show <sha>   # provenance bundle pointer
 ```
 
 The full five-agent demo, run against production:
@@ -77,12 +105,16 @@ WEFT_ADMIN_TOKEN=… bash scripts/demo-live_V-0.01.sh
 
 It shows concurrent starts, a refused exclusive lease, a collision flagged before submit, one batch
 that lands one change, rejects one for conflict (naming the peer) and one for a broken test
-(found by bisection), human review, conflict resolution, zero CHANGELOG conflicts, the quality
-leaderboard and a one-command revert.
+(found by bisection), human review, an **AI Conflict Room** whose resolution passes the check and
+lands, zero CHANGELOG conflicts, the quality leaderboard and a one-command revert.
+
+Feature acceptance scripts (each runs against a live deployment and exits non-zero on failure):
+`live-symbols`, `live-stacks`, `live-recipes-drivers`, `live-push-heartbeat`, `live-context-resume`,
+`live-provenance`, `live-import` (all in `scripts/`), plus `loadtest_V-0.01.mjs`.
 
 MCP: point any MCP client at `https://<worker>/mcp` with `Authorization: Bearer <agent token>`.
-The tools are `weft_start`, `weft_heartbeat`, `weft_submit`, `weft_show`, `weft_who`, `weft_queue`
-and `weft_leaderboard`.
+The tools are `weft_start`, `weft_heartbeat`, `weft_submit`, `weft_show`, `weft_who`, `weft_queue`,
+`weft_context`, `weft_resume`, `weft_rooms`, `weft_room_show`, `weft_room_accept` and `weft_leaderboard`.
 
 ## The agent contract
 
@@ -92,14 +124,16 @@ JSON is printed automatically when stdout is not a TTY. Exit codes: `0` ok · `2
 
 ## Honest limits
 
-- Artifacts is in open beta. Repos are capped at 1 GB and files at 32 MB.
-- Heartbeats are reported by the CLI. Deriving them from push events needs one subscription per fork
-  (planned).
+- Artifacts is in open beta. Repos are capped at 1 GB and files at 32 MB. We saw concurrent forks of
+  one trunk occasionally report success and never exist; Weft serializes forks per trunk and re-forks.
 - Humans authenticate with an admin token in this build (Cloudflare Access is planned). Read
   endpoints are public on this demo deployment (`PUBLIC_READ=true`).
 - Rubric thresholds are not calibrated yet. Calibration needs labeled outcomes (reverted, hotfixed,
   human-rejected), which Weft is now recording.
-- Latency figures have not been measured under load yet.
+- Load test (single repo coordinator): 3,000 req/min → p95 260 ms; 6,000 req/min → p95 384 ms; zero 5xx.
+- Symbol intents cover TS/JS/Python; other languages fall back to whole-file overlap. Conflict Room
+  proposals come from a model: only proposals that pass the repo's check are offered, and the agent
+  decides whether to accept.
 
 ## License
 
