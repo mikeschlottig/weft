@@ -29,7 +29,7 @@ import type {
   WeftEvent,
   Workspace,
 } from "../core/types.ts";
-import { createTrunk, forkFrom, forkName, headOf, headerToken, listFiles, mintToken, repoInfo, revokeToken } from "./artifacts.ts";
+import { createTrunk, forkName, headOf, headerToken, listFiles, mintToken, provisionFork, repoInfo, revokeToken } from "./artifacts.ts";
 import { runner } from "./runner-client.ts";
 
 export const DEFAULT_CONFIG: RepoConfig = {
@@ -80,6 +80,8 @@ const oneLine = (s: string): string => s.replace(/\s+/g, " ").trim();
 const pad = (n: number): string => String(n).padStart(4, "0");
 
 export class RepoCoordinator extends DurableObject<Env> {
+  /** Serializes Artifacts fork calls for this trunk (in-memory; a fresh instance starts with an empty chain). */
+  private forkChain: Promise<unknown> = Promise.resolve();
   private readonly sql: SqlStorage;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -329,8 +331,10 @@ export class RepoCoordinator extends DurableObject<Env> {
 
       // ---- provisioning I/O
       try {
-        const fork = await forkFrom(this.env, m.repo, ws.forkRepo, `weft workspace ${wsId} (${input.agent.name})`);
-        const forkTok = await mintToken(this.env, ws.forkRepo, "write", FORK_TOKEN_TTL);
+        // Forks of one trunk are issued one at a time (concurrent forks were seen to vanish, see provisionFork).
+        const prov = this.forkChain.then(() => provisionFork(this.env, m.repo, ws.forkRepo, `weft workspace ${wsId} (${input.agent.name})`, FORK_TOKEN_TTL));
+        this.forkChain = prov.catch(() => undefined);
+        const { token: forkTok, ...fork } = await prov;
         const trunkTok = await mintToken(this.env, m.repo, "read", TRUNK_READ_TTL);
         const m2 = this.meta();
         const live2 = this.ws(wsId);

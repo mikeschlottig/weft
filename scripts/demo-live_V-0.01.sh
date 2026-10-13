@@ -14,6 +14,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 [[ -z "${WEFT_ADMIN_TOKEN:-}" && -f "$HOME/.env/weft.env" ]] && { set -a; . "$HOME/.env/weft.env"; set +a; }
 : "${WEFT_ADMIN_TOKEN:?set WEFT_ADMIN_TOKEN}"
 export WEFT_REMOTE="${WEFT_REMOTE:-https://weft.ceo-a53.workers.dev}"
+# Any failure prints a fixed marker (the video tape waits on it so a broken run ends the recording at once).
+trap 'rc=$?; [[ $rc -ne 0 ]] && printf "\nDEMO FAILED (exit %s)\n" "$rc"' EXIT
 export WEFT_REPO="${1:-shop-$(date +%m%d%H%M)}"
 EXAMPLE="${WEFT_EXAMPLE:-$ROOT/examples/shop}"
 WORK="$(mktemp -d -t weft-live)"; chmod 700 "$WORK"
@@ -40,7 +42,7 @@ G atlas start --task "add sales tax to invoices" --touch 'src/billing/**' --touc
 G birch start --task "add currency formatting" --touch 'src/util/**' --dir birch --json >birch.json &
 G cedar start --task "add volume discount" --touch 'src/billing/**' --dir cedar --json >cedar.json &
 G dune start --task "shorten session TTL" --touch 'src/auth/**' --exclusive --dir dune --json >dune.json &
-wait
+for pid in $(jobs -p); do wait "$pid" || { for a in atlas birch cedar dune; do echo "  $a: $(J '.error.message // "ok"' <"$a.json" 2>/dev/null)" >&2; done; exit 1; }; done
 for a in atlas birch cedar dune; do printf '  %-6s %-20s forecast=%s\n' "$a" "$(J '.data.workspace.id' <"$a.json")" "$(J '.data.forecast.risk' <"$a.json")"; done
 
 say "act 1b — elm asks for src/auth/session.js while dune holds an exclusive lease"

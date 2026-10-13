@@ -210,7 +210,7 @@ async function load() {
   if (!REPO) return;
   try {
     [S, LB] = await Promise.all([get(`/v1/repos/${encodeURIComponent(REPO)}/snapshot`), get(`/v1/repos/${encodeURIComponent(REPO)}/leaderboard`)]);
-    if (!selected && S.changesets.length) selected = S.changesets[0].id;
+    if (!selected && S.changesets.length) selected = (S.changesets.find((c) => c.status === "landed" && c.scorecard) || S.changesets[0]).id;
     render();
   } catch (err) {
     $("kpis").innerHTML = `<div class="panel" style="grid-column:1/-1"><div class="empty">Could not load <b>${esc(REPO)}</b>: ${esc(err.message)}</div></div>`;
@@ -314,6 +314,9 @@ function show(v) {
 document.addEventListener("click", (e) => { const el = e.target.closest("[data-cs]"); if (el) { selected = el.dataset.cs; render(); show("changesets"); } });
 document.addEventListener("keydown", (e) => { if ((e.key === "Enter" || e.key === " ") && e.target.matches(".card[data-cs]")) { e.preventDefault(); e.target.click(); } });
 $("repoForm").addEventListener("submit", (e) => { e.preventDefault(); open($("repoInput").value); });
+const qs = new URLSearchParams(location.search);
+if (qs.get("view")) show(qs.get("view"));
+if (qs.get("cs")) selected = qs.get("cs");
 let initial = location.hash.slice(1);
 if (!initial) { try { initial = localStorage.getItem("weft-repo") || ""; } catch (err) { initial = ""; } }
 if (initial) open(initial); else $("kpis").innerHTML = `<div class="panel" style="grid-column:1/-1"><div class="empty">Enter a repo name above (for example <b>shop-live1</b>) to watch it live.</div></div>`;

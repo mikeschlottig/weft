@@ -2,17 +2,10 @@
 // Types come from `wrangler types` (worker-configuration.d.ts), verified 2026-10-12.
 
 import { WeftError } from "../core/errors.ts";
+import { codeOf, isRepoNotFound, isRetryableArtifactsError, isRetryableFreshArtifactsError } from "../core/artifacts-retry.ts";
 import { withRetry } from "../core/retry.ts";
 
-const RETRYABLE = new Set(["INTERNAL_ERROR", "UPSTREAM_UNAVAILABLE", "CREATE_IN_PROGRESS", "FORK_IN_PROGRESS", "IMPORT_IN_PROGRESS"]);
-
-const codeOf = (err: unknown): string | null =>
-  typeof err === "object" && err !== null && "code" in err && typeof (err as { code: unknown }).code === "string" ? (err as { code: string }).code : null;
-
-export const isRetryableArtifactsError = (err: unknown): boolean => {
-  const c = codeOf(err);
-  return c === null || RETRYABLE.has(c);
-};
+const FRESH = { retryable: isRetryableFreshArtifactsError, attempts: 5, baseMs: 300 } as const;
 
 const wrap = (err: unknown, what: string): WeftError => {
   const c = codeOf(err);
@@ -22,9 +15,9 @@ const wrap = (err: unknown, what: string): WeftError => {
   return new WeftError("UPSTREAM_ARTIFACTS", `${what}: ${err instanceof Error ? err.message : String(err)}`, { retryable: true });
 };
 
-const call = async <T>(what: string, fn: () => Promise<T>): Promise<T> => {
+const call = async <T>(what: string, fn: () => Promise<T>, fresh = false): Promise<T> => {
   try {
-    return await withRetry(fn, { retryable: isRetryableArtifactsError, baseMs: 300 });
+    return await withRetry(fn, fresh ? FRESH : { retryable: isRetryableArtifactsError, baseMs: 300 });
   } catch (err: unknown) {
     throw wrap(err, what);
   }
@@ -48,11 +41,11 @@ export const headerToken = (plaintext: string): string => plaintext.split("?expi
 export const createTrunk = (env: Env, repo: string, description: string): Promise<ArtifactsCreateRepoResult> =>
   call(`create ${repo}`, () => env.ARTIFACTS.create(repo, { setDefaultBranch: "main", description }));
 
-export const repoInfo = (env: Env, name: string): Promise<ArtifactsRepoInfo> =>
+export const repoInfo = (env: Env, name: string, fresh = false): Promise<ArtifactsRepoInfo> =>
   call(`info ${name}`, async () => {
     using r = await env.ARTIFACTS.get(name);
     return r.info();
-  });
+  }, fresh);
 
 export const forkFrom = async (env: Env, trunk: string, name: string, description: string): Promise<{ remote: string }> => {
   try {
@@ -63,16 +56,42 @@ export const forkFrom = async (env: Env, trunk: string, name: string, descriptio
     return { remote: res.remote };
   } catch (err: unknown) {
     // Idempotent retry: the fork exists from an earlier attempt — reuse it.
-    if (err instanceof WeftError && err.code === "ALREADY_EXISTS") return { remote: (await repoInfo(env, name)).remote };
+    if (err instanceof WeftError && err.code === "ALREADY_EXISTS") return { remote: (await repoInfo(env, name, true)).remote };
     throw err;
   }
 };
 
-export const mintToken = (env: Env, name: string, scope: "read" | "write", ttl: number): Promise<ArtifactsCreateTokenResult> =>
+/** Fork + write token, verified. Seen live 2026-10-12 with four concurrent forks of one trunk: `fork()`
+ *  resolved, yet the fork never existed (still absent minutes later). Retrying reads cannot fix that,
+ *  so a fork that is still missing after the fresh-read retries is forked again (3 attempts). */
+export const provisionFork = async (
+  env: Env,
+  trunk: string,
+  name: string,
+  description: string,
+  ttl: number,
+): Promise<{ remote: string; token: ArtifactsCreateTokenResult; forkAttempts: number }> => {
+  let last: unknown;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const fork = await forkFrom(env, trunk, name, description);
+      const token = await mintToken(env, name, "write", ttl, true);
+      return { remote: fork.remote, token, forkAttempts: attempt };
+    } catch (err: unknown) {
+      last = err;
+      if (!isRepoNotFound(err)) throw err;
+      console.warn(JSON.stringify({ event: "artifacts.fork_vanished", trunk, name, attempt }));
+    }
+  }
+  throw last;
+};
+
+/** `fresh`: the repo was created by Weft in this same request — retry NOT_FOUND (read-after-create lag). */
+export const mintToken = (env: Env, name: string, scope: "read" | "write", ttl: number, fresh = false): Promise<ArtifactsCreateTokenResult> =>
   call(`token ${scope} ${name}`, async () => {
     using r = await env.ARTIFACTS.get(name);
     return r.createToken(scope, ttl);
-  });
+  }, fresh);
 
 export const revokeToken = (env: Env, name: string, tokenId: string): Promise<boolean> =>
   call(`revoke ${name}`, async () => {
