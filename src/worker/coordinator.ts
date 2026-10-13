@@ -62,9 +62,19 @@ interface Meta {
   seq: number;
   trunkHead: string | null;
   trunkFiles: { head: string; files: string[] } | null;
-  activeBatch: { id: string; workflowId: string; since: number } | null;
+  /** Legacy single-lane field (pre FR-26); migrated into activeBatches on read. */
+  activeBatch?: { id: string; workflowId: string; since: number } | null;
+  /** FR-26: one entry per lane in flight, with the (merge-relevant) files its changesets touch. */
+  activeBatches?: ActiveBatch[];
   paused: string | null;
   createdAt: string;
+}
+
+interface ActiveBatch {
+  id: string;
+  workflowId: string;
+  since: number;
+  files: string[];
 }
 
 interface BatchRow {
@@ -226,6 +236,22 @@ export class RepoCoordinator extends DurableObject<Env> {
       .toArray()
       .map((r) => JSON.parse(r.data) as Room);
   }
+  /** FR-26 lanes in flight (migrates the legacy single-batch field). Mutates `m`; callers save it. */
+  private actives(m: Meta): ActiveBatch[] {
+    if (!m.activeBatches) {
+      m.activeBatches = m.activeBatch ? [{ ...m.activeBatch, files: [] }] : [];
+      m.activeBatch = null;
+    }
+    return m.activeBatches;
+  }
+  private lanesOf(m: Meta): number {
+    return Math.max(1, Math.min(8, m.config.lanes ?? 2));
+  }
+  /** Files that matter for lane disjointness: union/sorted-lines files never conflict, so they are ignored. */
+  private laneFiles(m: Meta, files: string[]): string[] {
+    const free = [...m.config.unionGlobs, ...(m.config.drivers ?? []).filter((d) => d.driver === "union" || d.driver === "sorted-lines").map((d) => d.glob)];
+    return files.filter((f) => !matches(f, free));
+  }
   private nextSeq(m: Meta): number {
     m.seq += 1;
     return m.seq;
@@ -320,7 +346,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         adopted = true;
       }
       const config: RepoConfig = { ...DEFAULT_CONFIG, ...input.config, judge: { ...DEFAULT_CONFIG.judge, ...(input.config.judge ?? {}) } };
-      const m: Meta = { repo: input.repo, trunkRemote: remote, config, seq: 0, trunkHead: null, trunkFiles: null, activeBatch: null, paused: null, createdAt: now() };
+      const m: Meta = { repo: input.repo, trunkRemote: remote, config, seq: 0, trunkHead: null, trunkFiles: null, activeBatches: [], paused: null, createdAt: now() };
       this.emit(m, "repo.created", input.actor, { remote, adopted, imported: imported?.url ?? null });
       this.saveMeta(m);
       this.project({ kind: "repo", repo: m.repo, config, createdAt: m.createdAt });
@@ -760,7 +786,7 @@ export class RepoCoordinator extends DurableObject<Env> {
     return this.guard(async () => {
       const m = this.meta();
       if (m.paused) throw new WeftError("TRUNK_RED", `queue paused: ${m.paused}`, { hint: "fix or revert trunk, then `weft config --check ...` to resume" });
-      if (m.activeBatch) return { started: false, activeBatch: m.activeBatch.id };
+      if (this.actives(m).length >= this.lanesOf(m)) return { started: false, activeBatches: this.actives(m).map((b) => b.id) };
       const started = await this.kick(actor);
       return { started: started !== null, batchId: started };
     });
@@ -768,14 +794,16 @@ export class RepoCoordinator extends DurableObject<Env> {
 
   private async kick(actor: string): Promise<string | null> {
     const m0 = this.meta();
-    if (m0.activeBatch || m0.paused) return null;
+    if (this.actives(m0).length >= this.lanesOf(m0) || m0.paused) return null;
     if (this.csByStatus("queued", 1).length === 0) return null;
     const head = await headOf(this.env, m0.repo);
     if (!head) return null;
 
     // ---- decision block
     const m = this.meta();
-    if (m.activeBatch || m.paused) return null;
+    if (this.actives(m).length >= this.lanesOf(m) || m.paused) return null;
+    // FR-26: a new lane may only take changesets whose files are disjoint from every lane in flight.
+    const busy = new Set(this.actives(m).flatMap((b) => b.files));
     // FR-27: a stacked changeset is eligible only when its parent has landed or rides earlier in this batch.
     const queued: Changeset[] = [];
     const picked = new Set<string>();
@@ -785,6 +813,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         const ps = this.cs(c.after).status;
         if (ps !== "landed") continue;
       }
+      if (this.laneFiles(m, c.provenance.filesTouched).some((f) => busy.has(f))) continue;
       queued.push(c);
       picked.add(c.id);
     }
@@ -831,12 +860,15 @@ export class RepoCoordinator extends DurableObject<Env> {
     }
     const workflowId = `${m.repo.replace(/[^a-zA-Z0-9_-]/g, "_")}-${batchId}`;
     this.putBatch({ id: batchId, state: "claimed", claim, pre });
-    m.activeBatch = { id: batchId, workflowId, since: Date.now() };
-    this.emit(m, "queue.batch_started", actor, { batchId, changesets: members.map((x) => x.id), trunkHead: head });
+    const laneFilesSet = [...new Set(queued.flatMap((c) => this.laneFiles(m, c.provenance.filesTouched)))];
+    this.actives(m).push({ id: batchId, workflowId, since: Date.now(), files: laneFilesSet });
+    this.emit(m, "queue.batch_started", actor, { batchId, changesets: members.map((x) => x.id), trunkHead: head, lane: this.actives(m).length, lanesInFlight: this.actives(m).map((b) => b.id) });
     this.saveMeta(m);
 
     try {
       await this.env.MERGE_QUEUE.create({ id: workflowId, params: { repo: m.repo, batchId } });
+      // FR-26: another lane may be free for other disjoint changesets.
+      if (this.actives(this.meta()).length < this.lanesOf(m)) this.scheduleKick(300);
       return batchId;
     } catch (err: unknown) {
       await this.requeueInternal(batchId, `workflow create failed: ${toWeftError(err).message}`);
@@ -914,6 +946,7 @@ export class RepoCoordinator extends DurableObject<Env> {
     bisectSteps: number;
     logKeys: Record<string, string>;
     readmitted?: string[];
+    laneRebases?: number;
   }) {
     return this.guard(async () => {
       const m = this.meta();
@@ -1000,7 +1033,7 @@ export class RepoCoordinator extends DurableObject<Env> {
       b.state = "landed";
       this.putBatch(b);
       if (input.trunkAfter) m.trunkHead = input.trunkAfter;
-      m.activeBatch = null;
+      m.activeBatches = this.actives(m).filter((x) => x.id !== b.id);
       this.emit(m, "queue.batch_landed", "weft-merge-queue", {
         batchId: b.id,
         landed: landedIds,
@@ -1008,6 +1041,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         checksRun: input.checksRun,
         bisectSteps: input.bisectSteps,
         readmitted: input.readmitted ?? [],
+        laneRebases: input.laneRebases ?? 0,
         trunkHead: input.trunkAfter ?? b.claim.trunkHead,
       });
       this.saveMeta(m);
@@ -1052,7 +1086,7 @@ export class RepoCoordinator extends DurableObject<Env> {
       b.state = "requeued";
       this.putBatch(b);
     }
-    if (m.activeBatch?.id === batchId) m.activeBatch = null;
+    m.activeBatches = this.actives(m).filter((x) => x.id !== batchId);
     this.emit(m, "queue.requeued", "weft-merge-queue", { batchId, reason });
     this.saveMeta(m);
     this.scheduleKick(15_000);
@@ -1075,7 +1109,7 @@ export class RepoCoordinator extends DurableObject<Env> {
   revert(csId: string, actor: string) {
     return this.guard(async () => {
       const m0 = this.meta();
-      if (m0.activeBatch) throw new WeftError("QUEUE_BUSY", "a batch is landing; retry the revert shortly", { retryable: true });
+      if (this.actives(m0).length > 0) throw new WeftError("QUEUE_BUSY", "a batch is landing; retry the revert shortly", { retryable: true });
       const c0 = this.cs(csId);
       if (c0.status !== "landed" || !c0.landedCommit) throw invalidState(`changeset ${csId} is ${c0.status}, not landed`);
       const head = await headOf(this.env, m0.repo);
@@ -1469,7 +1503,9 @@ export class RepoCoordinator extends DurableObject<Env> {
       return {
         repo: m.repo,
         paused: m.paused,
-        activeBatch: m.activeBatch,
+        activeBatch: this.actives(m)[0] ?? null,
+        activeBatches: this.actives(m),
+        lanes: this.lanesOf(m),
         queue: rows.map((c) => ({ id: c.id, status: c.status, agent: c.provenance.agentName, risk: c.riskScore, files: c.provenance.filesTouched.length, message: c.message, hold: c.scorecard?.hold ?? null })),
       };
     });
@@ -1534,7 +1570,8 @@ export class RepoCoordinator extends DurableObject<Env> {
         .exec<{ seq: number; at: number; type: string; actor: string; data: string }>(`SELECT seq, at, type, actor, data FROM events ORDER BY seq DESC LIMIT 80`)
         .toArray()
         .map((r) => ({ seq: r.seq, at: new Date(r.at).toISOString(), type: r.type, actor: r.actor, data: JSON.parse(r.data) as Record<string, unknown> }));
-      const activeBatch = m.activeBatch ? this.batch(m.activeBatch.id) : null;
+      const firstActive = this.actives(m)[0];
+      const activeBatch = firstActive ? this.batch(firstActive.id) : null;
       const lastBatchRow = this.sql.exec<{ data: string }>(`SELECT data FROM batches ORDER BY rowid DESC LIMIT 1`).toArray()[0];
       const lastBatch = lastBatchRow ? (JSON.parse(lastBatchRow.data) as BatchRow) : null;
       const b = activeBatch ?? lastBatch;
@@ -1548,6 +1585,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         changesets: this.allCs(100).map((c) => ({ ...c, scorecard: c.scorecard })),
         batch: b ? { id: b.id, state: b.state, trunkHead: b.claim.trunkHead, members: b.claim.members.map((x) => x.id) } : null,
         rooms: this.allRooms(50),
+        lanes: { max: this.lanesOf(m), inFlight: this.actives(m).map((x) => ({ id: x.id, files: x.files, since: new Date(x.since).toISOString() })) },
         events,
         seq: m.seq,
       };
@@ -1590,8 +1628,8 @@ export class RepoCoordinator extends DurableObject<Env> {
     const m = this.metaOrNull();
     if (!m) return;
     // Stale runner lease: a Workflow that never reported back.
-    if (m.activeBatch && Date.now() - m.activeBatch.since > RUNNER_LEASE_MS) {
-      await this.requeueInternal(m.activeBatch.id, "runner lease expired", false);
+    for (const stale of this.actives(m).filter((x) => Date.now() - x.since > RUNNER_LEASE_MS)) {
+      await this.requeueInternal(stale.id, "runner lease expired", false);
     }
     const m2 = this.meta();
     let changed = false;

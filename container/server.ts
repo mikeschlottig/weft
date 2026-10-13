@@ -739,6 +739,10 @@ createServer((req, res) => {
     "/room-prepare": roomPrepare as (b: never) => Promise<unknown>,
     "/room-verify": roomVerify as (b: never) => Promise<unknown>,
     "/fast-forward": fastForward as (b: never) => Promise<unknown>,
+    "/notes": (async (b: { trunk: TrunkRef & { writeToken: string }; notes: { commit: string; text: string }[]; claimTime: number }) => {
+      const gitDir = await repoDir(b.trunk.remote);
+      return { notesPushed: await pushNotes(gitDir, b.trunk, b.notes, b.claimTime) };
+    }) as (b: never) => Promise<unknown>,
   };
   const handler = req.method === "POST" ? routes[url.pathname] : undefined;
   if (!handler) {

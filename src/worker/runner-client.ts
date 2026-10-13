@@ -83,6 +83,8 @@ export const runner = (env: Env, repo: string) => ({
     drivers: MergeDriverRule[];
   }) =>
     call<{ candidate: string; tree: string; markersLeft: string[]; checkPassed: boolean | null; log: string; pushed: boolean; filesTouched: string[]; added: number; deleted: number }>(env, repo, "/room-verify", b),
+  notes: (b: { trunk: TrunkRef & { writeToken: string }; notes: { commit: string; text: string }[]; claimTime: number }) =>
+    call<{ notesPushed: boolean }>(env, repo, "/notes", b),
   fastForward: (b: { trunk: TrunkRef; fork: { forkRemote: string; writeToken: string; readToken: string; branch: string }; expected: string; to: string; toRef: string }) =>
     call<{ branch: string; head: string }>(env, repo, "/fast-forward", b),
 });

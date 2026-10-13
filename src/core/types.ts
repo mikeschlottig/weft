@@ -133,6 +133,8 @@ export interface RepoConfig {
   drivers?: MergeDriverRule[];
   /** FR-25: admin-defined codemods agents may reference by name; args reach the command as $1.. / WEFT_ARG_n, never spliced. */
   recipes?: Record<string, { command: string; description?: string }>;
+  /** FR-26: batches validated concurrently when their file scopes are disjoint (default 2). */
+  lanes?: number;
   judge: { enabled: boolean; model: string; holdOnSecurity: number; holdOnAlignment: number };
 }
 

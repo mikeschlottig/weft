@@ -131,44 +131,90 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
         return { trunkRed: true };
       }
 
-      // 4. FR-34 provenance bundles in R2 (content-addressed by sha256), linked from trunk by git notes
-      const notes = spec.applied.length === 0 ? [] : await step.do("provenance", STEP, async () => {
-        const bundles = await rpc<{ csId: string; bundle: Record<string, unknown> }[]>(() => coord.provenanceFor(batchId, spec.applied.map((a) => a.id)));
-        const out: { commit: string; text: string }[] = [];
-        for (const b of bundles) {
-          const commit = spec.applied.find((a) => a.id === b.csId)?.commit;
-          if (!commit) continue;
-          const body = JSON.stringify({ ...b.bundle, commit, batchId }, null, 2);
-          const sha = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)))].map((x) => x.toString(16).padStart(2, "0")).join("");
-          const key = `prov/${repo}/${b.csId}.json`;
-          await this.env.BLOBS.put(key, body, { httpMetadata: { contentType: "application/json" }, customMetadata: { sha256: sha, commit } });
-          out.push({ commit, text: `weft-provenance v1\nchangeset: ${b.csId}\nbundle: r2://${key}\nsha256: ${sha}\nfetch: /v1/repos/${repo}/changesets/${b.csId}/provenance\n` });
-        }
-        return out;
-      });
-
-      // 5. the single trunk write, with a compare-and-swap lease (verified against Artifacts 2026-10-12)
-      if (spec.applied.length > 0) {
-        const pushed = await step.do("push", STEP, async () => {
-          const rebuild = await specInput(this.env, claim, ids);
-          const write = headerToken((await mintToken(this.env, claim.trunkRepo, "write", 600)).plaintext);
-          try {
-            const r = await runner(this.env, repo).push({ trunk: { ...rebuild.trunk, writeToken: write }, expectedOld: claim.trunkHead, tip: spec.tip, rebuild, notes });
-            return { moved: false, notesPushed: r.notesPushed };
-          } catch (err: unknown) {
-            if (err instanceof WeftError && err.code === "TRUNK_MOVED") return { moved: true, notesPushed: false };
-            throw err;
+      // 4. the single trunk write, with a compare-and-swap lease (verified against Artifacts 2026-10-12).
+      //    FR-26: if another lane landed first (TRUNK_MOVED), re-speculate this lane on the new trunk —
+      //    full chain + one check on the new merged tip — and push again, instead of requeueing.
+      let final = { trunkHead: claim.trunkHead, tip: spec.tip, applied: spec.applied, rejected: spec.rejected, checkPassed: spec.checkPassed, checksRun: spec.checksRun, bisectSteps: spec.bisectSteps, logKeys: spec.logKeys, readmitted: spec.readmitted };
+      let rebases = 0;
+      if (final.applied.length > 0) {
+        for (let attempt = 1; ; attempt += 1) {
+          const at = final;
+          const pushed = await step.do(`push-${attempt}`, STEP, async () => {
+            const rebuild = { ...(await specInput(this.env, claim, ids)), trunkHead: at.trunkHead };
+            const write = headerToken((await mintToken(this.env, claim.trunkRepo, "write", 600)).plaintext);
+            try {
+              await runner(this.env, repo).push({ trunk: { ...rebuild.trunk, writeToken: write }, expectedOld: at.trunkHead, tip: at.tip, rebuild });
+              return { moved: false };
+            } catch (err: unknown) {
+              if (err instanceof WeftError && err.code === "TRUNK_MOVED") return { moved: true };
+              throw err;
+            }
+          });
+          if (!pushed.moved) break;
+          if (attempt >= 3) {
+            await step.do("requeue-moved", STEP, () => rpc<null>(() => coord.requeueBatch(batchId, "trunk moved during validation")));
+            return { requeued: "trunk moved" };
           }
+          const respec = await step.do(`rebase-${attempt}`, LONG, async () => {
+            const head = await headOf(this.env, claim.trunkRepo);
+            if (!head) throw new NonRetryableError("trunk vanished");
+            const input = { ...(await specInput(this.env, claim, final.applied.map((a) => a.id))), trunkHead: head };
+            try {
+              const r = await runner(this.env, repo).speculate(input);
+              return { trunkRed: false, head, r };
+            } catch (err: unknown) {
+              if (err instanceof WeftError && err.code === "TRUNK_RED") return { trunkRed: true, head, r: null };
+              throw err;
+            }
+          });
+          if (respec.trunkRed || !respec.r) {
+            await step.do("requeue-red-after-move", STEP, () => rpc<null>(() => coord.requeueBatch(batchId, "trunk moved and is red")));
+            return { requeued: "trunk moved and is red" };
+          }
+          rebases += 1;
+          const r = respec.r;
+          final = {
+            trunkHead: respec.head,
+            tip: r.tip,
+            applied: r.applied,
+            rejected: [...final.rejected, ...r.rejected],
+            checkPassed: { ...final.checkPassed, ...r.checkPassed },
+            checksRun: final.checksRun + r.checksRun,
+            bisectSteps: final.bisectSteps + r.bisectSteps,
+            logKeys: final.logKeys,
+            readmitted: [...final.readmitted, ...(r.readmitted ?? [])],
+          };
+          if (final.applied.length === 0) break;
+        }
+        if (final.applied.length > 0) {
+          const head = await step.do("verify", STEP, () => headOf(this.env, claim.trunkRepo));
+          if (head !== final.tip) {
+            await step.do("requeue-verify", STEP, () => rpc<null>(() => coord.requeueBatch(batchId, `verify: main=${head ?? "none"} expected ${final.tip}`)));
+            return { requeued: "verify mismatch" };
+          }
+        }
+      }
+
+      // 5. FR-34 provenance bundles in R2 (content-addressed by sha256), linked from trunk by git notes.
+      //    Runs after the push because a rebased lane's commits differ from the first speculation.
+      if (final.applied.length > 0) {
+        const landed = final.applied;
+        await step.do("provenance", STEP, async () => {
+          const bundles = await rpc<{ csId: string; bundle: Record<string, unknown> }[]>(() => coord.provenanceFor(batchId, landed.map((a) => a.id)));
+          const notes: { commit: string; text: string }[] = [];
+          for (const b of bundles) {
+            const commit = landed.find((a) => a.id === b.csId)?.commit;
+            if (!commit) continue;
+            const body = JSON.stringify({ ...b.bundle, commit, batchId, laneRebases: rebases }, null, 2);
+            const sha = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)))].map((x) => x.toString(16).padStart(2, "0")).join("");
+            const key = `prov/${repo}/${b.csId}.json`;
+            await this.env.BLOBS.put(key, body, { httpMetadata: { contentType: "application/json" }, customMetadata: { sha256: sha, commit } });
+            notes.push({ commit, text: `weft-provenance v1\nchangeset: ${b.csId}\nbundle: r2://${key}\nsha256: ${sha}\nfetch: /v1/repos/${repo}/changesets/${b.csId}/provenance\n` });
+          }
+          const write = headerToken((await mintToken(this.env, claim.trunkRepo, "write", 600)).plaintext);
+          const r = await runner(this.env, repo).notes({ trunk: { remote: claim.trunkRemote, token: write, writeToken: write }, notes, claimTime: claim.claimTime });
+          return { notes: notes.length, pushed: r.notesPushed };
         });
-        if (pushed.moved) {
-          await step.do("requeue-moved", STEP, () => rpc<null>(() => coord.requeueBatch(batchId, "trunk moved during validation")));
-          return { requeued: "trunk moved" };
-        }
-        const head = await step.do("verify", STEP, () => headOf(this.env, claim.trunkRepo));
-        if (head !== spec.tip) {
-          await step.do("requeue-verify", STEP, () => rpc<null>(() => coord.requeueBatch(batchId, `verify: main=${head ?? "none"} expected ${spec.tip}`)));
-          return { requeued: "verify mismatch" };
-        }
       }
 
       // 6. record outcomes + scorecards (idempotent on batchId)
@@ -176,18 +222,19 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
         rpc<{ idempotent: boolean }>(() =>
           coord.landBatch({
             batchId,
-            trunkAfter: spec.applied.length > 0 ? spec.tip : null,
-            applied: spec.applied.map((a) => ({ id: a.id, commit: a.commit })),
-            rejected: spec.rejected,
-            checkPassed: spec.checkPassed,
-            checksRun: spec.checksRun,
-            bisectSteps: spec.bisectSteps,
-            logKeys: spec.logKeys,
-            readmitted: spec.readmitted,
+            trunkAfter: final.applied.length > 0 ? final.tip : null,
+            applied: final.applied.map((a) => ({ id: a.id, commit: a.commit })),
+            rejected: final.rejected,
+            checkPassed: final.checkPassed,
+            checksRun: final.checksRun,
+            bisectSteps: final.bisectSteps,
+            logKeys: final.logKeys,
+            readmitted: final.readmitted,
+            laneRebases: rebases,
           }),
         ),
       );
-      return { landed: spec.applied.length, rejected: spec.rejected.length, held: held.length, checksRun: spec.checksRun };
+      return { landed: final.applied.length, rejected: final.rejected.length, held: held.length, checksRun: final.checksRun, laneRebases: rebases };
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);
       await step.do("requeue-on-failure", STEP, () => rpc<null>(() => coord.requeueBatch(batchId, `workflow failed: ${reason.slice(0, 300)}`)));
