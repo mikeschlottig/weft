@@ -31,8 +31,12 @@ export interface SpecInput {
   unionGlobs: string[];
   drivers: MergeDriverRule[];
   recipes: Record<string, { command: string }>;
+  signingKey?: string;
   members: (BatchMember & { forkToken: string })[];
 }
+
+/** FR-33: the SSH signing key secret, if configured (optional so an unsigned deployment still works). */
+export const signingKey = (env: Env): string | undefined => (env as unknown as { WEFT_SIGNING_KEY?: string }).WEFT_SIGNING_KEY || undefined;
 
 const call = async <T>(env: Env, repo: string, path: string, body: unknown): Promise<T> =>
   withRetry(
@@ -58,9 +62,9 @@ const call = async <T>(env: Env, repo: string, path: string, body: unknown): Pro
 export const runner = (env: Env, repo: string) => ({
   prepare: (b: { trunk: TrunkRef; trunkHead: string; members: ForkRef[] }) => call<{ stats: Record<string, DiffStats> }>(env, repo, "/prepare", b),
   speculate: (b: SpecInput) => call<SpeculationResult>(env, repo, "/speculate", b),
-  push: (b: { trunk: TrunkRef & { writeToken: string }; expectedOld: string; tip: string; rebuild: SpecInput }) =>
-    call<{ pushed: true; tip: string }>(env, repo, "/push", b),
-  revert: (b: { trunk: TrunkRef & { writeToken: string }; trunkHead: string; landedCommit: string; message: string; actor: string; claimTime: number }) =>
+  push: (b: { trunk: TrunkRef & { writeToken: string }; expectedOld: string; tip: string; rebuild: SpecInput; notes?: { commit: string; text: string }[] }) =>
+    call<{ pushed: true; tip: string; notesPushed: boolean }>(env, repo, "/push", b),
+  revert: (b: { trunk: TrunkRef & { writeToken: string }; trunkHead: string; landedCommit: string; message: string; actor: string; claimTime: number; signingKey?: string }) =>
     call<{ commit: string }>(env, repo, "/revert", b),
   roomPrepare: (b: { trunk: TrunkRef; trunkHead: string; fork: RoomFork; unionGlobs: string[]; drivers: MergeDriverRule[] }) =>
     call<{ trunkHead: string; base: string; clean: boolean; conflicted: string[]; files: RoomFile[] }>(env, repo, "/room-prepare", b),

@@ -13,7 +13,7 @@ import type { BatchClaim, DiffStats, GateResult, JudgeAnswers, Rejection } from 
 type Claim = BatchClaim & { pre: Record<string, { gates: GateResult[]; judge: JudgeAnswers | null; behind: number; rejections: number }> };
 import { headOf, headerToken, mintToken } from "./artifacts.ts";
 import { judgeChangeset } from "./judge.ts";
-import { runner, type SpecInput } from "./runner-client.ts";
+import { runner, signingKey, type SpecInput } from "./runner-client.ts";
 
 interface Params {
   repo: string;
@@ -52,6 +52,7 @@ const specInput = async (env: Env, claim: BatchClaim, ids: string[]): Promise<Sp
     unionGlobs: claim.config.unionGlobs,
     drivers: claim.config.drivers ?? [],
     recipes: Object.fromEntries(Object.entries(claim.config.recipes ?? {}).map(([k, v]) => [k, { command: v.command }])),
+    signingKey: signingKey(env),
     members: claim.members.filter((m) => ids.includes(m.id)).map((m) => ({ ...m, forkToken: toks[m.id] ?? "" })),
   };
 };
@@ -130,16 +131,32 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
         return { trunkRed: true };
       }
 
-      // 4. the single trunk write, with a compare-and-swap lease (verified against Artifacts 2026-10-12)
+      // 4. FR-34 provenance bundles in R2 (content-addressed by sha256), linked from trunk by git notes
+      const notes = spec.applied.length === 0 ? [] : await step.do("provenance", STEP, async () => {
+        const bundles = await rpc<{ csId: string; bundle: Record<string, unknown> }[]>(() => coord.provenanceFor(batchId, spec.applied.map((a) => a.id)));
+        const out: { commit: string; text: string }[] = [];
+        for (const b of bundles) {
+          const commit = spec.applied.find((a) => a.id === b.csId)?.commit;
+          if (!commit) continue;
+          const body = JSON.stringify({ ...b.bundle, commit, batchId }, null, 2);
+          const sha = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)))].map((x) => x.toString(16).padStart(2, "0")).join("");
+          const key = `prov/${repo}/${b.csId}.json`;
+          await this.env.BLOBS.put(key, body, { httpMetadata: { contentType: "application/json" }, customMetadata: { sha256: sha, commit } });
+          out.push({ commit, text: `weft-provenance v1\nchangeset: ${b.csId}\nbundle: r2://${key}\nsha256: ${sha}\nfetch: /v1/repos/${repo}/changesets/${b.csId}/provenance\n` });
+        }
+        return out;
+      });
+
+      // 5. the single trunk write, with a compare-and-swap lease (verified against Artifacts 2026-10-12)
       if (spec.applied.length > 0) {
         const pushed = await step.do("push", STEP, async () => {
           const rebuild = await specInput(this.env, claim, ids);
           const write = headerToken((await mintToken(this.env, claim.trunkRepo, "write", 600)).plaintext);
           try {
-            await runner(this.env, repo).push({ trunk: { ...rebuild.trunk, writeToken: write }, expectedOld: claim.trunkHead, tip: spec.tip, rebuild });
-            return { moved: false };
+            const r = await runner(this.env, repo).push({ trunk: { ...rebuild.trunk, writeToken: write }, expectedOld: claim.trunkHead, tip: spec.tip, rebuild, notes });
+            return { moved: false, notesPushed: r.notesPushed };
           } catch (err: unknown) {
-            if (err instanceof WeftError && err.code === "TRUNK_MOVED") return { moved: true };
+            if (err instanceof WeftError && err.code === "TRUNK_MOVED") return { moved: true, notesPushed: false };
             throw err;
           }
         });
@@ -154,7 +171,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
         }
       }
 
-      // 5. record outcomes + scorecards (idempotent on batchId)
+      // 6. record outcomes + scorecards (idempotent on batchId)
       await step.do("land", STEP, () =>
         rpc<{ idempotent: boolean }>(() =>
           coord.landBatch({

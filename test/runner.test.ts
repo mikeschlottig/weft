@@ -241,3 +241,27 @@ test("runner FR-25: a recipe is replayed on the new trunk, so it also rewrites c
   });
   assert.equal(bad.rejected[0]?.rejection.reason, "recipe_failed", "unsafe arguments are refused, never executed");
 });
+
+test("runner FR-33/34: trunk commits are SSH-signed, deterministic across rebuilds, and carry provenance notes", async () => {
+  const keyDir = mkdtempSync(join(root, "key-"));
+  spawnSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-C", "queue@weft.dev", "-f", join(keyDir, "k")]);
+  const { readFileSync } = await import("node:fs");
+  const key = readFileSync(join(keyDir, "k"), "utf8");
+  const pub = readFileSync(join(keyDir, "k.pub"), "utf8").trim();
+  const { trunk, base, heads } = setup({ s: { "f.txt": "line1\nS\nline3\n" } });
+  const input = { trunk: { remote: trunk, token: "" }, trunkHead: base, claimTime: 1_790_000_500, checkCommand: null, unionGlobs: [], signingKey: key, members: [member("s", heads.s!, base, ["f.txt"])] };
+  const a = await call<{ tip: string }>("/speculate", input);
+  const b = await call<{ tip: string }>("/speculate", input);
+  assert.equal(a.tip, b.tip, "signed speculation is byte-identical on rebuild");
+  const r = await call<{ pushed: boolean; notesPushed: boolean }>("/push", {
+    trunk: { remote: trunk, token: "", writeToken: "" }, expectedOld: base, tip: a.tip, rebuild: input,
+    notes: [{ commit: a.tip, text: "weft-provenance v1\nchangeset: s\n" }],
+  });
+  assert.equal(r.pushed, true);
+  assert.equal(r.notesPushed, true);
+  writeFileSync(join(keyDir, "allowed"), `queue@weft.dev namespaces="git" ${pub}\n`);
+  const v = spawnSync("git", ["--git-dir", trunk, "-c", `gpg.ssh.allowedSignersFile=${join(keyDir, "allowed")}`, "verify-commit", a.tip], { encoding: "utf8" });
+  assert.equal(v.status, 0, v.stderr);
+  assert.match(v.stderr, /Good "git" signature for queue@weft\.dev/);
+  assert.match(sh(["--git-dir", trunk, "notes", "--ref=weft", "show", a.tip]), /changeset: s/);
+});

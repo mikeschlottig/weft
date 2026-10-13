@@ -64,6 +64,16 @@ const parseTrailers = (message: string): Record<string, string> => {
 
 route("GET", "/healthz", "health", "public", async () => ({ data: { ok: true, service: "weft", rubric: "wqs-1" } }));
 
+// FR-33: the public key every trunk commit is signed with, in git's allowed-signers format.
+route("GET", "/v1/signing-key", "signing-key", "public", async (c) => {
+  const pub = (c.env as unknown as { WEFT_SIGNING_PUBKEY?: string }).WEFT_SIGNING_PUBKEY ?? null;
+  if (!pub) throw new WeftError("NOT_FOUND", "this deployment does not sign commits");
+  return {
+    data: { format: "ssh", signer: "queue@weft.dev", publicKey: pub, allowedSigners: `queue@weft.dev namespaces="git" ${pub}` },
+    hints: ["echo \"<allowedSigners>\" > allowed_signers && git -c gpg.ssh.allowedSignersFile=allowed_signers verify-commit <sha>"],
+  };
+});
+
 route("POST", "/v1/agents", "agent register", "admin", async (c) => {
   const b = await c.body();
   const name = str(b.name, "name");
@@ -185,6 +195,14 @@ route("GET", "/v1/repos/:repo/changesets/:cs", "show", "read", async (c) => {
   if (cs.status === "rejected" && cs.rejection?.logKey) hints.push(`weft logs ${cs.id}`);
   for (const a of cs.scorecard?.advice ?? []) hints.push(`improve: ${a}`);
   return { data: cs, hints };
+});
+
+route("GET", "/v1/repos/:repo/changesets/:cs/provenance", "provenance", "read", async (c) => {
+  const key = `prov/${c.params.repo ?? ""}/${c.params.cs ?? ""}.json`;
+  const obj = await c.env.BLOBS.get(key);
+  if (!obj) throw new WeftError("NOT_FOUND", `no provenance bundle for ${c.params.cs ?? ""} (only landed changesets have one)`);
+  const text = await obj.text();
+  return { data: { key, sha256: obj.customMetadata?.sha256 ?? null, commit: obj.customMetadata?.commit ?? null, bundle: JSON.parse(text) as unknown } };
 });
 
 route("GET", "/v1/repos/:repo/changesets/:cs/log", "logs", "read", async (c) => {

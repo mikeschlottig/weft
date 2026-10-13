@@ -100,7 +100,7 @@
       "ai": { "binding": "AI" },
       "analytics_engine_datasets": [{ "binding": "METRICS", "dataset": "weft_events_dev" }],
       "secrets": { "required": ["ADMIN_TOKEN", "JWT_SIGNING_SECRET"] },
-      "vars": { "PUBLIC_READ": "true", "WEFT_ENV": "dev", "ARTIFACTS_EVENTS_QUEUE": "weft-artifacts-events-dev" }
+      "vars": { "PUBLIC_READ": "true", "WEFT_ENV": "dev", "ARTIFACTS_EVENTS_QUEUE": "weft-artifacts-events-dev", "WEFT_SIGNING_PUBKEY": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKm+s/wrMSuz9vOCkPL8XrGMvtU+fkhJYg3vtHv2S6PT queue@weft.dev" }
     }
   }
 }

@@ -36,7 +36,7 @@ import type {
   Workspace,
 } from "../core/types.ts";
 import { changedPaths, createTrunk, forkName, headOf, headerToken, listFiles, mintToken, provisionFork, repoInfo, revokeToken } from "./artifacts.ts";
-import { runner } from "./runner-client.ts";
+import { runner, signingKey } from "./runner-client.ts";
 
 export const DEFAULT_CONFIG: RepoConfig = {
   checkCommand: null,
@@ -1080,6 +1080,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         message: `Revert "${subject}"\n\nWeft-Reverts: ${c0.id}\nWeft-Reverted-By: ${oneLine(actor)}\n`,
         actor: oneLine(actor),
         claimTime: Math.floor(Date.now() / 1000),
+        signingKey: signingKey(this.env),
       });
       const verify = await headOf(this.env, m0.repo);
       if (verify !== res.commit) throw new WeftError("TRUNK_MOVED", `revert verify failed: main=${verify}`, { retryable: true });
@@ -1212,6 +1213,49 @@ export class RepoCoordinator extends DurableObject<Env> {
         fork: { remote: fresh.forkRemote, token: headerToken(forkTok.plaintext), expiresAt: forkTok.expiresAt },
         trunk: { remote: m.trunkRemote, token: headerToken(trunkTok.plaintext), expiresAt: trunkTok.expiresAt, head: tf.head },
       };
+    });
+  }
+
+  /** FR-34: provenance bundle contents for changesets being landed by `batchId` (written to R2 by the Workflow). */
+  provenanceFor(batchId: string, ids: string[]) {
+    return this.guard(async () => {
+      const m = this.meta();
+      const b = this.batch(batchId);
+      return ids.map((id) => {
+        const c = this.cs(id);
+        const pre = b?.pre[id];
+        const room = this.allRooms(200).find((r) => r.resubmittedAs === c.id) ?? null;
+        return {
+          csId: id,
+          bundle: {
+            schema: "weft-provenance-1",
+            repo: m.repo,
+            changeset: c.id,
+            message: c.message,
+            workspace: c.wsId,
+            agent: { id: c.agentId, name: c.provenance.agentName, model: c.provenance.model },
+            task: c.provenance.task,
+            intent: c.provenance.intentGlobs,
+            filesTouched: c.provenance.filesTouched,
+            lines: { added: c.provenance.linesAdded, deleted: c.provenance.linesDeleted },
+            checkpoints: c.provenance.checkpoints,
+            forkHead: c.headCommit,
+            base: c.baseCommit,
+            promptSha256: c.provenance.promptSha256,
+            toolCalls: c.provenance.toolCalls,
+            costUsd: c.provenance.costUsd,
+            risk: { score: c.riskScore, factors: c.risk },
+            review: { approvedBy: c.approvedBy, hold: c.scorecard?.hold ?? null },
+            judge: pre?.judge ?? null,
+            gates: pre?.gates ?? [],
+            resolves: c.resolves,
+            room: room ? { id: room.id, attempts: room.attempts.length, model: room.attempts[room.attempts.length - 1]?.model ?? null, candidate: room.verified?.candidate ?? null } : null,
+            stackedOn: c.after ?? null,
+            recipe: c.recipe ?? null,
+            submittedAt: c.enqueuedAt,
+          },
+        };
+      });
     });
   }
 

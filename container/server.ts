@@ -94,6 +94,25 @@ const repoDir = async (trunkRemote: string): Promise<string> => {
   return dir;
 };
 
+// ---------------------------------------------------------------- FR-33 commit signing
+
+/**
+ * Run `fn` with git signing args for the SSH key in `key` (or none). The key exists on disk only for the
+ * duration of the call (0600, removed in finally). Ed25519 SSH signatures are deterministic, so a rebuilt
+ * speculation still reproduces byte-identical signed commits (verified 2026-10-12).
+ */
+const withSigning = async <T>(key: string | undefined, fn: (sign: { pre: string[]; flag: string[] }) => Promise<T>): Promise<T> => {
+  if (!key) return fn({ pre: [], flag: [] });
+  const dir = mkdtempSync(join(tmpdir(), "weft-sign-"));
+  const file = join(dir, "key");
+  try {
+    writeFileSync(file, key.endsWith("\n") ? key : `${key}\n`, { mode: 0o600 });
+    return await fn({ pre: ["-c", "gpg.format=ssh", "-c", `user.signingkey=${file}`], flag: ["-S"] });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+};
+
 // ---------------------------------------------------------------- merge driver registry v2
 
 type DriverRule = { glob: string; driver: "union" | "json-merge" | "sorted-lines" };
@@ -245,6 +264,7 @@ interface SpecInput {
   unionGlobs: string[];
   drivers?: DriverRule[];
   recipes?: Record<string, { command: string }>;
+  signingKey?: string;
   members: (BatchMember & { forkToken: string })[];
 }
 
@@ -298,7 +318,7 @@ const replayRecipe = async (gitDir: string, tip: string, command: string, args: 
   }
 };
 
-const buildChain = async (gitDir: string, start: string, members: BatchMember[], claimTime: number, recipes: Record<string, { command: string }> = {}) => {
+const buildChain = async (gitDir: string, start: string, members: BatchMember[], claimTime: number, recipes: Record<string, { command: string }> = {}, sign: { pre: string[]; flag: string[] } = { pre: [], flag: [] }) => {
   let tip = start;
   const applied: Applied[] = [];
   const conflicts: { m: BatchMember; files: string[]; peers: ConflictPeer[] }[] = [];
@@ -319,7 +339,7 @@ const buildChain = async (gitDir: string, start: string, members: BatchMember[],
         continue;
       }
       const msg = `${m.message}\n\n${m.trailers.join("\n")}\nWeft-Recipe: ${m.recipe.name} ${m.recipe.args.join(" ")}\n`;
-      const commit = await out(gitDir, ["commit-tree", res.tree, "-p", tip, "-F", "-"], { input: msg, env: commitEnv(claimTime, m.agentName, `${m.agentId}@agents.weft.dev`) });
+      const commit = await out(gitDir, [...sign.pre, "commit-tree", res.tree, "-p", tip, ...sign.flag, "-F", "-"], { input: msg, env: commitEnv(claimTime, m.agentName, `${m.agentId}@agents.weft.dev`) });
       applied.push({ m, commit, tree: res.tree });
       tip = commit;
       continue;
@@ -341,7 +361,7 @@ const buildChain = async (gitDir: string, start: string, members: BatchMember[],
       continue;
     }
     const msg = `${m.message}\n\n${m.trailers.join("\n")}\n`;
-    const commit = await out(gitDir, ["commit-tree", merged.tree, "-p", tip, "-F", "-"], {
+    const commit = await out(gitDir, [...sign.pre, "commit-tree", merged.tree, "-p", tip, ...sign.flag, "-F", "-"], {
       input: msg,
       env: commitEnv(claimTime, m.agentName, `${m.agentId}@agents.weft.dev`),
     });
@@ -368,7 +388,9 @@ const runCheck = async (gitDir: string, commit: string, command: string): Promis
   }
 };
 
-const speculate = async (body: SpecInput): Promise<SpeculationResult> => {
+const speculate = (body: SpecInput): Promise<SpeculationResult> => withSigning(body.signingKey, (sign) => speculateSigned(body, sign));
+
+const speculateSigned = async (body: SpecInput, sign: { pre: string[]; flag: string[] }): Promise<SpeculationResult> => {
   const gitDir = await repoDir(body.trunk.remote);
   writeAttributes(gitDir, body.unionGlobs, body.drivers ?? []);
   await fetchTrunk(gitDir, body.trunk, body.trunkHead);
@@ -406,7 +428,7 @@ const speculate = async (body: SpecInput): Promise<SpeculationResult> => {
   // check culprits is re-admitted to the next round (it never conflicted with anything that will land).
   const conflictOnly = new Map<string, { m: BatchMember; peerIds: string[] }>();
   for (;;) {
-    const chain = await buildChain(gitDir, body.trunkHead, candidates, body.claimTime, body.recipes ?? {});
+    const chain = await buildChain(gitDir, body.trunkHead, candidates, body.claimTime, body.recipes ?? {}, sign);
     for (const f of chain.recipeFailures) {
       if (rejected.some((r) => r.id === f.m.id)) continue;
       rejected.push({ id: f.m.id, rejection: { reason: "recipe_failed", detail: f.log.slice(-600), files: f.m.filesTouched, conflictsWith: [], logKey: null } });
@@ -484,7 +506,20 @@ const speculate = async (body: SpecInput): Promise<SpeculationResult> => {
 
 // ---------------------------------------------------------------- push / revert
 
-const push = async (body: { trunk: TrunkRef & { writeToken: string }; expectedOld: string; tip: string; rebuild: SpecInput }): Promise<{ pushed: true; tip: string }> => {
+/** FR-34: attach provenance notes (refs/notes/weft) to landed commits and push them. Best effort, retried. */
+const pushNotes = async (gitDir: string, trunk: TrunkRef & { writeToken: string }, notes: { commit: string; text: string }[], claimTime: number): Promise<boolean> => {
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    await git(gitDir, ["fetch", "-q", trunk.remote, "+refs/notes/weft:refs/notes/weft"], { token: trunk.writeToken, allow: [1, 128] });
+    for (const n of notes) {
+      await git(gitDir, ["notes", "--ref=weft", "add", "-f", "-m", n.text, n.commit], { env: commitEnv(claimTime, "weft-merge-queue", "queue@weft.dev") });
+    }
+    const r = await git(gitDir, ["push", "--porcelain", trunk.remote, "refs/notes/weft:refs/notes/weft"], { token: trunk.writeToken, allow: [1] });
+    if (r.code === 0) return true;
+  }
+  return false;
+};
+
+const push = async (body: { trunk: TrunkRef & { writeToken: string }; expectedOld: string; tip: string; rebuild: SpecInput; notes?: { commit: string; text: string }[] }): Promise<{ pushed: true; tip: string; notesPushed: boolean }> => {
   const gitDir = await repoDir(body.trunk.remote);
   if (!(await hasObject(gitDir, body.tip))) {
     // Container restarted between steps: deterministic dates make the rebuild byte-identical.
@@ -496,7 +531,8 @@ const push = async (body: { trunk: TrunkRef & { writeToken: string }; expectedOl
     allow: [1],
   });
   if (r.code !== 0) throw new RunnerError("TRUNK_MOVED", `push rejected: ${redact(r.stderr || r.stdout).slice(0, 400)}`, 409, true);
-  return { pushed: true, tip: body.tip };
+  const notesPushed = body.notes && body.notes.length > 0 ? await pushNotes(gitDir, body.trunk, body.notes, body.rebuild.claimTime).catch(() => false) : false;
+  return { pushed: true, tip: body.tip, notesPushed };
 };
 
 const revert = async (body: {
@@ -506,13 +542,14 @@ const revert = async (body: {
   message: string;
   actor: string;
   claimTime: number;
-}): Promise<{ commit: string }> => {
+  signingKey?: string;
+}): Promise<{ commit: string }> => withSigning(body.signingKey, async (sign) => {
   const gitDir = await repoDir(body.trunk.remote);
   await fetchTrunk(gitDir, body.trunk, body.trunkHead);
   if (!(await hasObject(gitDir, body.landedCommit))) throw new RunnerError("NOT_FOUND", `commit ${body.landedCommit} not on trunk`, 404);
   const merged = await mergeTree(gitDir, body.landedCommit, body.trunkHead, `${body.landedCommit}^`);
   if (!merged.clean) throw new RunnerError("REVERT_CONFLICT", "later trunk commits depend on this changeset", 409, false, { files: merged.files });
-  const commit = await out(gitDir, ["commit-tree", merged.tree, "-p", body.trunkHead, "-F", "-"], {
+  const commit = await out(gitDir, [...sign.pre, "commit-tree", merged.tree, "-p", body.trunkHead, ...sign.flag, "-F", "-"], {
     input: body.message,
     env: commitEnv(body.claimTime, body.actor, "revert@weft.dev"),
   });
@@ -522,7 +559,7 @@ const revert = async (body: {
   });
   if (r.code !== 0) throw new RunnerError("TRUNK_MOVED", "trunk moved; retry the revert", 409, true);
   return { commit };
-};
+});
 
 // ---------------------------------------------------------------- Conflict Rooms (FR-24)
 

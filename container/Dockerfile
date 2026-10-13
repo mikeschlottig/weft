@@ -3,7 +3,7 @@
 # trixie: git 2.47 (merge-tree --merge-base needs git >= 2.40; bookworm ships 2.39)
 FROM node:24-trixie-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends git ca-certificates openssh-client \
  && rm -rf /var/lib/apt/lists/* \
  && git --version \
  && git --version | awk '{split($3,v,"."); if (v[1] < 2 || (v[1] == 2 && v[2] < 40)) exit 1}'
