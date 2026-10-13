@@ -8,6 +8,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { WeftError, encodeForRpc, invalidState, notFound, toWeftError, usage } from "../core/errors.ts";
+import { RECIPE_ARG } from "../core/types.ts";
 import { blockingOverlaps, forecast, isLive, isRealOverlap, outOfIntent, scoreRisk } from "../core/forecast.ts";
 import { matches } from "../core/glob.ts";
 import { checkGate, composeScorecard, processGates } from "../core/rubric.ts";
@@ -24,6 +25,7 @@ import type {
   JudgeAnswers,
   Provenance,
   Rejection,
+  RecipeRef,
   RepoConfig,
   Room,
   RoomAttempt,
@@ -73,6 +75,7 @@ interface BatchRow {
 }
 
 interface SubmitInput {
+  recipe?: RecipeRef | null;
   wsId: string;
   agent: AgentClaims;
   message: string;
@@ -586,6 +589,7 @@ export class RepoCoordinator extends DurableObject<Env> {
 
   /** Unwrapped submit, shared by the API route and by accepting a verified Conflict Room proposal. */
   private async submitCore(input: {
+    recipe?: RecipeRef | null;
     wsId: string;
     agent: AgentClaims;
     message: string;
@@ -653,7 +657,15 @@ export class RepoCoordinator extends DurableObject<Env> {
         scorecard: null,
         attempts: 0,
         after: w.after ?? null,
+        recipe: null,
       };
+      if (input.recipe) {
+        const def = m.config.recipes?.[input.recipe.name];
+        if (!def) throw usage(`unknown recipe: ${input.recipe.name}`, `available: ${Object.keys(m.config.recipes ?? {}).join(", ") || "none (an admin defines recipes in the repo config)"}`);
+        const bad = input.recipe.args.find((a) => !RECIPE_ARG.test(a));
+        if (bad !== undefined) throw usage(`recipe argument not allowed: ${bad}`, "letters, digits and . _ / @ : + = , - only");
+        c.recipe = { name: input.recipe.name, args: input.recipe.args };
+      }
       if (c.after) {
         const pc = this.cs(c.after);
         if (pc.status === "rejected" || pc.status === "reverted") throw invalidState(`your stack parent ${pc.id} was ${pc.status}`, "re-stack: weft start --after <new parent> (or start fresh from trunk)");
@@ -762,6 +774,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         task: c.provenance.task,
         intentGlobs: c.provenance.intentGlobs,
         after: c.after ?? null,
+        recipe: c.recipe ?? null,
       };
     });
     const claim: BatchClaim = {
@@ -1248,6 +1261,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         message: c.message,
         checkCommand: m.config.checkCommand,
         unionGlobs: m.config.unionGlobs,
+        drivers: m.config.drivers ?? [],
         workspaceStatus: w.status,
       };
     });

@@ -5,12 +5,12 @@
 // Credentials arrive per request, are passed to git with `-c http.extraHeader`, and are never
 // written to disk, config, logs or the process environment.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { classifyFiles, scanAddedLines } from "../src/core/rubric.ts";
 import type { BatchMember, ConflictPeer, DiffStats, Rejection, SpeculationResult } from "../src/core/types.ts";
 
@@ -94,9 +94,76 @@ const repoDir = async (trunkRemote: string): Promise<string> => {
   return dir;
 };
 
-const writeAttributes = (gitDir: string, unionGlobs: string[]): void => {
+// ---------------------------------------------------------------- merge driver registry v2
+
+type DriverRule = { glob: string; driver: "union" | "json-merge" | "sorted-lines" };
+const DRIVER_DIR = join(process.env.WEFT_RUNNER_ROOT ?? "/srv/repos", "..", "weft-drivers");
+
+/** 3-way JSON merge: per-key recursion; a real conflict only when both sides changed the same leaf differently. */
+const JSON_MERGE = String.raw`import { readFileSync, writeFileSync } from "node:fs";
+const [o, a, b] = process.argv.slice(2);
+const read = (p) => { const t = readFileSync(p, "utf8"); return { t, v: t.trim() ? JSON.parse(t) : {} }; };
+const eq = (x, y) => JSON.stringify(x) === JSON.stringify(y);
+const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
+const merge = (O, A, B) => {
+  if (eq(A, B)) return A;
+  if (eq(O, A)) return B;
+  if (eq(O, B)) return A;
+  if (isObj(A) && isObj(B)) {
+    const base = isObj(O) ? O : {};
+    const out = {};
+    for (const k of new Set([...Object.keys(A), ...Object.keys(B)])) {
+      const r = merge(base[k], A[k], B[k]);
+      if (r !== undefined) out[k] = r;
+    }
+    return out;
+  }
+  if (Array.isArray(A) && Array.isArray(B) && [...A, ...B].every((x) => typeof x !== "object")) {
+    const removed = new Set((Array.isArray(O) ? O : []).filter((x) => !A.includes(x) || !B.includes(x)));
+    return [...new Set([...A, ...B])].filter((x) => !removed.has(x));
+  }
+  throw new Error("conflict");
+};
+try {
+  const O = read(o), A = read(a), B = read(b);
+  const indent = (A.t.match(/^[ \t]+(?=")/m) || ["  "])[0];
+  const out = merge(O.v, A.v, B.v);
+  writeFileSync(a, JSON.stringify(out, null, indent) + (A.t.endsWith("\n") ? "\n" : ""));
+  process.exit(0);
+} catch { process.exit(1); }
+`;
+
+/** Line-set merge: union of both sides minus lines either side deleted, sorted. Never conflicts. */
+const SORTED_LINES = String.raw`import { readFileSync, writeFileSync } from "node:fs";
+const [o, a, b] = process.argv.slice(2);
+const L = (p) => readFileSync(p, "utf8").split("\n").filter((x) => x.length > 0);
+const O = L(o), A = L(a), B = L(b);
+const removed = new Set(O.filter((x) => !A.includes(x) || !B.includes(x)));
+const out = [...new Set([...A, ...B])].filter((x) => !removed.has(x)).sort();
+writeFileSync(a, out.join("\n") + (out.length ? "\n" : ""));
+`;
+
+const ensureDrivers = (): void => {
+  mkdirSync(DRIVER_DIR, { recursive: true });
+  for (const [name, src] of [["json-merge.mjs", JSON_MERGE], ["sorted-lines.mjs", SORTED_LINES]] as const) {
+    const p = join(DRIVER_DIR, name);
+    writeFileSync(p, src);
+  }
+};
+
+const writeAttributes = (gitDir: string, unionGlobs: string[], drivers: DriverRule[] = []): void => {
   mkdirSync(join(gitDir, "info"), { recursive: true });
-  writeFileSync(join(gitDir, "info", "attributes"), unionGlobs.map((g) => `${g} merge=union\n`).join(""));
+  const rules = [...unionGlobs.map((g) => `${g} merge=union`), ...drivers.map((d) => `${d.glob} merge=${d.driver === "union" ? "union" : `weft-${d.driver}`}`)];
+  writeFileSync(join(gitDir, "info", "attributes"), rules.map((r) => `${r}\n`).join(""));
+  if (drivers.some((d) => d.driver !== "union")) {
+    ensureDrivers();
+    // Registered in the scratch repo's own config: merge-tree runs them (verified locally, git 2.47+).
+    const cfg = join(gitDir, "config");
+    for (const name of ["json-merge", "sorted-lines"]) {
+      spawnSync("git", ["config", "--file", cfg, `merge.weft-${name}.name`, `weft ${name}`]);
+      spawnSync("git", ["config", "--file", cfg, `merge.weft-${name}.driver`, `node ${join(DRIVER_DIR, `${name}.mjs`)} %O %A %B %P`]);
+    }
+  }
 };
 
 const hasObject = async (gitDir: string, sha: string): Promise<boolean> =>
@@ -176,6 +243,8 @@ interface SpecInput {
   claimTime: number;
   checkCommand: string | null;
   unionGlobs: string[];
+  drivers?: DriverRule[];
+  recipes?: Record<string, { command: string }>;
   members: (BatchMember & { forkToken: string })[];
 }
 
@@ -203,16 +272,56 @@ const mergeTree = async (gitDir: string, base: string, ours: string, theirs: str
   return { clean: false, tree, files: [...new Set(lines((blank === -1 ? rest : rest.slice(0, blank)).join("\n")))] };
 };
 
-const buildChain = async (gitDir: string, start: string, members: BatchMember[], claimTime: number) => {
+const RECIPE_ARG_RE = /^[A-Za-z0-9_.\/@:+=,-]{1,200}$/;
+
+/** FR-25: run an admin-defined recipe on `tip` and return the resulting tree (null = failed or no-op). */
+const replayRecipe = async (gitDir: string, tip: string, command: string, args: string[]): Promise<{ tree: string | null; log: string }> => {
+  if (!args.every((a) => RECIPE_ARG_RE.test(a))) return { tree: null, log: "recipe arguments rejected by the allow-list" };
+  const dir = mkdtempSync(join(tmpdir(), "weft-recipe-"));
+  const idx = join(mkdtempSync(join(tmpdir(), "weft-recipe-idx-")), "index");
+  try {
+    await run("sh", ["-c", 'git --git-dir="$1" archive "$2" | tar -x -C "$3"', "sh", gitDir, tip, dir]);
+    const argEnv: Record<string, string> = { CI: "1", WEFT_TIP: tip };
+    args.forEach((a, i) => (argEnv[`WEFT_ARG_${i + 1}`] = a));
+    const r = await run("sh", ["-c", command, "weft-recipe", ...args], { cwd: dir, env: argEnv, timeoutMs: CHECK_TIMEOUT_MS, allow: Array.from({ length: 256 }, (_, i) => i).concat([-1]) });
+    const log = `$ ${command} ${args.join(" ")}\n${r.stdout}${r.stderr}\n# exit ${r.code}\n`.slice(0, 50_000);
+    if (r.code !== 0) return { tree: null, log };
+    const env = { GIT_INDEX_FILE: idx, GIT_WORK_TREE: dir };
+    await git(gitDir, ["read-tree", tip], { env });
+    await run("git", [`--git-dir=${gitDir}`, `--work-tree=${dir}`, "add", "-A", "."], { cwd: dir, env });
+    const tree = await out(gitDir, ["write-tree"], { env });
+    const before = await out(gitDir, ["rev-parse", `${tip}^{tree}`]);
+    return { tree: tree === before ? null : tree, log: tree === before ? `${log}recipe produced no changes on the current trunk\n` : log };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(dirname(idx), { recursive: true, force: true });
+  }
+};
+
+const buildChain = async (gitDir: string, start: string, members: BatchMember[], claimTime: number, recipes: Record<string, { command: string }> = {}) => {
   let tip = start;
   const applied: Applied[] = [];
   const conflicts: { m: BatchMember; files: string[]; peers: ConflictPeer[] }[] = [];
   const dependents: { m: BatchMember; parent: string }[] = [];
+  const recipeFailures: { m: BatchMember; log: string }[] = [];
   const inBatch = new Set(members.map((x) => x.id));
   for (const m of members) {
     // FR-27: a stacked child rides on its parent; if the parent is in this batch but did not apply, neither can it.
     if (m.after && inBatch.has(m.after) && !applied.some((a) => a.m.id === m.after)) {
       dependents.push({ m, parent: m.after });
+      continue;
+    }
+    if (m.recipe) {
+      const def = recipes[m.recipe.name];
+      const res = def ? await replayRecipe(gitDir, tip, def.command, m.recipe.args) : { tree: null, log: `unknown recipe ${m.recipe.name}` };
+      if (!res.tree) {
+        recipeFailures.push({ m, log: res.log });
+        continue;
+      }
+      const msg = `${m.message}\n\n${m.trailers.join("\n")}\nWeft-Recipe: ${m.recipe.name} ${m.recipe.args.join(" ")}\n`;
+      const commit = await out(gitDir, ["commit-tree", res.tree, "-p", tip, "-F", "-"], { input: msg, env: commitEnv(claimTime, m.agentName, `${m.agentId}@agents.weft.dev`) });
+      applied.push({ m, commit, tree: res.tree });
+      tip = commit;
       continue;
     }
     const base = await out(gitDir, ["merge-base", tip, m.headCommit]);
@@ -239,7 +348,7 @@ const buildChain = async (gitDir: string, start: string, members: BatchMember[],
     applied.push({ m, commit, tree: merged.tree });
     tip = commit;
   }
-  return { tip, applied, conflicts, dependents };
+  return { tip, applied, conflicts, dependents, recipeFailures };
 };
 
 interface CheckOutcome {
@@ -261,7 +370,7 @@ const runCheck = async (gitDir: string, commit: string, command: string): Promis
 
 const speculate = async (body: SpecInput): Promise<SpeculationResult> => {
   const gitDir = await repoDir(body.trunk.remote);
-  writeAttributes(gitDir, body.unionGlobs);
+  writeAttributes(gitDir, body.unionGlobs, body.drivers ?? []);
   await fetchTrunk(gitDir, body.trunk, body.trunkHead);
   for (const m of body.members) await fetchFork(gitDir, m);
 
@@ -297,7 +406,11 @@ const speculate = async (body: SpecInput): Promise<SpeculationResult> => {
   // check culprits is re-admitted to the next round (it never conflicted with anything that will land).
   const conflictOnly = new Map<string, { m: BatchMember; peerIds: string[] }>();
   for (;;) {
-    const chain = await buildChain(gitDir, body.trunkHead, candidates, body.claimTime);
+    const chain = await buildChain(gitDir, body.trunkHead, candidates, body.claimTime, body.recipes ?? {});
+    for (const f of chain.recipeFailures) {
+      if (rejected.some((r) => r.id === f.m.id)) continue;
+      rejected.push({ id: f.m.id, rejection: { reason: "recipe_failed", detail: f.log.slice(-600), files: f.m.filesTouched, conflictsWith: [], logKey: null } });
+    }
     for (const c of chain.conflicts) {
       const rejection: Rejection = {
         reason: "conflict",
@@ -432,9 +545,9 @@ interface RoomFork {
 }
 
 /** base/ours/theirs (+ marker view) for each conflicted file, and the losing change's other files. */
-const roomPrepare = async (body: { trunk: TrunkRef; trunkHead: string; fork: RoomFork; unionGlobs: string[] }) => {
+const roomPrepare = async (body: { trunk: TrunkRef; trunkHead: string; fork: RoomFork; unionGlobs: string[]; drivers?: DriverRule[] }) => {
   const gitDir = await repoDir(body.trunk.remote);
-  writeAttributes(gitDir, body.unionGlobs);
+  writeAttributes(gitDir, body.unionGlobs, body.drivers ?? []);
   await fetchTrunk(gitDir, body.trunk, body.trunkHead);
   await fetchFork(gitDir, { id: "room", ...body.fork });
   const head = body.fork.headCommit;
@@ -472,9 +585,10 @@ const roomVerify = async (body: {
   claimTime: number;
   checkCommand: string | null;
   unionGlobs: string[];
+  drivers?: DriverRule[];
 }) => {
   const gitDir = await repoDir(body.trunk.remote);
-  writeAttributes(gitDir, body.unionGlobs);
+  writeAttributes(gitDir, body.unionGlobs, body.drivers ?? []);
   await fetchTrunk(gitDir, body.trunk, body.trunkHead);
   await fetchFork(gitDir, { id: "room", ...body.fork });
   const head = body.fork.headCommit;

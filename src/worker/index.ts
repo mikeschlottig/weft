@@ -163,6 +163,7 @@ route("POST", "/v1/repos/:repo/workspaces/:ws/changesets", "submit", "agent", as
     toolCalls: numOr(b.toolCalls, null),
     costUsd: numOr(b.costUsd, null),
     resolves: typeof b.resolves === "string" ? b.resolves : null,
+    recipe: b.recipe && typeof b.recipe === "object" ? { name: str((b.recipe as Record<string, unknown>).name, "recipe.name"), args: strs((b.recipe as Record<string, unknown>).args ?? [], "recipe.args") } : null,
   });
   const cs = res.changeset;
   return {

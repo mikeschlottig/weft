@@ -11,7 +11,7 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloud
 import { NonRetryableError } from "cloudflare:workflows";
 import { WeftError, decodeFromRpc } from "../core/errors.ts";
 import { MAX_ROOM_ATTEMPTS, RESOLVER_MODEL, parseProposal, resolverMessages, responseText } from "../core/resolve.ts";
-import type { Room, RoomAttempt, RoomFile } from "../core/types.ts";
+import type { MergeDriverRule, Room, RoomAttempt, RoomFile } from "../core/types.ts";
 import { headOf, headerToken, mintToken } from "./artifacts.ts";
 import { runner } from "./runner-client.ts";
 
@@ -31,6 +31,7 @@ interface RoomInput {
   message: string;
   checkCommand: string | null;
   unionGlobs: string[];
+  drivers: MergeDriverRule[];
   workspaceStatus: string;
 }
 
@@ -66,6 +67,7 @@ export class RoomResolver extends WorkflowEntrypoint<Env, Params> {
           trunkHead,
           fork: { forkRemote: input.forkRemote, forkToken: forkRead, branch: input.branch, headCommit: input.headCommit },
           unionGlobs: input.unionGlobs,
+          drivers: input.drivers,
         });
         await rpc(() => coord.roomUpdate(roomId, { status: "proposing", trunkHead: r.trunkHead, hunks: r.files }));
         return { trunkHead: r.trunkHead, clean: r.clean, files: r.files };
@@ -115,6 +117,7 @@ export class RoomResolver extends WorkflowEntrypoint<Env, Params> {
             claimTime: Math.floor(Date.parse(input.room.createdAt) / 1000) + n,
             checkCommand: input.checkCommand,
             unionGlobs: input.unionGlobs,
+            drivers: input.drivers,
           });
           let logKey: string | null = null;
           if (v.log) {

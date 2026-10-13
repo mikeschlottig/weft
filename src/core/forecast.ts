@@ -33,7 +33,9 @@ export const forecast = (
   config: RepoConfig,
   nowMs: number,
 ): Forecast => {
-  const merging = (f: string): boolean => !matches(f, config.unionGlobs);
+  // Union and sorted-lines files cannot conflict, so they never count as an overlap.
+  const conflictFree = [...config.unionGlobs, ...(config.drivers ?? []).filter((d) => d.driver === "union" || d.driver === "sorted-lines").map((d) => d.glob)];
+  const merging = (f: string): boolean => !matches(f, conflictFree);
   const files = trunkFiles.filter(merging);
   const selfTouched = self.touched.filter(merging);
   const mine = new Set([...files.filter((f) => matches(f, self.globs)), ...selfTouched]);

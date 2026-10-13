@@ -4,7 +4,7 @@
 import { Container, getContainer } from "@cloudflare/containers";
 import { WeftError } from "../core/errors.ts";
 import { withRetry } from "../core/retry.ts";
-import type { BatchMember, DiffStats, RoomFile, SpeculationResult } from "../core/types.ts";
+import type { BatchMember, DiffStats, MergeDriverRule, RoomFile, SpeculationResult } from "../core/types.ts";
 
 export class MergeRunner extends Container<Env> {
   defaultPort = 8080;
@@ -29,6 +29,8 @@ export interface SpecInput {
   claimTime: number;
   checkCommand: string | null;
   unionGlobs: string[];
+  drivers: MergeDriverRule[];
+  recipes: Record<string, { command: string }>;
   members: (BatchMember & { forkToken: string })[];
 }
 
@@ -60,7 +62,7 @@ export const runner = (env: Env, repo: string) => ({
     call<{ pushed: true; tip: string }>(env, repo, "/push", b),
   revert: (b: { trunk: TrunkRef & { writeToken: string }; trunkHead: string; landedCommit: string; message: string; actor: string; claimTime: number }) =>
     call<{ commit: string }>(env, repo, "/revert", b),
-  roomPrepare: (b: { trunk: TrunkRef; trunkHead: string; fork: RoomFork; unionGlobs: string[] }) =>
+  roomPrepare: (b: { trunk: TrunkRef; trunkHead: string; fork: RoomFork; unionGlobs: string[]; drivers: MergeDriverRule[] }) =>
     call<{ trunkHead: string; base: string; clean: boolean; conflicted: string[]; files: RoomFile[] }>(env, repo, "/room-prepare", b),
   roomVerify: (b: {
     trunk: TrunkRef;
@@ -74,6 +76,7 @@ export const runner = (env: Env, repo: string) => ({
     claimTime: number;
     checkCommand: string | null;
     unionGlobs: string[];
+    drivers: MergeDriverRule[];
   }) =>
     call<{ candidate: string; tree: string; markersLeft: string[]; checkPassed: boolean | null; log: string; pushed: boolean; filesTouched: string[]; added: number; deleted: number }>(env, repo, "/room-verify", b),
   fastForward: (b: { trunk: TrunkRef; fork: { forkRemote: string; writeToken: string; readToken: string; branch: string }; expected: string; to: string; toRef: string }) =>

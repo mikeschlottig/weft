@@ -4,7 +4,7 @@
 export type IntentMode = "soft" | "exclusive";
 export type WorkspaceStatus = "provisioning" | "active" | "conflicted" | "submitted" | "landed" | "abandoned";
 export type ChangesetStatus = "queued" | "needs_review" | "validating" | "landed" | "rejected" | "reverted";
-export type RejectionReason = "conflict" | "check_failed" | "policy" | "judge_hold" | "dependency";
+export type RejectionReason = "conflict" | "check_failed" | "policy" | "judge_hold" | "dependency" | "recipe_failed";
 
 export interface AgentClaims {
   sub: string; // agent id
@@ -110,7 +110,16 @@ export interface Changeset {
   attempts: number;
   /** FR-27: parent changeset; this one is speculated on top of it and rejected if it is rejected. */
   after?: string | null;
+  /** FR-25: replayed on the current trunk at landing instead of merging the fork's text. */
+  recipe?: RecipeRef | null;
 }
+
+export interface RecipeRef {
+  name: string;
+  args: string[];
+}
+
+export const RECIPE_ARG = /^[A-Za-z0-9_.\/@:+=,-]{1,200}$/;
 
 export interface RepoConfig {
   checkCommand: string | null;
@@ -120,7 +129,17 @@ export interface RepoConfig {
   unionGlobs: string[];
   leaseTtlSeconds: number;
   batchWindowMs: number;
+  /** Driver registry v2: merge drivers per glob, applied by the merge-runner (and `union` also in workspaces). */
+  drivers?: MergeDriverRule[];
+  /** FR-25: admin-defined codemods agents may reference by name; args reach the command as $1.. / WEFT_ARG_n, never spliced. */
+  recipes?: Record<string, { command: string; description?: string }>;
   judge: { enabled: boolean; model: string; holdOnSecurity: number; holdOnAlignment: number };
+}
+
+export type MergeDriverName = "union" | "json-merge" | "sorted-lines";
+export interface MergeDriverRule {
+  glob: string;
+  driver: MergeDriverName;
 }
 
 export interface OverlapFinding {
@@ -244,6 +263,7 @@ export interface BatchMember {
   task: string;
   intentGlobs: string[];
   after?: string | null;
+  recipe?: RecipeRef | null;
 }
 
 export interface BatchClaim {

@@ -43,6 +43,10 @@ const OPTIONS = {
   cost: { type: "string" },
   resolves: { type: "string" },
   after: { type: "string" },
+  driver: { type: "string", multiple: true },
+  recipe: { type: "string" },
+  arg: { type: "string", multiple: true },
+  "recipe-def": { type: "string", multiple: true },
   continue: { type: "boolean" },
   abort: { type: "boolean" },
   by: { type: "string" },
@@ -64,7 +68,8 @@ const HELP = `weft — coordination-first version control for many agents (Cloud
 Env: WEFT_REMOTE (default ${DEFAULT_REMOTE}), WEFT_TOKEN (agent token or admin token), WEFT_REPO
 
 Admin
-  weft init <repo> [--from DIR] [--check CMD] [--batch N] [--batch-window MS] [--sensitive GLOBS] [--union GLOBS] [--no-judge]
+  weft init <repo> [--from DIR] [--check CMD] [--batch N] [--batch-window MS] [--sensitive GLOBS] [--union GLOBS] [--driver GLOB=DRIVER] [--no-judge]
+                                      drivers: union · json-merge (3-way by key) · sorted-lines
   weft config [--check CMD] [--batch N] [--review-threshold N] [--sensitive GLOBS] [--no-judge]
   weft agent register --name NAME --model MODEL [--ttl-hours N]
   weft approve <cs> [--by NAME]       weft revert <cs> [--by NAME]       weft queue run
@@ -76,7 +81,8 @@ Agent loop (inside a workspace dir, or --ws)
   weft widen --touch GLOB
   weft checkpoint [-m MSG]            commit + push to your fork
   weft sync [--continue|--abort]      merge trunk in; conflicts name the peer changeset
-  weft submit -m MSG [--prompt-file F] [--tool-calls N] [--cost USD] [--resolves cs-x]
+  weft submit -m MSG [--prompt-file F] [--tool-calls N] [--cost USD] [--resolves cs-x] [--recipe NAME --arg X ...]
+                                      --recipe: replay an admin-defined codemod on the newest trunk at landing (FR-25)
   weft abandon
   weft context [--md] [--budget TOKENS]  context pack: task, peers, rejections, recent landings, rules
   weft resume [<ws-id> --repo R --dir PATH]  re-acquire an expired workspace (or re-clone it elsewhere)
@@ -84,6 +90,9 @@ Agent loop (inside a workspace dir, or --ws)
 Read
   weft queue · weft show <cs> · weft scorecard <cs> · weft logs <cs> · weft log [-n N]
   weft who <path> · weft events [--since SEQ] [--follow] · weft leaderboard [--global]
+
+Recipes (codemods replayed on the newest trunk instead of merging text)
+  weft recipe list · weft recipe run <name> --arg X · weft submit --recipe <name> --arg X
 
 Conflict Rooms (an AI proposal, merged on current trunk and proven by the repo's check)
   weft room list · weft room show <id> · weft room log <id> · weft room accept <id>
@@ -241,6 +250,23 @@ const configPatch = (f: Flags): Record<string, unknown> => {
   if (f["no-judge"]) p.judge = { enabled: false };
   const bw = intOf(f["batch-window"], "batch-window");
   if (bw !== undefined) p.batchWindowMs = bw;
+  if (f["recipe-def"]) {
+    // --recipe-def 'NAME=shell command using $1 $2 / $WEFT_ARG_1' (admin only)
+    p.recipes = Object.fromEntries(f["recipe-def"].map((spec) => {
+      const i = spec.indexOf("=");
+      if (i <= 0) throw usage(`bad --recipe-def ${spec}`, "NAME=COMMAND");
+      return [spec.slice(0, i), { command: spec.slice(i + 1) }];
+    }));
+  }
+  if (f.driver) {
+    p.drivers = f.driver.map((spec) => {
+      const i = spec.lastIndexOf("=");
+      const glob = spec.slice(0, i);
+      const driver = spec.slice(i + 1);
+      if (i <= 0 || !["union", "json-merge", "sorted-lines"].includes(driver)) throw usage(`bad --driver ${spec}`, "GLOB=union|json-merge|sorted-lines, e.g. --driver 'package.json=json-merge'");
+      return { glob, driver };
+    });
+  }
   return p;
 };
 
@@ -418,6 +444,7 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
         toolCalls: intOf(f["tool-calls"], "tool-calls") ?? null,
         costUsd: f.cost !== undefined ? Number(f.cost) : null,
         resolves: f.resolves ?? null,
+        recipe: f.recipe ? { name: f.recipe, args: f.arg ?? [] } : null,
       });
     }
     case "abandon": {
@@ -491,6 +518,26 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
         saveWs(dir, { repo, ws: wsId, branch: r.data.workspace.branch, fork: r.data.fork, trunk: r.data.trunk });
       }
       return { data: { workspace: r.data.workspace, wasExpired: r.data.wasExpired, forecast: r.data.forecast, path: dir }, hints: [`cd ${dir}`, "weft context --md  # what happened while you were away", ...r.hints] };
+    }
+    case "recipe": {
+      // FR-25: run an admin-defined recipe locally exactly as the merge-runner replays it at landing.
+      const repo = repoOf(f);
+      const snap = await api<{ config: { recipes?: Record<string, { command: string; description?: string }> } }>("GET", `/v1/repos/${repo}/snapshot`);
+      const recipes = snap.data.config.recipes ?? {};
+      if (!pos[0] || pos[0] === "list") return { data: recipes, hints: ["weft recipe run <name> --arg X  # then: weft submit --recipe <name> --arg X"] };
+      if (pos[0] !== "run" || !pos[1]) throw usage("weft recipe list | weft recipe run <name> --arg X [--arg Y]");
+      const def = recipes[pos[1]];
+      if (!def) throw usage(`unknown recipe: ${pos[1]}`, `available: ${Object.keys(recipes).join(", ") || "none"}`);
+      const args = f.arg ?? [];
+      const bad = args.find((x) => !/^[A-Za-z0-9_.\/@:+=,-]{1,200}$/.test(x));
+      if (bad !== undefined) throw usage(`recipe argument not allowed: ${bad}`);
+      const { cwd } = loadWs(f);
+      const env: Record<string, string> = { ...process.env as Record<string, string>, CI: "1" };
+      args.forEach((x, i) => (env[`WEFT_ARG_${i + 1}`] = x));
+      const r = spawnSync("sh", ["-c", def.command, "weft-recipe", ...args], { cwd, encoding: "utf8", env, timeout: TIMEOUT_MS });
+      if (r.status !== 0) throw new WeftError("RECIPE_FAILED", `recipe ${pos[1]} exited ${r.status}: ${(r.stderr || r.stdout).slice(0, 400)}`, { exitCode: EXIT.checkFailed });
+      const changed = touchedFiles(cwd);
+      return { data: { recipe: pos[1], args, changed }, hints: [`weft submit -m "..." --recipe ${pos[1]}${args.map((x) => ` --arg ${x}`).join("")}  # replayed on the newest trunk at landing`] };
     }
     case "room": {
       const repo = repoOf(f);

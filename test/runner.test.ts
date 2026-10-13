@@ -157,3 +157,87 @@ test("runner FR-27: when the parent fails the check, its stacked child is reject
   assert.deepEqual(r.applied.map((a) => a.id), ["z"]);
   assert.deepEqual(r.rejected.map((x) => [x.id, x.rejection.reason]).sort(), [["c", "dependency"], ["p", "check_failed"]]);
 });
+
+test("runner drivers v2: json-merge merges different keys, still conflicts on the same key; sorted-lines never conflicts", async () => {
+  const trunk = join(root, `trunk-drv-${Math.random().toString(36).slice(2)}.git`);
+  sh(["init", "-q", "--bare", "-b", "main", trunk]);
+  const work = mkdtempSync(join(root, "d-"));
+  sh(["init", "-q", "-b", "main", work]);
+  writeFileSync(join(work, "package.json"), `{\n  "name": "shop",\n  "version": "1.0.0",\n  "dependencies": {\n    "a": "1.0.0"\n  }\n}\n`);
+  writeFileSync(join(work, "ALLOWLIST"), "alpha\nmike\n");
+  sh(["add", "-A"], work);
+  sh(["commit", "-q", "-m", "init"], work);
+  sh(["push", "-q", trunk, "main"], work);
+  const base = sh(["rev-parse", "HEAD"], work);
+  const mk = (id: string, files: Record<string, string>) => {
+    const fork = join(root, `fork-drv-${id}-${Math.random().toString(36).slice(2)}.git`);
+    sh(["init", "-q", "--bare", "-b", "main", fork]);
+    sh(["checkout", "-q", "-B", `weft/${id}`, base], work);
+    for (const [p, c] of Object.entries(files)) writeFileSync(join(work, p), c);
+    sh(["commit", "-q", "-am", id], work);
+    sh(["push", "-q", fork, `weft/${id}`], work);
+    return { remote: fork, branch: `weft/${id}`, head: sh(["rev-parse", "HEAD"], work) };
+  };
+  const pj = (deps: string, version = "1.0.0") => `{\n  "name": "shop",\n  "version": "${version}",\n  "dependencies": {\n${deps}\n  }\n}\n`;
+  const x = mk("x", { "package.json": pj(`    "a": "1.0.0",\n    "b": "2.0.0"`), ALLOWLIST: "alpha\nmike\nzed\n" });
+  const y = mk("y", { "package.json": pj(`    "a": "1.0.0",\n    "c": "3.0.0"`), ALLOWLIST: "alpha\nbeta\nmike\n" });
+  const z = mk("z", { "package.json": pj(`    "a": "1.0.0"`, "2.0.0") });
+  const w = mk("w", { "package.json": pj(`    "a": "1.0.0"`, "3.0.0") });
+  const drivers = [{ glob: "package.json", driver: "json-merge" }, { glob: "ALLOWLIST", driver: "sorted-lines" }];
+  const r = await call<{ applied: { id: string; tree: string }[]; rejected: { id: string; rejection: { reason: string } }[] }>("/speculate", {
+    trunk: { remote: trunk, token: "" }, trunkHead: base, claimTime: 1_790_000_300, checkCommand: null, unionGlobs: [], drivers,
+    members: [member("x", x, base, ["package.json", "ALLOWLIST"]), member("y", y, base, ["package.json", "ALLOWLIST"]), member("z", z, base, ["package.json"]), member("w", w, base, ["package.json"])],
+  });
+  assert.deepEqual(r.applied.map((a) => a.id), ["x", "y", "z"]);
+  assert.deepEqual(r.rejected.map((q) => [q.id, q.rejection.reason]), [["w", "conflict"]], "version 2.0.0 vs 3.0.0 is a real conflict");
+  const tip = r.applied[r.applied.length - 1]?.tree ?? "";
+  const runnerRepo = join(root, "runner");
+  const gitDir = join(runnerRepo, spawnSync("ls", [runnerRepo], { encoding: "utf8" }).stdout.split("\n").find((d) => d && spawnSync("git", ["--git-dir", join(runnerRepo, d), "cat-file", "-e", tip], {}).status === 0) ?? "");
+  const show = (p: string) => spawnSync("git", ["--git-dir", gitDir, "show", `${tip}:${p}`], { encoding: "utf8" }).stdout;
+  assert.deepEqual(JSON.parse(show("package.json")).dependencies, { a: "1.0.0", b: "2.0.0", c: "3.0.0" });
+  assert.equal(JSON.parse(show("package.json")).version, "2.0.0");
+  assert.equal(show("ALLOWLIST"), "alpha\nbeta\nmike\nzed\n");
+});
+
+test("runner FR-25: a recipe is replayed on the new trunk, so it also rewrites code that landed meanwhile", async () => {
+  const RENAME = `files=$(grep -rlw -- "$1" src || true); [ -z "$files" ] || perl -pi -e 's/\\b\\Q$ENV{WEFT_ARG_1}\\E\\b/$ENV{WEFT_ARG_2}/g' $files`;
+  const trunk = join(root, `trunk-rcp-${Math.random().toString(36).slice(2)}.git`);
+  sh(["init", "-q", "--bare", "-b", "main", trunk]);
+  const work = mkdtempSync(join(root, "r-"));
+  sh(["init", "-q", "-b", "main", work]);
+  spawnSync("mkdir", ["-p", join(work, "src")]);
+  writeFileSync(join(work, "src", "invoice.js"), "export function total(items) {\n  return items.length;\n}\n");
+  sh(["add", "-A"], work);
+  sh(["commit", "-q", "-m", "init"], work);
+  sh(["push", "-q", trunk, "main"], work);
+  const base = sh(["rev-parse", "HEAD"], work);
+  const mk = (id: string, files: Record<string, string>) => {
+    const fork = join(root, `fork-rcp-${id}-${Math.random().toString(36).slice(2)}.git`);
+    sh(["init", "-q", "--bare", "-b", "main", fork]);
+    sh(["checkout", "-q", "-B", `weft/${id}`, base], work);
+    for (const [p, c] of Object.entries(files)) writeFileSync(join(work, p), c);
+    sh(["add", "-A"], work);
+    sh(["commit", "-q", "-m", id], work);
+    sh(["push", "-q", fork, `weft/${id}`], work);
+    return { remote: fork, branch: `weft/${id}`, head: sh(["rev-parse", "HEAD"], work) };
+  };
+  // b: a NEW call site of total(); a: the rename done by text on the old base (would miss b's call).
+  const b = mk("b", { "src/report.js": 'import { total } from "./invoice.js";\nexport const report = (xs) => total(xs);\n' });
+  const a = mk("a", { "src/invoice.js": "export function invoiceTotal(items) {\n  return items.length;\n}\n" });
+  // Passes on trunk; would FAIL if the rename were text-merged (report.js would import a missing `total`).
+  const check = `[ ! -f src/report.js ] || node --input-type=module -e "import('./src/report.js').then((m) => process.exit(m.report([1, 2]) === 2 ? 0 : 1), (e) => { console.error(e.message); process.exit(1); })"`;
+  const res = await call<{ applied: { id: string; tree: string }[]; rejected: { id: string; rejection: { reason: string; detail: string } }[]; tip: string }>("/speculate", {
+    trunk: { remote: trunk, token: "" }, trunkHead: base, claimTime: 1_790_000_400, checkCommand: check, unionGlobs: [], recipes: { rename: { command: RENAME } },
+    members: [member("b", b, base, ["src/report.js"]), { ...member("a", a, base, ["src/invoice.js"]), recipe: { name: "rename", args: ["total", "invoiceTotal"] } }],
+  });
+  assert.deepEqual(res.applied.map((x) => x.id), ["b", "a"], JSON.stringify(res.rejected));
+  const g = join(root, "runner", spawnSync("ls", [join(root, "runner")], { encoding: "utf8" }).stdout.split("\n").find((d) => d && spawnSync("git", ["--git-dir", join(root, "runner", d), "cat-file", "-e", res.tip]).status === 0) ?? "");
+  const show = (p: string) => spawnSync("git", ["--git-dir", g, "show", `${res.tip}:${p}`], { encoding: "utf8" }).stdout;
+  assert.match(show("src/report.js"), /invoiceTotal\(xs\)/, "b's new call site was renamed by the replayed recipe");
+  assert.match(spawnSync("git", ["--git-dir", g, "log", "-1", "--format=%B", res.tip], { encoding: "utf8" }).stdout, /Weft-Recipe: rename total invoiceTotal/);
+  const bad = await call<{ rejected: { id: string; rejection: { reason: string } }[] }>("/speculate", {
+    trunk: { remote: trunk, token: "" }, trunkHead: base, claimTime: 1_790_000_401, checkCommand: null, unionGlobs: [], recipes: { rename: { command: RENAME } },
+    members: [{ ...member("a", a, base, ["src/invoice.js"]), recipe: { name: "rename", args: ["total;rm -rf /", "x"] } }],
+  });
+  assert.equal(bad.rejected[0]?.rejection.reason, "recipe_failed", "unsafe arguments are refused, never executed");
+});

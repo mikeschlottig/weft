@@ -50,6 +50,8 @@ const specInput = async (env: Env, claim: BatchClaim, ids: string[]): Promise<Sp
     claimTime: claim.claimTime,
     checkCommand: claim.config.checkCommand,
     unionGlobs: claim.config.unionGlobs,
+    drivers: claim.config.drivers ?? [],
+    recipes: Object.fromEntries(Object.entries(claim.config.recipes ?? {}).map(([k, v]) => [k, { command: v.command }])),
     members: claim.members.filter((m) => ids.includes(m.id)).map((m) => ({ ...m, forkToken: toks[m.id] ?? "" })),
   };
 };
