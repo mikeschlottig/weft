@@ -55,7 +55,7 @@
   "analytics_engine_datasets": [{ "binding": "METRICS", "dataset": "weft_events" }],
 
   "secrets": { "required": ["ADMIN_TOKEN", "JWT_SIGNING_SECRET"] },
-  "vars": { "PUBLIC_READ": "true", "WEFT_ENV": "production", "ARTIFACTS_EVENTS_QUEUE": "weft-artifacts-events" },
+  "vars": { "PUBLIC_READ": "true", "WEFT_ENV": "production", "ARTIFACTS_EVENTS_QUEUE": "weft-artifacts-events", "WEFT_SIGNING_PUBKEY": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAPlo/RKrXy/UAmmyhjeG/gO2X1uybR5IhEfRtaYu294 queue@weft.dev" },
 
   // ---------------------------------------------------------------- weft-dev
   // M1–M3 development. A separate Worker (weft-dev) with its own Artifacts namespace, D1, R2, KV,
