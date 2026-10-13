@@ -46,6 +46,8 @@ const OPTIONS = {
   driver: { type: "string", multiple: true },
   recipe: { type: "string" },
   import: { type: "string" },
+  wait: { type: "boolean" },
+  "wait-timeout": { type: "string" },
   branch: { type: "string" },
   arg: { type: "string", multiple: true },
   "recipe-def": { type: "string", multiple: true },
@@ -77,7 +79,8 @@ Admin
   weft approve <cs> [--by NAME]       weft revert <cs> [--by NAME]       weft queue run
 
 Agent loop (inside a workspace dir, or --ws)
-  weft start --task "..." --touch GLOB [--touch GLOB] [--exclusive] [--after cs-x] [--dir PATH]
+  weft start --task "..." --touch GLOB [--touch GLOB] [--exclusive] [--after cs-x] [--wait [--wait-timeout S]] [--dir PATH]
+                                      --wait: queue fairly (FIFO) for a scope held under an exclusive lease (FR-10)
                                       --after: stack on a queued changeset (FR-27); --touch path#Symbol for symbol intents
   weft status                         heartbeat: touched, drift, live overlaps, forecast
   weft widen --touch GLOB
@@ -343,21 +346,36 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
     case "start": {
       const repo = repoOf(f);
       if (!f.task) throw usage('weft start needs --task "..."');
-      const r = await api<{
+      type Started = {
         workspace: { id: string; branch: string; baseCommit: string };
         stackedOn: { changeset: string; branch: string; head: string } | null;
         forecast: unknown;
         fork: Tok;
         trunk: Tok & { head: string };
-      }>("POST", `/v1/repos/${repo}/workspaces`, { task: f.task, touch: f.touch ?? [], mode: f.exclusive ? "exclusive" : "soft", after: f.after ?? null });
-      const ws = r.data.workspace;
+      };
+      type Waiting = { waiting: true; position: number; ahead: { agentName: string; task: string }[] };
+      const body = { task: f.task, touch: f.touch ?? [], mode: f.exclusive ? "exclusive" : "soft", after: f.after ?? null, wait: f.wait === true };
+      // FR-10: with --wait, hold a FIFO ticket for the scope and poll (backoff + jitter) until it is ours.
+      const deadline = Date.now() + (intOf(f["wait-timeout"], "wait-timeout") ?? 600) * 1000;
+      let r = await api<Started | Waiting>("POST", `/v1/repos/${repo}/workspaces`, body);
+      for (let i = 1; "waiting" in r.data; i += 1) {
+        if (Date.now() > deadline) {
+          throw new WeftError("WAIT_TIMEOUT", `still waiting for the scope (#${r.data.position} in line)`, { exitCode: EXIT.busy, retryable: true, hint: "weft start --wait again to keep your place", details: { ahead: r.data.ahead } });
+        }
+        if (process.stderr.isTTY || process.env.WEFT_VERBOSE) process.stderr.write(`waiting: #${r.data.position} in line${r.data.ahead.length ? ` (after ${r.data.ahead.map((a) => a.agentName).join(", ")})` : ""}\n`);
+        const cap = Math.min(10_000, 1_000 * 2 ** Math.min(i, 4));
+        await new Promise((res) => setTimeout(res, cap / 2 + Math.random() * (cap / 2)));
+        r = await api<Started | Waiting>("POST", `/v1/repos/${repo}/workspaces`, body);
+      }
+      const started = r as { data: Started; hints: string[] };
+      const ws = started.data.workspace;
       const dir = resolve(f.dir ?? ws.id);
-      git(["clone", "-q", r.data.fork.remote, dir], { token: r.data.fork.token });
-      git(["remote", "add", "trunk", r.data.trunk.remote], { cwd: dir });
-      if (r.data.stackedOn) {
+      git(["clone", "-q", started.data.fork.remote, dir], { token: started.data.fork.token });
+      git(["remote", "add", "trunk", started.data.trunk.remote], { cwd: dir });
+      if (started.data.stackedOn) {
         // FR-27: the fork was forked from the parent's fork, so the parent's branch is here; build on its head.
-        const p = r.data.stackedOn;
-        git(["fetch", "-q", "origin", `+refs/heads/${p.branch}:refs/remotes/origin/${p.branch}`], { cwd: dir, token: r.data.fork.token });
+        const p = started.data.stackedOn;
+        git(["fetch", "-q", "origin", `+refs/heads/${p.branch}:refs/remotes/origin/${p.branch}`], { cwd: dir, token: started.data.fork.token });
         git(["checkout", "-q", "-B", ws.branch, p.head], { cwd: dir });
       } else {
         git(["checkout", "-q", "-B", ws.branch], { cwd: dir });
@@ -367,9 +385,9 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
       git(["config", "weft.repo", repo], { cwd: dir });
       git(["config", "weft.ws", ws.id], { cwd: dir });
       setBase(dir, ws.baseCommit);
-      saveWs(dir, { repo, ws: ws.id, branch: ws.branch, fork: r.data.fork, trunk: r.data.trunk });
-      const data = { ...r.data, fork: { remote: r.data.fork.remote, expiresAt: r.data.fork.expiresAt }, trunk: { remote: r.data.trunk.remote, head: r.data.trunk.head }, path: dir };
-      return { data, hints: [`cd ${dir}`, ...r.hints] };
+      saveWs(dir, { repo, ws: ws.id, branch: ws.branch, fork: started.data.fork, trunk: started.data.trunk });
+      const data = { ...started.data, fork: { remote: started.data.fork.remote, expiresAt: started.data.fork.expiresAt }, trunk: { remote: started.data.trunk.remote, head: started.data.trunk.head }, path: dir };
+      return { data, hints: [`cd ${dir}`, ...started.hints] };
     }
     case "status": {
       const { cwd, w: w0 } = loadWs(f);

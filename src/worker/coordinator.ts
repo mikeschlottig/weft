@@ -10,7 +10,8 @@ import { DurableObject } from "cloudflare:workers";
 import { WeftError, encodeForRpc, invalidState, notFound, toWeftError, usage } from "../core/errors.ts";
 import { RECIPE_ARG } from "../core/types.ts";
 import { blockingOverlaps, forecast, isLive, isRealOverlap, outOfIntent, scoreRisk } from "../core/forecast.ts";
-import { matches } from "../core/glob.ts";
+import { matches, prefixesOverlap } from "../core/glob.ts";
+import { DUPLICATE_THRESHOLD, EMBED_MODEL, cosine, parseEmbedding } from "../core/similarity.ts";
 import { checkGate, composeScorecard, processGates } from "../core/rubric.ts";
 import type {
   AgentClaims,
@@ -102,7 +103,22 @@ interface SubmitInput {
   resolves: string | null;
 }
 
+const WAIT_STALE_MS = 120_000;
+
+interface Waiter {
+  id: string;
+  agentId: string;
+  agentName: string;
+  task: string;
+  globs: string[];
+  mode: IntentMode;
+  enqueuedAt: number;
+  lastPoll: number;
+}
+
 interface StoredWorkspace extends Workspace {
+  /** FR-09: embedding of the task text (for duplicate-intent detection among live workspaces). */
+  taskVec?: number[];
   behindAtSubmit: number;
   alertKeys: string[];
   expiredNotified: boolean;
@@ -128,6 +144,7 @@ export class RepoCoordinator extends DurableObject<Env> {
       this.sql.exec(`CREATE INDEX IF NOT EXISTS cs_status ON changesets(status, enqueued_at)`);
       this.sql.exec(`CREATE TABLE IF NOT EXISTS batches (id TEXT PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL)`);
       this.sql.exec(`CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, at INTEGER NOT NULL, type TEXT NOT NULL, actor TEXT NOT NULL, data TEXT NOT NULL)`);
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS waiters (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent_name TEXT NOT NULL, task TEXT NOT NULL, globs_json TEXT NOT NULL, mode TEXT NOT NULL, enqueued_at INTEGER NOT NULL, last_poll INTEGER NOT NULL)`);
       this.sql.exec(`CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, cs_id TEXT NOT NULL, ws_id TEXT NOT NULL, status TEXT NOT NULL, updated_at INTEGER NOT NULL, data TEXT NOT NULL)`);
       this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     });
@@ -367,7 +384,29 @@ export class RepoCoordinator extends DurableObject<Env> {
 
   // ------------------------------------------------------------ workspaces
 
-  start(input: { agent: AgentClaims; task: string; globs: string[]; mode: IntentMode; ttl: number | null; after?: string | null }) {
+  /** FR-10: overlapping, non-stale waiters enqueued before `before` (FIFO per scope). */
+  private waitersAhead(globs: string[], trunkFiles: readonly string[], before: number, exceptId: string | null): Waiter[] {
+    const nowMs = Date.now();
+    this.sql.exec(`DELETE FROM waiters WHERE last_poll < ?`, nowMs - WAIT_STALE_MS);
+    const all = this.sql
+      .exec<{ id: string; agent_id: string; agent_name: string; task: string; globs_json: string; mode: string; enqueued_at: number; last_poll: number }>(`SELECT * FROM waiters ORDER BY enqueued_at ASC`)
+      .toArray()
+      .map((r) => ({ id: r.id, agentId: r.agent_id, agentName: r.agent_name, task: r.task, globs: JSON.parse(r.globs_json) as string[], mode: r.mode as IntentMode, enqueuedAt: r.enqueued_at, lastPoll: r.last_poll }));
+    const overlap = (g: string[]): boolean => trunkFiles.some((f) => matches(f, g) && matches(f, globs)) || prefixesOverlap(g, globs).length > 0;
+    return all.filter((w) => w.id !== exceptId && w.enqueuedAt < before && overlap(w.globs));
+  }
+
+  private async embedTask(task: string): Promise<number[] | null> {
+    try {
+      const raw = await (this.env.AI as unknown as { run(model: string, input: Record<string, unknown>): Promise<unknown> }).run(EMBED_MODEL, { text: [task.slice(0, 1000)] });
+      return parseEmbedding(raw);
+    } catch (err: unknown) {
+      console.log(JSON.stringify({ level: "warn", msg: "task embedding failed (duplicate detection skipped)", err: String(err) }));
+      return null;
+    }
+  }
+
+  start(input: { agent: AgentClaims; task: string; globs: string[]; mode: IntentMode; ttl: number | null; after?: string | null; wait?: boolean }) {
     return this.guard(async () => {
       if (input.globs.length === 0) throw usage("an intent needs at least one --touch glob", "e.g. --touch 'src/auth/**'");
       if (!input.task.trim()) throw usage('start needs --task "..."');
@@ -384,11 +423,46 @@ export class RepoCoordinator extends DurableObject<Env> {
         parent = { cs: pc, ws: this.ws(pc.wsId) };
       }
 
+      const taskVec = await this.embedTask(input.task);
+
       // ---- decision block (no awaits)
       const m = this.meta();
       const live = this.liveWs().filter((o) => !parent || o.id !== parent.ws.id);
       const fc = forecast(live, { wsId: null, globs: input.globs, touched: [] }, tf.files, m.config, Date.now());
+      if (taskVec) {
+        const dups = live
+          .filter((o) => o.taskVec && isLive(o, Date.now()))
+          .map((o) => ({ workspaceId: o.id, agentName: o.agentName, task: o.task, similarity: Math.round(cosine(taskVec, o.taskVec ?? []) * 1000) / 1000 }))
+          .filter((d) => d.similarity >= DUPLICATE_THRESHOLD)
+          .sort((a, b) => b.similarity - a.similarity)
+          .slice(0, 5);
+        if (dups.length > 0) {
+          fc.duplicates = dups;
+          fc.advice += ` A live task looks like the same work: ${dups[0]?.agentName ?? "?"} — "${dups[0]?.task ?? ""}" (similarity ${dups[0]?.similarity ?? 0}). Coordinate before duplicating it.`;
+        }
+      }
       const blocking = blockingOverlaps(fc, input.mode);
+      // FR-10: fair FIFO per scope — earlier overlapping waiters go first; nobody cuts the line.
+      const ticketId = `${input.agent.sub}:${[...input.globs].sort().join("|")}`;
+      const mine = this.sql.exec<{ enqueued_at: number }>(`SELECT enqueued_at FROM waiters WHERE id = ?`, ticketId).toArray()[0];
+      const ahead = this.waitersAhead(input.globs, tf.files, mine?.enqueued_at ?? Date.now() + 1, ticketId);
+      if ((blocking.length > 0 || ahead.length > 0) && input.wait) {
+        const nowMs = Date.now();
+        this.sql.exec(
+          `INSERT INTO waiters (id, agent_id, agent_name, task, globs_json, mode, enqueued_at, last_poll) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_poll = excluded.last_poll`,
+          ticketId, input.agent.sub, input.agent.name, input.task, JSON.stringify(input.globs), input.mode, nowMs, nowMs,
+        );
+        if (!mine) this.emit(m, "workspace.waiting", input.agent.sub, { agentName: input.agent.name, task: input.task, globs: input.globs, position: ahead.length + 1, blockedBy: blocking.map((b) => b.agentName) });
+        this.saveMeta(m);
+        return { waiting: true as const, position: ahead.length + 1, ahead: ahead.map((w) => ({ agentName: w.agentName, task: w.task })), blocking, forecast: fc };
+      }
+      if (blocking.length === 0 && ahead.length > 0) {
+        throw new WeftError("LEASE_HELD", `${ahead.length} agent(s) are already waiting for this scope`, {
+          retryable: true,
+          hint: "weft start --wait  # join the queue for this scope (FIFO)",
+          details: { waiting: ahead.map((w) => ({ agentName: w.agentName, task: w.task })) },
+        });
+      }
       if (blocking.length > 0) {
         this.emit(m, "workspace.lease_refused", input.agent.sub, { agentName: input.agent.name, task: input.task, globs: input.globs, blocking });
         this.saveMeta(m);
@@ -416,6 +490,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         status: "provisioning",
         intent: { globs: input.globs, mode: input.mode, task: input.task, createdAt: now(), expiresAt: plusSeconds(ttl) },
         touched: [],
+        ...(taskVec ? { taskVec } : {}),
         createdAt: now(),
         updatedAt: now(),
         changesetId: null,
@@ -425,6 +500,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         expiredNotified: false,
       };
       this.putWs(ws);
+      this.sql.exec(`DELETE FROM waiters WHERE id = ?`, ticketId);
       this.saveMeta(m);
 
       // ---- provisioning I/O
@@ -451,6 +527,7 @@ export class RepoCoordinator extends DurableObject<Env> {
           forecast: fc.risk,
           peers: fc.overlaps.map((o) => o.agentName),
           after: parent?.cs.id ?? null,
+          duplicates: (fc.duplicates ?? []).map((d) => ({ agentName: d.agentName, similarity: d.similarity })),
         }, fc.overlaps.map((o) => `agent:${o.agentId}`));
         this.saveMeta(m2);
         return {

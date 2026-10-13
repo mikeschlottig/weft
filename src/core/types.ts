@@ -161,6 +161,8 @@ export interface Forecast {
   risk: "none" | "low" | "medium" | "high";
   overlaps: OverlapFinding[];
   advice: string;
+  /** FR-09: live workspaces whose task is semantically close to this one. */
+  duplicates?: { workspaceId: string; agentName: string; task: string; similarity: number }[];
 }
 
 export type EventType =
@@ -192,7 +194,8 @@ export type EventType =
   | "room.verified"
   | "room.failed"
   | "room.accepted"
-  | "workspace.resumed";
+  | "workspace.resumed"
+  | "workspace.waiting";
 
 export interface WeftEvent {
   seq: number;

@@ -3,6 +3,7 @@
 
 import { WeftError, decodeFromRpc, usage } from "../core/errors.ts";
 import { type ContextPack, contextMarkdown } from "../core/context.ts";
+import { DUPLICATE_THRESHOLD, EMBED_MODEL, cosine } from "../core/similarity.ts";
 import { signJwt } from "../core/jwt.ts";
 import type { AgentClaims, Envelope, ErrorEnvelope, IntentMode, RepoConfig } from "../core/types.ts";
 import { trunkLog } from "./artifacts.ts";
@@ -126,8 +127,11 @@ route("GET", "/v1/repos/:repo/snapshot", "snapshot", "read", async (c) => ({ dat
 route("POST", "/v1/repos/:repo/workspaces", "start", "agent", async (c) => {
   const b = await c.body();
   const mode: IntentMode = b.mode === "exclusive" ? "exclusive" : "soft";
-  const res = await coord(c.env, c.params.repo ?? "").start({ agent: claimsOf(c), task: str(b.task, "task"), globs: strs(b.touch, "touch"), mode, ttl: numOr(b.ttl, null), after: typeof b.after === "string" && b.after ? b.after : null });
+  const res = await coord(c.env, c.params.repo ?? "").start({ agent: claimsOf(c), task: str(b.task, "task"), globs: strs(b.touch, "touch"), mode, ttl: numOr(b.ttl, null), after: typeof b.after === "string" && b.after ? b.after : null, wait: b.wait === true });
+  if ("waiting" in res) return { data: res, hints: [`waiting: #${res.position} in line for this scope; poll again with --wait`] };
   const hints = ["weft status", 'weft submit -m "..."'];
+  const dup = res.forecast.duplicates?.[0];
+  if (dup) hints.unshift(`coordinate with ${dup.agentName} (${dup.workspaceId}): "${dup.task}" looks like the same work (similarity ${dup.similarity})`);
   if (res.forecast.risk === "medium" || res.forecast.risk === "high") hints.unshift("weft who <path>  # another agent is in scope");
   return { data: res, hints };
 });
@@ -237,6 +241,17 @@ route("GET", "/v1/repos/:repo/log", "log", "read", async (c) => {
       return { commit: e.hash, author: e.author.name, at: new Date(e.authoredAt * 1000).toISOString(), subject: e.message.split("\n")[0] ?? "", changeset: t["Weft-Changeset"] ?? null, model: t["Weft-Model"] ?? null, risk: t["Weft-Risk"] ? Number(t["Weft-Risk"]) : null, trailers: t };
     }),
   };
+});
+
+// ---- FR-09 calibration: score task pairs with the same embedding model the coordinator uses (admin only)
+route("POST", "/v1/admin/similarity", "similarity", "admin", async (c) => {
+  const b = await c.body();
+  const pairs = Array.isArray(b.pairs) ? (b.pairs as unknown[]).filter((p): p is [string, string] => Array.isArray(p) && p.length === 2 && p.every((x) => typeof x === "string")).slice(0, 50) : [];
+  if (pairs.length === 0) throw usage("pairs: [[taskA, taskB], ...] (max 50)");
+  const texts = [...new Set(pairs.flat())];
+  const raw = (await (c.env.AI as unknown as { run(model: string, input: Record<string, unknown>): Promise<unknown> }).run(EMBED_MODEL, { text: texts })) as { data?: number[][] };
+  const vecs = new Map(texts.map((t, i) => [t, raw.data?.[i] ?? []]));
+  return { data: { model: EMBED_MODEL, threshold: DUPLICATE_THRESHOLD, scores: pairs.map(([x, y]) => ({ a: x, b: y, similarity: Math.round(cosine(vecs.get(x) ?? [], vecs.get(y) ?? []) * 1000) / 1000 })) } };
 });
 
 // ---- context preservation: context packs + resume (FR-16)
