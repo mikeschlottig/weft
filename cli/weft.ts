@@ -89,22 +89,29 @@ const api = async <T>(method: string, path: string, body?: unknown): Promise<{ d
   const token = process.env.WEFT_TOKEN;
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (token) headers.authorization = `Bearer ${token}`;
+  // Retryable errors get ≥ 3 attempts with backoff + jitter. "Busy" codes (a batch is landing) keep
+  // retrying for up to BUSY_BUDGET_MS: waiting out a landing is the client's job, not the agent's.
+  const BUSY_BUDGET_MS = 90_000;
+  const started = Date.now();
   let lastErr: unknown;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  for (let attempt = 1; ; attempt += 1) {
+    let busy = false;
     try {
       const res = await fetch(`${remote()}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(TIMEOUT_MS) });
       const env = (await res.json()) as { ok: boolean; data?: T; hints?: string[]; error?: ErrorEnvelope["error"] };
       if (env.ok) return { data: env.data as T, hints: env.hints ?? [] };
       const e = env.error ?? { code: "INTERNAL", message: `HTTP ${res.status}`, retryable: false, hint: null, details: {} };
       const we = new WeftError(e.code, e.message, { retryable: e.retryable, hint: e.hint, details: e.details, exitCode: exitFor(e.code) });
-      if (!we.retryable || attempt === 3) throw we;
+      if (!we.retryable) throw we;
+      busy = /BUSY$/.test(we.code);
       lastErr = we;
     } catch (err: unknown) {
-      if (err instanceof WeftError && (!err.retryable || attempt === 3)) throw err;
+      if (err instanceof WeftError && !err.retryable) throw err;
       lastErr = err;
-      if (attempt === 3) break;
     }
-    const cap = 400 * 2 ** attempt;
+    const outOfBudget = busy ? Date.now() - started > BUSY_BUDGET_MS : attempt >= 3;
+    if (outOfBudget) break;
+    const cap = Math.min(8_000, 400 * 2 ** Math.min(attempt, 5));
     await new Promise((r) => setTimeout(r, cap / 2 + Math.random() * (cap / 2)));
   }
   throw toWeftError(lastErr);
