@@ -25,6 +25,10 @@ import type {
   Provenance,
   Rejection,
   RepoConfig,
+  Room,
+  RoomAttempt,
+  RoomFile,
+  RoomPeer,
   Scorecard,
   WeftEvent,
   Workspace,
@@ -68,6 +72,23 @@ interface BatchRow {
   pre: Record<string, { gates: GateResult[]; judge: JudgeAnswers | null; behind: number; rejections: number }>;
 }
 
+interface SubmitInput {
+  wsId: string;
+  agent: AgentClaims;
+  message: string;
+  head: string;
+  base: string;
+  filesTouched: string[];
+  linesAdded: number;
+  linesDeleted: number;
+  checkpoints: number;
+  behind: number;
+  promptSha256: string | null;
+  toolCalls: number | null;
+  costUsd: number | null;
+  resolves: string | null;
+}
+
 interface StoredWorkspace extends Workspace {
   behindAtSubmit: number;
   alertKeys: string[];
@@ -94,6 +115,7 @@ export class RepoCoordinator extends DurableObject<Env> {
       this.sql.exec(`CREATE INDEX IF NOT EXISTS cs_status ON changesets(status, enqueued_at)`);
       this.sql.exec(`CREATE TABLE IF NOT EXISTS batches (id TEXT PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL)`);
       this.sql.exec(`CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, at INTEGER NOT NULL, type TEXT NOT NULL, actor TEXT NOT NULL, data TEXT NOT NULL)`);
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, cs_id TEXT NOT NULL, ws_id TEXT NOT NULL, status TEXT NOT NULL, updated_at INTEGER NOT NULL, data TEXT NOT NULL)`);
       this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     });
   }
@@ -173,6 +195,33 @@ export class RepoCoordinator extends DurableObject<Env> {
   }
   private putBatch(b: BatchRow): void {
     this.sql.exec(`INSERT INTO batches (id, state, data) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET state = excluded.state, data = excluded.data`, b.id, b.state, JSON.stringify(b));
+  }
+  private roomOrNull(id: string): Room | null {
+    const row = this.sql.exec<{ data: string }>(`SELECT data FROM rooms WHERE id = ?`, id).toArray()[0];
+    return row ? (JSON.parse(row.data) as Room) : null;
+  }
+  private room(id: string): Room {
+    const r = this.roomOrNull(id);
+    if (!r) throw notFound("room", id, "weft room list");
+    return r;
+  }
+  private putRoom(r: Room): void {
+    r.updatedAt = now();
+    this.sql.exec(
+      `INSERT INTO rooms (id, cs_id, ws_id, status, updated_at, data) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at, data = excluded.data`,
+      r.id,
+      r.csId,
+      r.wsId,
+      r.status,
+      Date.now(),
+      JSON.stringify(r),
+    );
+  }
+  private allRooms(limit = 100): Room[] {
+    return this.sql
+      .exec<{ data: string }>(`SELECT data FROM rooms ORDER BY updated_at DESC LIMIT ?`, limit)
+      .toArray()
+      .map((r) => JSON.parse(r.data) as Room);
   }
   private nextSeq(m: Meta): number {
     m.seq += 1;
@@ -511,7 +560,12 @@ export class RepoCoordinator extends DurableObject<Env> {
     });
   }
 
-  submit(input: {
+  submit(input: SubmitInput) {
+    return this.guard(() => this.submitCore(input));
+  }
+
+  /** Unwrapped submit, shared by the API route and by accepting a verified Conflict Room proposal. */
+  private async submitCore(input: {
     wsId: string;
     agent: AgentClaims;
     message: string;
@@ -526,8 +580,8 @@ export class RepoCoordinator extends DurableObject<Env> {
     toolCalls: number | null;
     costUsd: number | null;
     resolves: string | null;
-  }) {
-    return this.guard(async () => {
+  }): Promise<{ changeset: Changeset }> {
+    {
       if (!input.message.trim()) throw usage("submit needs -m <message>");
       if (input.filesTouched.length === 0) throw new WeftError("NOTHING_TO_SUBMIT", "no changes relative to the workspace base", { hint: "edit files first" });
       if (!/^[0-9a-f]{40}$/.test(input.head)) throw usage("head must be a 40-char commit sha");
@@ -590,7 +644,7 @@ export class RepoCoordinator extends DurableObject<Env> {
       this.saveMeta(m);
       if (!needsReview) this.scheduleKick(m.config.batchWindowMs ?? KICK_DELAY_MS);
       return { changeset: c };
-    });
+    }
   }
 
   approve(csId: string, by: string) {
@@ -794,6 +848,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         });
       };
       const landedIds: string[] = [];
+      const roomsToStart: string[] = [];
       for (const a of input.applied) {
         const c = this.cs(a.id);
         c.status = "landed";
@@ -828,6 +883,7 @@ export class RepoCoordinator extends DurableObject<Env> {
           wqs: c.scorecard.total,
         }, [`agent:${c.agentId}`]);
         this.project({ kind: "scorecard", repo: m.repo, cs: { id: c.id, agentId: c.agentId, agentName: c.provenance.agentName, model: c.provenance.model, status: c.status, wqs: c.scorecard.total, scorecard: c.scorecard, landedCommit: null } });
+        if (rejection.reason === "conflict") roomsToStart.push(this.openRoom(m, c, rejection).id);
       }
       // Anything still validating in this batch (e.g. dropped by a rebuild) goes back to the queue.
       for (const x of b.claim.members) {
@@ -860,6 +916,7 @@ export class RepoCoordinator extends DurableObject<Env> {
           }),
         ),
       );
+      for (const roomId of roomsToStart) this.startResolver(m.repo, roomId);
       this.scheduleKick(500);
       return { idempotent: false };
     });
@@ -942,6 +999,192 @@ export class RepoCoordinator extends DurableObject<Env> {
       this.project({ kind: "outcome", repo: m.repo, csId, outcome: "reverted" });
       return { csId, revertCommit: res.commit };
     });
+  }
+
+  // ------------------------------------------------------------ Conflict Rooms (FR-24)
+
+  /** Called inside landBatch's transaction for each conflict rejection. */
+  private openRoom(m: Meta, c: Changeset, rejection: Rejection): Room {
+    const peers: RoomPeer[] = (rejection.conflictsWith.length > 0 ? rejection.conflictsWith : this.peersFor(rejection.files, c.enqueuedAt)).map((p) => {
+      const pc = p.changesetId ? this.sql.exec<{ data: string }>(`SELECT data FROM changesets WHERE id = ?`, p.changesetId).toArray()[0] : undefined;
+      const task = pc ? (JSON.parse(pc.data) as Changeset).provenance.task : null;
+      return { changesetId: p.changesetId, agentName: p.agentName, task, files: p.files };
+    });
+    const id = `r-${pad(this.nextSeq(m))}`;
+    const room: Room = {
+      id,
+      repo: m.repo,
+      csId: c.id,
+      wsId: c.wsId,
+      agentId: c.agentId,
+      agentName: c.provenance.agentName,
+      task: c.provenance.task,
+      intentGlobs: c.provenance.intentGlobs,
+      files: rejection.files,
+      peers,
+      status: "open",
+      trunkHead: null,
+      hunks: [],
+      attempts: [],
+      verified: null,
+      resubmittedAs: null,
+      error: null,
+      createdAt: now(),
+      updatedAt: now(),
+    };
+    this.putRoom(room);
+    this.emit(m, "room.opened", "weft", { roomId: id, csId: c.id, wsId: c.wsId, agentName: room.agentName, files: room.files, peers: peers.map((p) => p.agentName) }, [`agent:${c.agentId}`]);
+    return room;
+  }
+
+  private startResolver(repo: string, roomId: string): void {
+    this.ctx.waitUntil(
+      this.env.ROOM_RESOLVER.create({ id: `${repo.replace(/[^a-zA-Z0-9_-]/g, "_")}-${roomId}-${Date.now().toString(36)}`, params: { repo, roomId } }).catch((err: unknown) => {
+        const msg = toWeftError(err).message;
+        console.log(JSON.stringify({ level: "error", msg: "room resolver create failed", repo, roomId, err: msg }));
+        const m = this.meta();
+        const r = this.room(roomId);
+        r.status = "failed";
+        r.error = `resolver could not start: ${msg}`;
+        this.putRoom(r);
+        this.emit(m, "room.failed", "weft", { roomId, csId: r.csId, agentName: r.agentName, reason: r.error }, [`agent:${r.agentId}`]);
+        this.saveMeta(m);
+      }),
+    );
+  }
+
+  /** Everything the RoomResolver Workflow needs (no tokens: those are minted inside the steps). */
+  roomInput(roomId: string) {
+    return this.guard(async () => {
+      const m = this.meta();
+      const r = this.room(roomId);
+      const c = this.cs(r.csId);
+      const w = this.ws(r.wsId);
+      return {
+        room: r,
+        trunkRepo: m.repo,
+        trunkRemote: m.trunkRemote,
+        forkRepo: w.forkRepo,
+        forkRemote: w.forkRemote,
+        branch: w.branch,
+        headCommit: c.headCommit,
+        message: c.message,
+        checkCommand: m.config.checkCommand,
+        unionGlobs: m.config.unionGlobs,
+        workspaceStatus: w.status,
+      };
+    });
+  }
+
+  /** Progress reports from the RoomResolver Workflow (idempotent per attempt number). */
+  roomUpdate(roomId: string, patch: { status?: Room["status"]; trunkHead?: string; hunks?: RoomFile[]; attempt?: RoomAttempt; verified?: Room["verified"]; error?: string | null }) {
+    return this.guard(async () => {
+      const m = this.meta();
+      const r = this.room(roomId);
+      if (r.status === "accepted") return { status: r.status };
+      if (patch.trunkHead !== undefined) r.trunkHead = patch.trunkHead;
+      if (patch.hunks !== undefined) r.hunks = patch.hunks;
+      if (patch.error !== undefined) r.error = patch.error;
+      if (patch.attempt) {
+        const a = patch.attempt;
+        r.attempts = [...r.attempts.filter((x) => x.n !== a.n), a].sort((x, y) => x.n - y.n);
+        this.emit(m, "room.proposed", "weft-resolver", {
+          roomId,
+          csId: r.csId,
+          agentName: r.agentName,
+          attempt: a.n,
+          files: a.files,
+          checkPassed: a.checkPassed,
+          markersLeft: a.markersLeft,
+          error: a.error,
+          rationale: a.rationale,
+        }, [`agent:${r.agentId}`]);
+      }
+      if (patch.verified !== undefined) r.verified = patch.verified;
+      if (patch.status && patch.status !== r.status) {
+        r.status = patch.status;
+        if (r.status === "verified") {
+          this.emit(m, "room.verified", "weft-resolver", { roomId, csId: r.csId, wsId: r.wsId, agentName: r.agentName, candidate: r.verified?.candidate ?? null, attempts: r.attempts.length }, [`agent:${r.agentId}`]);
+        } else if (r.status === "failed") {
+          this.emit(m, "room.failed", "weft-resolver", { roomId, csId: r.csId, agentName: r.agentName, reason: r.error ?? "no green proposal" }, [`agent:${r.agentId}`]);
+        }
+      }
+      this.putRoom(r);
+      this.saveMeta(m);
+      return { status: r.status };
+    });
+  }
+
+  /** The losing agent accepts a verified proposal: fast-forward its branch, then resubmit with Weft-Resolves. */
+  roomAccept(roomId: string, agent: AgentClaims) {
+    return this.guard(async () => {
+      const m0 = this.meta();
+      const r0 = this.room(roomId);
+      if (r0.status !== "verified" || !r0.verified) throw invalidState(`room ${roomId} is ${r0.status}; only a verified proposal can be accepted`, r0.status === "failed" ? "resolve by hand: `weft sync`, fix, `weft submit --resolves " + r0.csId + "`" : "wait for the resolver (`weft room show " + roomId + "`)");
+      const w0 = this.own(r0.wsId, agent);
+      if (w0.status !== "active") throw invalidState(`workspace ${w0.id} is ${w0.status}`);
+      const c0 = this.cs(r0.csId);
+      const v = r0.verified;
+      const write = await mintToken(this.env, w0.forkRepo, "write", 600);
+      const read = await mintToken(this.env, w0.forkRepo, "read", 600);
+      const trunkRead = await mintToken(this.env, m0.repo, "read", 600);
+      await runner(this.env, m0.repo).fastForward({
+        trunk: { remote: m0.trunkRemote, token: headerToken(trunkRead.plaintext) },
+        fork: { forkRemote: w0.forkRemote, writeToken: headerToken(write.plaintext), readToken: headerToken(read.plaintext), branch: w0.branch },
+        expected: c0.headCommit,
+        to: v.candidate,
+        toRef: v.branch,
+      });
+      const res = await this.submitCore({
+        wsId: w0.id,
+        agent,
+        message: `${c0.message} (resolved in ${roomId})`,
+        head: v.candidate,
+        base: r0.trunkHead ?? c0.baseCommit,
+        filesTouched: v.filesTouched,
+        linesAdded: v.added,
+        linesDeleted: v.deleted,
+        checkpoints: 0,
+        behind: 0,
+        promptSha256: c0.provenance.promptSha256,
+        toolCalls: c0.provenance.toolCalls,
+        costUsd: c0.provenance.costUsd,
+        resolves: r0.csId,
+      });
+      const m = this.meta();
+      const r = this.room(roomId);
+      r.status = "accepted";
+      r.resubmittedAs = res.changeset.id;
+      this.putRoom(r);
+      const w = this.ws(w0.id);
+      w.baseCommit = r.trunkHead ?? w.baseCommit;
+      this.putWs(w);
+      this.emit(m, "room.accepted", agent.sub, { roomId, csId: r.csId, resubmittedAs: res.changeset.id, agentName: r.agentName }, [`agent:${r.agentId}`]);
+      this.saveMeta(m);
+      return { room: r, changeset: res.changeset, branch: w.branch, head: v.candidate, base: w.baseCommit };
+    });
+  }
+
+  rooms() {
+    return this.guard(async () =>
+      this.allRooms(200).map((r) => ({
+        id: r.id,
+        csId: r.csId,
+        agentName: r.agentName,
+        task: r.task,
+        files: r.files,
+        peers: r.peers.map((p) => p.agentName),
+        status: r.status,
+        attempts: r.attempts.length,
+        checkPassed: r.attempts[r.attempts.length - 1]?.checkPassed ?? null,
+        resubmittedAs: r.resubmittedAs,
+        updatedAt: r.updatedAt,
+      })),
+    );
+  }
+
+  roomShow(roomId: string) {
+    return this.guard(async () => this.room(roomId));
   }
 
   // ------------------------------------------------------------ read models
@@ -1035,6 +1278,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         workspaces: this.allWs(100).filter((w) => w.status !== "abandoned").map((w) => this.publicWs(w)),
         changesets: this.allCs(100).map((c) => ({ ...c, scorecard: c.scorecard })),
         batch: b ? { id: b.id, state: b.state, trunkHead: b.claim.trunkHead, members: b.claim.members.map((x) => x.id) } : null,
+        rooms: this.allRooms(50),
         events,
         seq: m.seq,
       };

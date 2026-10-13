@@ -10,6 +10,7 @@ import { handleMcp } from "./mcp.ts";
 
 export { RepoCoordinator } from "./coordinator.ts";
 export { MergeQueue } from "./merge-queue.ts";
+export { RoomResolver } from "./room-resolver.ts";
 export { MergeRunner } from "./runner-client.ts";
 
 type Handler = (ctx: Ctx) => Promise<{ data: unknown; hints?: string[] }>;
@@ -206,6 +207,29 @@ route("GET", "/v1/repos/:repo/log", "log", "read", async (c) => {
       return { commit: e.hash, author: e.author.name, at: new Date(e.authoredAt * 1000).toISOString(), subject: e.message.split("\n")[0] ?? "", changeset: t["Weft-Changeset"] ?? null, model: t["Weft-Model"] ?? null, risk: t["Weft-Risk"] ? Number(t["Weft-Risk"]) : null, trailers: t };
     }),
   };
+});
+
+// ---- Conflict Rooms (FR-24)
+route("GET", "/v1/repos/:repo/rooms", "room list", "read", async (c) => ({ data: await coord(c.env, c.params.repo ?? "").rooms() }));
+route("GET", "/v1/repos/:repo/rooms/:room", "room show", "read", async (c) => {
+  const r = await coord(c.env, c.params.repo ?? "").roomShow(c.params.room ?? "");
+  const hints: string[] = [];
+  if (r.status === "verified") hints.push(`weft room accept ${r.id}  # the proposal passed the check on current trunk`);
+  if (r.status === "failed") hints.push(`weft sync  # resolve by hand, then weft submit --resolves ${r.csId}`);
+  if (r.status === "open" || r.status === "proposing" || r.status === "verifying") hints.push(`weft room show ${r.id}  # resolver is working`);
+  return { data: r, hints };
+});
+route("GET", "/v1/repos/:repo/rooms/:room/log", "room log", "read", async (c) => {
+  const r = await coord(c.env, c.params.repo ?? "").roomShow(c.params.room ?? "");
+  const n = Number(c.url.searchParams.get("attempt") ?? String(r.attempts.length));
+  const key = r.attempts.find((a) => a.n === n)?.logKey;
+  if (!key) throw new WeftError("NOT_FOUND", `no check log for ${r.id} attempt ${n}`);
+  const obj = await c.env.BLOBS.get(key);
+  return { data: { key, attempt: n, log: obj ? await obj.text() : null } };
+});
+route("POST", "/v1/repos/:repo/rooms/:room/accept", "room accept", "agent", async (c) => {
+  const res = await coord(c.env, c.params.repo ?? "").roomAccept(c.params.room ?? "", claimsOf(c));
+  return { data: res, hints: [`weft show ${res.changeset.id}  # resubmitted with Weft-Resolves: ${res.room.csId}`, "weft events --follow"] };
 });
 
 route("GET", "/v1/repos/:repo/who", "who", "read", async (c) => ({ data: await coord(c.env, c.params.repo ?? "").who(str(c.url.searchParams.get("path"), "path")) }));

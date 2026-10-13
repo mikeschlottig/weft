@@ -114,13 +114,29 @@ A show "$(cs cedar)" --json | jq -c '.data.rejection | {reason, files, conflicts
 echo "  why was birch rejected? (merged-tree check log, from R2)"
 A logs "$(cs birch)" --json | jq -r '.data.log' | grep -E "not ok|expected|actual" | head -3 || true
 
-say "act 4 — a human approves dune's sensitive change; cedar resolves its conflict; birch fixes its bug"
+say "act 4 — a human approves dune's sensitive change; cedar's conflict goes to a Conflict Room; birch fixes its bug"
 S1=$(seq_now)
 A approve "$(cs dune)" --by mike --json | jq -c '{id: .data.id, status: .data.status, approvedBy: .data.approvedBy}'
+# Poll a changeset until it is landed/rejected/reverted (the queue may land fixes in separate batches).
+await_cs() { local id="$1" st=""; for _ in $(seq 1 150); do st=$(A show "$id" --json | J '.data.status'); case "$st" in landed|rejected|reverted) echo "$st"; return 0;; esac; sleep 4; done; echo "timeout:$st"; return 1; }
+( cd birch
+  perl -pi -e 's|\QpadStart(width, " ")\E|padStart(width, "0")|' src/util/format.js
+  G birch submit -m "Add currency() formatter" --json >../birch.sub2.json ) &
 ( cd cedar
-  set +e; G cedar sync --json >../cedar.sync.json; set -e
-  echo "  cedar sync: $(J '.error.code' <../cedar.sync.json) files=$(J '.error.details.conflicts.files | join(",")' <../cedar.sync.json) peer=$(J '.error.details.conflicts.peers[0].changesetId' <../cedar.sync.json) ($(J '.error.details.conflicts.peers[0].agentName' <../cedar.sync.json))"
-  cat >src/billing/invoice.js <<'EOF'
+  room=$(A room list --json | jq -r --arg cs "$(J '.data.changeset.id' <../cedar.sub.json)" '[.data[] | select(.csId == $cs)][0].id // empty')
+  if [ -n "$room" ]; then
+    echo "  Conflict Room $room: Workers AI proposes a resolution; the merge-runner merges it on current trunk and runs the check"
+    node "$ROOT/scripts/wait-events.mjs" "$WEFT_REPO" "$S0" room.verified,room.failed 900 >/dev/null || true
+    A room show "$room" --json | jq -c '{room: .data.id, status: .data.status, attempts: [.data.attempts[] | {n, files, checkPassed, rationale}]}'
+  fi
+  if [ -n "$room" ] && [ "$(A room show "$room" --json | J '.data.status')" = "verified" ]; then
+    G cedar room accept "$room" --json >../cedar.sub2.json
+    jq -c '{path: "room", resubmitted: .data.changeset.id, resolves: .data.changeset.resolves, local: .data.local}' <../cedar.sub2.json
+  else
+    echo "  room did not verify — cedar resolves by hand (weft sync)"
+    set +e; G cedar sync --json >../cedar.sync.json; set -e
+    echo "  cedar sync: $(J '.error.code' <../cedar.sync.json) files=$(J '.error.details.conflicts.files | join(",")' <../cedar.sync.json) peer=$(J '.error.details.conflicts.peers[0].changesetId' <../cedar.sync.json) ($(J '.error.details.conflicts.peers[0].agentName' <../cedar.sync.json))"
+    cat >src/billing/invoice.js <<'EOF'
 export function discount(subtotal) {
   return subtotal >= 100 ? subtotal * 0.1 : 0;
 }
@@ -130,14 +146,16 @@ export function total(items) {
   return Math.round((subtotal - discount(subtotal)) * 1.08 * 100) / 100;
 }
 EOF
-  perl -pi -e 's|\Q), 180);\E|), 194.4);|' test/discount.test.js
-  G cedar sync --continue --json | jq -c '{action: .data.action}'
-  G cedar submit -m "Add 10% volume discount (applied before tax)" --resolves "$(J '.data.changeset.id' <../cedar.sub.json)" --json >../cedar.sub2.json )
-( cd birch
-  perl -pi -e 's|\QpadStart(width, " ")\E|padStart(width, "0")|' src/util/format.js
-  G birch submit -m "Add currency() formatter" --json >../birch.sub2.json )
-node "$ROOT/scripts/wait-events.mjs" "$WEFT_REPO" "$S1" queue.batch_landed 600 --print \
-  | jq -rc 'select(.type | test("judged|landed|rejected")) | "  \(.type) \(.data.csId // .data.batchId) \(.data.agentName // "") \(if .data.wqs != null then "WQS=" + (.data.wqs|tostring) else "" end) \(if .data.checksRun != null then "checks=" + (.data.checksRun|tostring) else "" end)"'
+    perl -pi -e 's|\Q), 180);\E|), 194.4);|' test/discount.test.js
+    G cedar sync --continue --json | jq -c '{action: .data.action}'
+    G cedar submit -m "Add 10% volume discount (applied before tax)" --resolves "$(J '.data.changeset.id' <../cedar.sub.json)" --json >../cedar.sub2.json
+  fi )
+wait
+for x in "dune:$(cs dune)" "birch:$(J '.data.changeset.id' <birch.sub2.json)" "cedar:$(J '.data.changeset.id' <cedar.sub2.json)"; do
+  printf '  %-6s %-8s %s\n' "${x%%:*}" "${x##*:}" "$(await_cs "${x##*:}")"
+done
+node "$ROOT/scripts/wait-events.mjs" "$WEFT_REPO" "$S1" queue.batch_landed 60 --print \
+  | jq -rc 'select(.type | test("judged|landed|rejected|room\\.")) | "  \(.type) \(.data.csId // .data.roomId // .data.batchId) \(.data.agentName // "") \(if .data.wqs != null then "WQS=" + (.data.wqs|tostring) else "" end) \(if .data.checksRun != null then "checks=" + (.data.checksRun|tostring) else "" end)"'
 
 say "act 5 — trunk carries server-written provenance; CHANGELOG merged with zero conflicts"
 A log -n 5 --json | jq -rc '.data[] | "  \(.commit[0:10]) \(.subject) | \(.changeset // "-") \(.model // "") risk=\(.risk // "-")"'

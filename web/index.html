@@ -110,6 +110,14 @@ tr.click{cursor:pointer}tr.click:hover td{background:var(--panel2)}
 .trailers{font:12px/1.6 var(--mono);background:#0E0F11;color:#C8FF1E;padding:12px;margin:0;overflow-x:auto;white-space:pre}
 .empty{padding:20px 12px;color:var(--muted)}
 .note{font-size:12px;color:var(--muted);padding:8px 12px}
+.tl{max-height:560px;overflow:auto}
+.tl .it{display:grid;grid-template-columns:64px 26px minmax(0,1fr);gap:8px;padding:7px 12px;border-bottom:1px solid var(--hair);align-items:start}
+.tl .ic{font:13px var(--mono);text-align:center}
+.tl .tx b{font-weight:700}.tl .sub{font:11.5px var(--mono);color:var(--muted);margin-top:2px;word-break:break-word}
+.code{font:11.5px/1.5 var(--mono);background:var(--panel2);border-top:1px solid var(--hair);margin:0;padding:10px 12px;max-height:260px;overflow:auto;white-space:pre}
+.vs{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0}
+.vs>div{padding:10px 12px;border-right:1px solid var(--hair)}
+@media (max-width:760px){.vs{grid-template-columns:minmax(0,1fr)}}
 .toast{position:fixed;right:16px;bottom:16px;z-index:9;background:var(--ink);color:var(--bg);border:2px solid var(--line);box-shadow:4px 4px 0 var(--magenta);padding:10px 14px;max-width:380px;display:none}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
@@ -128,6 +136,8 @@ tr.click{cursor:pointer}tr.click:hover td{background:var(--panel2)}
     <button data-view="swarm" aria-current="page">Swarm <span class="badge" id="nb-agents">0</span></button>
     <button data-view="queue">Queue <span class="badge" id="nb-queue">0</span></button>
     <button data-view="changesets">Changesets <span class="badge" id="nb-cs">0</span></button>
+    <button data-view="agents">Agents <span class="badge" id="nb-agentlist">0</span></button>
+    <button data-view="conflicts">Conflicts <span class="badge" id="nb-rooms">0</span></button>
     <button data-view="quality">Quality</button>
     <button data-view="events">Events</button>
   </nav>
@@ -152,6 +162,16 @@ tr.click{cursor:pointer}tr.click:hover td{background:var(--panel2)}
       <h1>Changesets</h1>
       <p class="lede">Server-written provenance, the explained risk score, the WQS scorecard and the reason each changeset was held, rejected or landed.</p>
       <div class="split"><div class="panel"><div class="ph"><h2>All changesets</h2></div><div class="cslist" id="cslist"></div></div><div id="csdetail"><div class="panel"><div class="empty">Select a changeset.</div></div></div></div>
+    </section>
+    <section class="view" id="v-agents">
+      <h1>Agents</h1>
+      <p class="lede">The agent console: every step an agent took and everything Weft told it, from its start and collision forecast to its verdict, as recorded by the coordinator. Nothing here is simulated.</p>
+      <div class="split"><div class="panel"><div class="ph"><h2>Agents</h2></div><div class="cslist" id="agentlist"></div></div><div id="agentdetail"><div class="panel"><div class="empty">Select an agent.</div></div></div></div>
+    </section>
+    <section class="view" id="v-conflicts">
+      <h1>Conflict rooms</h1>
+      <p class="lede">When the queue rejects a changeset for a conflict, a room opens. Workers AI proposes a resolution, the merge-runner merges it onto current trunk, and the repo's check runs on the merged tree. Only a green proposal is offered to the agent.</p>
+      <div class="split"><div class="panel"><div class="ph"><h2>Rooms</h2></div><div class="cslist" id="roomlist"></div></div><div id="roomdetail"><div class="panel"><div class="empty">No conflict rooms yet.</div></div></div></div>
     </section>
     <section class="view" id="v-quality">
       <h1>Quality</h1>
@@ -196,7 +216,7 @@ const statusPill = (s) => pill(...(STATUS[s] || [s, "s-mut"]));
 const globRe = (g) => new RegExp("^" + g.replace(/[.+^$()|[\]\\]/g, "\\$&").replace(/\*\*\//g, "(?:.*/)?").replace(/\*\*/g, ".*").replace(/(?<!\.)\*/g, "[^/]*") + (/[*?]/.test(g) ? "$" : "(?:/.*)?$"));
 const matches = (p, globs) => globs.some((g) => globRe(g).test(p));
 
-let REPO = "", S = null, LB = null, selected = null, sock = null, pending = null;
+let REPO = "", S = null, LB = null, EV = [], selected = null, selAgent = null, selRoom = null, sock = null, pending = null;
 
 const get = async (path) => {
   const r = await fetch(path, { headers: { accept: "application/json" } });
@@ -209,7 +229,7 @@ const toast = (m) => { const t = $("toast"); t.textContent = m; t.style.display 
 async function load() {
   if (!REPO) return;
   try {
-    [S, LB] = await Promise.all([get(`/v1/repos/${encodeURIComponent(REPO)}/snapshot`), get(`/v1/repos/${encodeURIComponent(REPO)}/leaderboard`)]);
+    [S, LB, EV] = await Promise.all([get(`/v1/repos/${encodeURIComponent(REPO)}/snapshot`), get(`/v1/repos/${encodeURIComponent(REPO)}/leaderboard`), get(`/v1/repos/${encodeURIComponent(REPO)}/events?since=0`)]);
     if (!selected && S.changesets.length) selected = (S.changesets.find((c) => c.status === "landed" && c.scorecard) || S.changesets[0]).id;
     render();
   } catch (err) {
@@ -228,6 +248,9 @@ function connect() {
     if (m.t !== "event") return;
     const e = m.event;
     if (e.type === "workspace.alert") toast(`Collision forecast: ${e.data.agentName} and ${e.data.peerAgent} on ${(e.data.files || []).join(", ")}`);
+    if (e.type === "room.opened") toast(`Conflict room ${e.data.roomId} opened for ${e.data.agentName}`);
+    if (e.type === "room.verified") toast(`Room ${e.data.roomId}: resolution passed the check — offered to ${e.data.agentName}`);
+    if (e.type === "room.failed") toast(`Room ${e.data.roomId}: no green resolution (${e.data.reason})`);
     if (e.type === "queue.batch_landed") toast(`Batch landed ${e.data.landed.length}, rejected ${e.data.rejected.length} (${e.data.checksRun} check runs)`);
     schedule();
   });
@@ -281,6 +304,8 @@ function render() {
 
   $("cslist").innerHTML = cs.map((c) => `<button role="option" aria-selected="${c.id === selected}" data-cs="${esc(c.id)}"><div class="mono"><b>${esc(c.id)}</b> ${statusPill(c.status)} ${typeof c.scorecard?.total === "number" ? pill("WQS " + c.scorecard.total, "s-info") : ""}</div><div>${esc(c.message)}</div><div style="margin-top:4px">${agent(c.provenance.agentName)}</div></button>`).join("") || '<div class="empty">None yet.</div>';
   renderDetail();
+  renderAgents();
+  renderRooms();
   const row = (r) => `<tr><td>${r.key.includes("/") || r.key.startsWith("@") || r.key.includes("-") && !/^[a-z]+$/.test(r.key) ? `<span class="mono">${esc(r.key)}</span>` : agent(r.key)}</td><td class="num"><b>${r.meanWqs ?? "—"}</b></td><td class="num">${r.landed}/${r.submitted}</td><td class="num">${r.firstTryRate}%</td><td class="num">${r.meanIntentAlignment ?? "—"}</td></tr>`;
   $("lbAgent").innerHTML = (LB?.byAgent || []).map(row).join("") || `<tr><td colspan="5" class="empty">No scored changesets yet.</td></tr>`;
   $("lbModel").innerHTML = (LB?.byModel || []).map(row).join("") || `<tr><td colspan="5" class="empty">No scored changesets yet.</td></tr>`;
@@ -305,6 +330,77 @@ function renderDetail() {
       <div class="panel"><div class="ph"><h2>Rubric · judge</h2><span class="meta">Cloudflare CLEF</span></div><div style="padding:6px 0">${judgeRows}</div></div>
     </div>`;
 }
+
+// ---------------------------------------------------------------- agent console
+const ICON = { "workspace.started": "▶", "workspace.lease_refused": "⛔", "workspace.heartbeat": "♥", "workspace.alert": "⚠", "workspace.synced": "⇣", "workspace.conflicted": "⚠", "workspace.intent_widened": "↔", "workspace.abandoned": "✕", "workspace.expired": "⌛", "changeset.submitted": "⇡", "changeset.needs_review": "⚑", "changeset.approved": "✓", "changeset.judged": "⚖", "changeset.landed": "✓", "changeset.rejected": "✕", "changeset.reverted": "↶", "room.opened": "◇", "room.proposed": "✎", "room.verified": "◆", "room.failed": "✕", "room.accepted": "⇡" };
+const fmtEvent = (e) => {
+  const d = e.data || {};
+  switch (e.type) {
+    case "workspace.started": return [`started <b>${esc(d.wsId)}</b>: ${esc(d.task)}`, `intent ${esc((d.globs || []).join(" "))} · ${esc(d.mode)} · forecast <b>${esc(d.forecast)}</b>${d.peers?.length ? " · overlaps " + esc(d.peers.join(", ")) : ""}`];
+    case "workspace.lease_refused": return [`<b>refused</b>: an exclusive lease is held`, esc((d.blocking || []).map((b) => b.agentName + " " + (b.files || []).join(",")).join("; "))];
+    case "workspace.heartbeat": return [`heartbeat: ${d.touched} file(s) touched · forecast <b>${esc(d.forecast)}</b>`, ""];
+    case "workspace.alert": return [`<b>collision forecast</b> with ${esc(d.peerAgent)} (${esc(d.strength)})`, esc((d.files || []).join(", "))];
+    case "workspace.synced": return [`synced with trunk (${esc(d.action)})`, esc(String(d.base || "").slice(0, 10))];
+    case "workspace.conflicted": return [`<b>sync conflict</b>`, esc((d.files || []).join(", "))];
+    case "workspace.intent_widened": return [`widened intent`, esc((d.added || []).join(" "))];
+    case "workspace.abandoned": return [`workspace abandoned`, esc(d.reason || "")];
+    case "workspace.expired": return [`lease expired`, ""];
+    case "changeset.submitted": return [`submitted <b>${esc(d.csId)}</b>: ${esc(d.message)}`, `${d.files} file(s) · risk ${d.risk} · ${esc(d.status)}`];
+    case "changeset.needs_review": return [`<b>${esc(d.csId)}</b> held for a human`, esc(d.reason || "")];
+    case "changeset.approved": return [`<b>${esc(d.csId)}</b> approved by ${esc(e.actor)}`, ""];
+    case "changeset.judged": return [`judged <b>${esc(d.csId)}</b>`, `intent alignment ${d.intentAlignment ?? "—"} · security ${d.securityConcern ?? "—"}${d.hold ? " · HOLD " + esc(d.hold) : ""}`];
+    case "changeset.landed": return [`<b>${esc(d.csId)}</b> landed on trunk`, `${esc(String(d.commit || "").slice(0, 10))} · WQS ${d.wqs ?? "—"}`];
+    case "changeset.rejected": return [`<b>${esc(d.csId)}</b> rejected: ${esc(d.reason)}`, `${(d.conflictsWith || []).length ? "conflicts with " + esc(d.conflictsWith.join(", ")) + " · " : ""}${esc((d.files || []).join(", "))}`];
+    case "changeset.reverted": return [`<b>${esc(d.csId)}</b> reverted`, esc(String(d.revertCommit || "").slice(0, 10))];
+    case "room.opened": return [`conflict room <b>${esc(d.roomId)}</b> opened`, `vs ${esc((d.peers || []).join(", ") || "trunk")} on ${esc((d.files || []).join(", "))}`];
+    case "room.proposed": return [`resolver attempt ${d.attempt}: check ${d.checkPassed === true ? "<b>passed</b>" : d.checkPassed === null ? "n/a" : "<b>failed</b>"}`, esc(d.error || d.rationale || (d.files || []).join(", "))];
+    case "room.verified": return [`room <b>${esc(d.roomId)}</b>: verified resolution ready`, `candidate ${esc(String(d.candidate || "").slice(0, 10))} · weft room accept ${esc(d.roomId)}`];
+    case "room.failed": return [`room <b>${esc(d.roomId)}</b> could not be resolved automatically`, esc(d.reason || "")];
+    case "room.accepted": return [`accepted room <b>${esc(d.roomId)}</b>, resubmitted as <b>${esc(d.resubmittedAs)}</b>`, `Weft-Resolves: ${esc(d.csId)}`];
+    default: return [esc(e.type), esc(JSON.stringify(d).slice(0, 160))];
+  }
+};
+function renderAgents() {
+  const names = [...new Set([...S.workspaces.map((w) => w.agentName), ...EV.map((e) => e.data?.agentName).filter(Boolean)])].sort();
+  $("nb-agentlist").textContent = names.length;
+  if (!selAgent || !names.includes(selAgent)) selAgent = names[0] || null;
+  $("agentlist").innerHTML = names.map((n) => {
+    const w = S.workspaces.filter((x) => x.agentName === n)[0];
+    return `<button role="option" aria-selected="${n === selAgent}" data-agent="${esc(n)}"><div>${agent(n)} ${w ? statusPill(w.status) : ""}</div><div class="mono" style="color:var(--muted);margin-top:3px">${esc(w ? w.task : "")}</div></button>`;
+  }).join("") || '<div class="empty">No agents yet.</div>';
+  if (!selAgent) { $("agentdetail").innerHTML = '<div class="panel"><div class="empty">No agents yet.</div></div>'; return; }
+  const mine = EV.filter((e) => e.data?.agentName === selAgent || (e.data?.peerAgent === selAgent && e.type === "workspace.alert")).slice().reverse();
+  const ws = S.workspaces.filter((x) => x.agentName === selAgent);
+  const w = ws[0];
+  const card = w ? `<div class="panel" style="margin-bottom:16px"><div class="ph"><h2>${esc(w.id)}</h2>${statusPill(w.status)}<span class="meta">${esc(w.model)}</span></div>
+    <dl class="kv" style="margin:0"><div><dt>Task</dt><dd>${esc(w.task)}</dd></div><div><dt>Intent</dt><dd>${esc(w.intent.globs.join(" "))} · ${esc(w.intent.mode)}</dd></div><div><dt>Touched</dt><dd>${esc(w.touched.join(", ") || "—")}</dd></div><div><dt>Changeset</dt><dd>${esc(w.changesetId || "—")}</dd></div><div><dt>Lease until</dt><dd>${esc((w.intent.expiresAt || "").slice(11, 19))}</dd></div></dl></div>` : "";
+  $("agentdetail").innerHTML = `${card}<div class="panel"><div class="ph"><h2>Timeline · ${esc(selAgent)}</h2><span class="meta">${mine.length} events · newest first</span></div><div class="tl">${mine.map((e) => { const [t, sub] = fmtEvent(e); return `<div class="it"><span class="t mono">${esc(e.at.slice(11, 19))}</span><span class="ic" aria-hidden="true">${ICON[e.type] || "·"}</span><div class="tx">${t}${sub ? `<div class="sub">${sub}</div>` : ""}</div></div>`; }).join("") || '<div class="empty">No events yet.</div>'}</div></div>`;
+}
+
+// ---------------------------------------------------------------- conflict rooms
+const ROOM = { open: ["◇ open", "s-info"], proposing: ["✎ proposing", "s-info"], verifying: ["⟳ checking", "s-info"], verified: ["◆ verified", "s-ok"], failed: ["✕ failed", "s-bad"], accepted: ["✓ accepted", "s-ok"] };
+function renderRooms() {
+  const rooms = S.rooms || [];
+  $("nb-rooms").textContent = rooms.filter((r) => !["accepted", "failed"].includes(r.status)).length;
+  if (!selRoom || !rooms.some((r) => r.id === selRoom)) selRoom = rooms[0]?.id || null;
+  $("roomlist").innerHTML = rooms.map((r) => `<button role="option" aria-selected="${r.id === selRoom}" data-room="${esc(r.id)}"><div class="mono"><b>${esc(r.id)}</b> ${pill(...(ROOM[r.status] || [r.status, "s-mut"]))}</div><div>${agent(r.agentName)} <span class="mono" style="color:var(--muted)">vs ${esc(r.peers.map((p) => p.agentName).join(", ") || "trunk")}</span></div><div class="mono" style="color:var(--muted);margin-top:3px">${esc(r.files.join(", "))}</div></button>`).join("") || '<div class="empty">No conflicts so far.</div>';
+  const r = rooms.find((x) => x.id === selRoom);
+  if (!r) { $("roomdetail").innerHTML = '<div class="panel"><div class="empty">No conflict rooms yet.</div></div>'; return; }
+  const peerTxt = r.peers.map((p) => `${agent(p.agentName || "trunk")} <span class="mono">${esc(p.changesetId || "")}</span><div class="sub mono" style="color:var(--muted)">${esc(p.task || "")}</div>`).join("<br>") || "trunk";
+  const attempts = r.attempts.map((a) => `<div class="it"><span class="t mono">#${a.n}</span><span class="ic">${a.checkPassed === true ? "✓" : a.checkPassed === null ? "·" : "✕"}</span><div class="tx">${a.error ? `proposal unusable: ${esc(a.error)}` : `rewrote ${esc(a.files.join(", "))} · check ${a.checkPassed === true ? "<b>passed</b>" : a.checkPassed === null ? "not configured" : "<b>failed</b>"}${a.markersLeft.length ? " · markers left in " + esc(a.markersLeft.join(", ")) : ""}`}<div class="sub">${esc(a.rationale)}${a.candidate ? " · candidate " + esc(a.candidate.slice(0, 10)) : ""} · ${(a.ms / 1000).toFixed(1)} s · ${esc(a.model)}</div></div></div>`).join("") || '<div class="empty">Waiting for the resolver…</div>';
+  const hunks = (r.hunks || []).filter((h) => h.conflicted).map((h) => `<div class="ph"><h2 class="mono" style="text-transform:none">${esc(h.path)}</h2><span class="meta">conflict as the queue saw it</span></div><pre class="code">${esc(h.merged || "")}</pre>`).join("");
+  $("roomdetail").innerHTML = `
+    <div class="panel" style="margin-bottom:16px"><div class="ph"><h2>${esc(r.id)}</h2>${pill(...(ROOM[r.status] || [r.status, "s-mut"]))}<span class="meta">${esc(r.csId)}${r.resubmittedAs ? " → " + esc(r.resubmittedAs) : ""}</span></div>
+      <div class="vs"><div><dt class="mono" style="color:var(--muted)">CHANGE BEING RESOLVED</dt>${agent(r.agentName)} <span class="mono">${esc(r.csId)}</span><div class="sub mono" style="color:var(--muted)">${esc(r.task)} · ${esc(r.intentGlobs.join(" "))}</div></div><div><dt class="mono" style="color:var(--muted)">ALREADY ON TRUNK</dt>${peerTxt}</div></div>
+      ${r.error ? `<div class="note" style="color:var(--bad)">${esc(r.error)}</div>` : ""}
+      ${r.verified ? `<div class="note" style="color:var(--ok)"><b>Verified:</b> merge commit ${esc(r.verified.candidate.slice(0, 10))} on <code>${esc(r.verified.branch)}</code> passed the check on trunk ${esc((r.trunkHead || "").slice(0, 10))}. ${r.status === "accepted" ? "Accepted and resubmitted." : "The agent can run <code>weft room accept " + esc(r.id) + "</code>."}</div>` : ""}</div>
+    <div class="grid g2"><div class="panel"><div class="ph"><h2>Resolver attempts</h2><span class="meta">Workers AI → merge-runner check</span></div><div class="tl">${attempts}</div></div>
+      <div class="panel">${hunks || '<div class="empty">Conflict contents not captured yet.</div>'}</div></div>`;
+}
+document.addEventListener("click", (e) => {
+  const a = e.target.closest("[data-agent]"); if (a) { selAgent = a.dataset.agent; renderAgents(); }
+  const r = e.target.closest("[data-room]"); if (r) { selRoom = r.dataset.room; renderRooms(); }
+});
 
 document.querySelectorAll(".nav button").forEach((b) => (b.onclick = () => show(b.dataset.view)));
 function show(v) {

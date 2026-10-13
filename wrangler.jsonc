@@ -29,7 +29,10 @@
     }
   ],
 
-  "workflows": [{ "name": "weft-merge-queue", "binding": "MERGE_QUEUE", "class_name": "MergeQueue" }],
+  "workflows": [
+    { "name": "weft-merge-queue", "binding": "MERGE_QUEUE", "class_name": "MergeQueue" },
+    { "name": "weft-room-resolver", "binding": "ROOM_RESOLVER", "class_name": "RoomResolver" }
+  ],
 
   "queues": {
     "producers": [{ "binding": "JOBS", "queue": "weft-jobs" }],
@@ -71,7 +74,10 @@
           "instance_type": "basic"
         }
       ],
-      "workflows": [{ "name": "weft-merge-queue-dev", "binding": "MERGE_QUEUE", "class_name": "MergeQueue" }],
+      "workflows": [
+        { "name": "weft-merge-queue-dev", "binding": "MERGE_QUEUE", "class_name": "MergeQueue" },
+        { "name": "weft-room-resolver-dev", "binding": "ROOM_RESOLVER", "class_name": "RoomResolver" }
+      ],
       "queues": {
         "producers": [{ "binding": "JOBS", "queue": "weft-jobs-dev" }],
         "consumers": [

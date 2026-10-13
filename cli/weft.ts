@@ -78,6 +78,9 @@ Read
   weft queue · weft show <cs> · weft scorecard <cs> · weft logs <cs> · weft log [-n N]
   weft who <path> · weft events [--since SEQ] [--follow] · weft leaderboard [--global]
 
+Conflict Rooms (an AI proposal, merged on current trunk and proven by the repo's check)
+  weft room list · weft room show <id> · weft room log <id> · weft room accept <id>
+
 Exit: 0 ok · 2 usage · 3 conflict · 4 lease held · 5 check failed · 6 not found · 7 busy (retry) · 8 bad state
 `;
 
@@ -428,6 +431,29 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
     case "who":
       if (!pos[0]) throw usage("weft who <path>");
       return api("GET", `/v1/repos/${repoOf(f)}/who?path=${encodeURIComponent(pos[0])}`);
+    case "room": {
+      const repo = repoOf(f);
+      const sub = pos[0] ?? "list";
+      if (sub === "list") return api("GET", `/v1/repos/${repo}/rooms`);
+      const id = pos[1];
+      if (!id) throw usage(`weft room ${sub} <room-id>`);
+      if (sub === "show") return api("GET", `/v1/repos/${repo}/rooms/${id}`);
+      if (sub === "log") return api("GET", `/v1/repos/${repo}/rooms/${id}/log`);
+      if (sub === "accept") {
+        const { cwd, w } = loadWs(f);
+        const r = await api<{ branch: string; head: string; base: string; changeset: { id: string } }>("POST", `/v1/repos/${w.repo}/rooms/${id}/accept`, {});
+        // Bring the local checkout to the verified resolution (the server fast-forwarded the fork branch).
+        if (out(["status", "--porcelain"], { cwd }).length > 0) {
+          return { data: { ...r.data, local: "not updated: uncommitted changes" }, hints: ["commit or stash, then `git fetch origin && git reset --hard origin/" + r.data.branch + "`", ...r.hints] };
+        }
+        const fw = await fresh(cwd, w);
+        git(["fetch", "-q", "origin", `+refs/heads/${r.data.branch}:refs/remotes/origin/${r.data.branch}`], { cwd, token: fw.fork.token });
+        git(["reset", "-q", "--hard", r.data.head], { cwd });
+        setBase(cwd, r.data.base);
+        return { data: { ...r.data, local: "updated to the verified resolution" }, hints: r.hints };
+      }
+      throw usage("weft room list | show <id> | log <id> | accept <id>");
+    }
     case "leaderboard":
       return f.global ? api("GET", "/v1/leaderboard") : api("GET", `/v1/repos/${repoOf(f)}/leaderboard`);
     case "events":

@@ -92,6 +92,24 @@ const buildServer = (env: Env, claims: AgentClaims): McpServer => {
     async (a) => envelope("queue", () => repo(a.repo).queue()),
   );
   s.registerTool(
+    "weft_rooms",
+    { description: "Conflict rooms for the repo: each rejected-for-conflict changeset, the resolver's attempts and whether a check-verified resolution is ready.", inputSchema: z.object({ repo: z.string() }) },
+    async (a) => envelope("room list", () => repo(a.repo).rooms()),
+  );
+  s.registerTool(
+    "weft_room_show",
+    { description: "One conflict room: both intents, the conflicted files with markers, every resolver attempt with its check verdict.", inputSchema: z.object({ repo: z.string(), room: z.string() }) },
+    async (a) => envelope("room show", () => repo(a.repo).roomShow(a.room)),
+  );
+  s.registerTool(
+    "weft_room_accept",
+    {
+      description: "Accept a verified resolution: your workspace branch is fast-forwarded to the merge commit that passed the check, and it is resubmitted with Weft-Resolves. Then fetch your fork branch.",
+      inputSchema: z.object({ repo: z.string(), room: z.string() }),
+    },
+    async (a) => envelope("room accept", () => repo(a.repo).roomAccept(a.room, claims), ["git fetch origin && git reset --hard <head> in your checkout"]),
+  );
+  s.registerTool(
     "weft_leaderboard",
     { description: "Quality leaderboard for the repo: mean WQS, land rate and first-try rate by agent and by model.", inputSchema: z.object({ repo: z.string() }) },
     async (a) => envelope("leaderboard", () => repo(a.repo).leaderboard()),

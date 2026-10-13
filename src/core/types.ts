@@ -157,7 +157,12 @@ export type EventType =
   | "queue.speculated"
   | "queue.batch_landed"
   | "queue.requeued"
-  | "queue.trunk_red";
+  | "queue.trunk_red"
+  | "room.opened"
+  | "room.proposed"
+  | "room.verified"
+  | "room.failed"
+  | "room.accepted";
 
 export interface WeftEvent {
   seq: number;
@@ -264,4 +269,61 @@ export interface ErrorEnvelope {
   command: string;
   error: { code: string; message: string; retryable: boolean; hint: string | null; details: Record<string, unknown> };
   requestId?: string;
+}
+
+// ---------------------------------------------------------------- Conflict Rooms (FR-24)
+
+export type RoomStatus = "open" | "proposing" | "verifying" | "verified" | "failed" | "accepted";
+
+/** One conflicted (or related) file as the resolver sees it. Content is capped by the runner. */
+export interface RoomFile {
+  path: string;
+  conflicted: boolean; // false = another file the losing changeset touched (e.g. its tests)
+  base: string | null; // merge base
+  ours: string | null; // current trunk
+  theirs: string | null; // the losing changeset's head
+  merged: string | null; // git merge-file output with conflict markers (conflicted files only)
+  truncated: boolean;
+}
+
+export interface RoomPeer {
+  changesetId: string | null;
+  agentName: string | null;
+  task: string | null;
+  files: string[];
+}
+
+export interface RoomAttempt {
+  n: number;
+  model: string;
+  files: string[]; // paths the proposal rewrote
+  rationale: string;
+  candidate: string | null; // merge commit: parents = trunk head, losing head
+  checkPassed: boolean | null; // null = repo has no check command
+  markersLeft: string[];
+  logKey: string | null;
+  error: string | null;
+  ms: number;
+}
+
+export interface Room {
+  id: string;
+  repo: string;
+  csId: string; // the rejected changeset
+  wsId: string;
+  agentId: string;
+  agentName: string;
+  task: string;
+  intentGlobs: string[];
+  files: string[]; // conflicted files at rejection
+  peers: RoomPeer[];
+  status: RoomStatus;
+  trunkHead: string | null; // trunk the proposal was built on
+  hunks: RoomFile[];
+  attempts: RoomAttempt[];
+  verified: { candidate: string; branch: string; filesTouched: string[]; added: number; deleted: number } | null;
+  resubmittedAs: string | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
 }

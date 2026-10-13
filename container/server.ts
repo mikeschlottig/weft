@@ -374,6 +374,134 @@ const revert = async (body: {
   return { commit };
 };
 
+// ---------------------------------------------------------------- Conflict Rooms (FR-24)
+
+const ROOM_FILE_CAP = 64_000;
+const ROOM_MAX_FILES = 12;
+
+const showFile = async (gitDir: string, rev: string, path: string): Promise<string | null> => {
+  const r = await git(gitDir, ["show", `${rev}:${path}`], { allow: [128] });
+  return r.code === 0 ? r.stdout : null;
+};
+
+const cap = (s: string | null): { text: string | null; truncated: boolean } =>
+  s === null ? { text: null, truncated: false } : s.length > ROOM_FILE_CAP ? { text: s.slice(0, ROOM_FILE_CAP), truncated: true } : { text: s, truncated: false };
+
+interface RoomFork {
+  forkRemote: string;
+  forkToken: string;
+  branch: string;
+  headCommit: string;
+}
+
+/** base/ours/theirs (+ marker view) for each conflicted file, and the losing change's other files. */
+const roomPrepare = async (body: { trunk: TrunkRef; trunkHead: string; fork: RoomFork; unionGlobs: string[] }) => {
+  const gitDir = await repoDir(body.trunk.remote);
+  writeAttributes(gitDir, body.unionGlobs);
+  await fetchTrunk(gitDir, body.trunk, body.trunkHead);
+  await fetchFork(gitDir, { id: "room", ...body.fork });
+  const head = body.fork.headCommit;
+  const base = await out(gitDir, ["merge-base", body.trunkHead, head]);
+  const merged = await mergeTree(gitDir, base, body.trunkHead, head);
+  const conflicted = merged.files;
+  const touched = lines(await out(gitDir, ["diff", "--name-only", base, head]));
+  const related = touched.filter((f) => !conflicted.includes(f));
+  const files = [];
+  for (const path of [...conflicted, ...related].slice(0, ROOM_MAX_FILES)) {
+    const isConflicted = conflicted.includes(path);
+    const b = cap(await showFile(gitDir, base, path));
+    const o = cap(await showFile(gitDir, body.trunkHead, path));
+    const t = cap(await showFile(gitDir, head, path));
+    let m: { text: string | null; truncated: boolean } = { text: null, truncated: false };
+    if (isConflicted) {
+      // The marker view comes from the conflicted merge tree itself (same algorithm the queue used).
+      m = cap(await showFile(gitDir, merged.tree, path));
+    }
+    files.push({ path, conflicted: isConflicted, base: b.text, ours: o.text, theirs: t.text, merged: m.text, truncated: b.truncated || o.truncated || t.truncated || m.truncated });
+  }
+  return { trunkHead: body.trunkHead, base, clean: merged.clean, conflicted, files };
+};
+
+/** Build trunk+candidate as a merge commit, refuse leftover markers, run the check, push on green. */
+const roomVerify = async (body: {
+  trunk: TrunkRef;
+  trunkHead: string;
+  fork: RoomFork & { writeToken: string };
+  roomBranch: string;
+  resolutions: { path: string; content: string }[];
+  message: string;
+  authorName: string;
+  authorEmail: string;
+  claimTime: number;
+  checkCommand: string | null;
+  unionGlobs: string[];
+}) => {
+  const gitDir = await repoDir(body.trunk.remote);
+  writeAttributes(gitDir, body.unionGlobs);
+  await fetchTrunk(gitDir, body.trunk, body.trunkHead);
+  await fetchFork(gitDir, { id: "room", ...body.fork });
+  const head = body.fork.headCommit;
+  const base = await out(gitDir, ["merge-base", body.trunkHead, head]);
+  const merged = await mergeTree(gitDir, base, body.trunkHead, head);
+  const tmp = mkdtempSync(join(tmpdir(), "weft-room-"));
+  try {
+    const env = { GIT_INDEX_FILE: join(tmp, "index") };
+    await git(gitDir, ["read-tree", merged.tree], { env });
+    for (const r of body.resolutions) {
+      const blob = await out(gitDir, ["hash-object", "-w", "--stdin"], { input: r.content });
+      await git(gitDir, ["update-index", "--add", "--cacheinfo", `100644,${blob},${r.path}`], { env });
+    }
+    const tree = await out(gitDir, ["write-tree"], { env });
+    const markersLeft: string[] = [];
+    for (const path of merged.files) {
+      const text = (await showFile(gitDir, tree, path)) ?? "";
+      if (/^(<<<<<<<|>>>>>>>)( |$)/m.test(text) || /^=======$/m.test(text)) markersLeft.push(path);
+    }
+    const candidate = await out(gitDir, ["commit-tree", tree, "-p", body.trunkHead, "-p", head, "-F", "-"], {
+      input: body.message,
+      env: commitEnv(body.claimTime, body.authorName, body.authorEmail),
+    });
+    if (markersLeft.length > 0) return { candidate, tree, markersLeft, checkPassed: false, log: `conflict markers remain in: ${markersLeft.join(", ")}\n`, pushed: false, filesTouched: [], added: 0, deleted: 0 };
+    let checkPassed: boolean | null = null;
+    let log = "";
+    if (body.checkCommand) {
+      const res = await runCheck(gitDir, candidate, body.checkCommand);
+      checkPassed = res.pass;
+      log = res.text;
+    }
+    const filesTouched = lines(await out(gitDir, ["diff", "--name-only", body.trunkHead, candidate]));
+    let added = 0;
+    let deleted = 0;
+    for (const row of lines(await out(gitDir, ["diff", "--numstat", body.trunkHead, candidate]))) {
+      const [a = "0", d = "0"] = row.split("\t");
+      added += Number.isNaN(Number(a)) ? 0 : Number(a);
+      deleted += Number.isNaN(Number(d)) ? 0 : Number(d);
+    }
+    let pushed = false;
+    if (checkPassed !== false) {
+      await git(gitDir, ["push", "-q", "-f", body.fork.forkRemote, `${candidate}:refs/heads/${body.roomBranch}`], { token: body.fork.writeToken });
+      pushed = true;
+    }
+    return { candidate, tree, markersLeft, checkPassed, log, pushed, filesTouched, added, deleted };
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+};
+
+/** Move a fork branch from `expected` to `to` (lease-protected), e.g. accepting a verified room proposal. */
+const fastForward = async (body: { trunk: TrunkRef; fork: { forkRemote: string; writeToken: string; readToken: string; branch: string }; expected: string; to: string; toRef: string }) => {
+  const gitDir = await repoDir(body.trunk.remote);
+  if (!(await hasObject(gitDir, body.to))) {
+    await git(gitDir, ["fetch", "-q", body.fork.forkRemote, `+refs/heads/${body.toRef}:refs/weft/room/${body.to.slice(0, 12)}`], { token: body.fork.readToken });
+  }
+  const r = await git(gitDir, ["push", "--porcelain", body.fork.forkRemote, `${body.to}:refs/heads/${body.fork.branch}`, `--force-with-lease=${body.fork.branch}:${body.expected}`], {
+    token: body.fork.writeToken,
+    allow: [1],
+  });
+  if (r.code !== 0) throw new RunnerError("BRANCH_MOVED", `workspace branch moved since the proposal: ${redact(r.stderr || r.stdout).slice(0, 300)}`, 409, false);
+  return { branch: body.fork.branch, head: body.to };
+};
+
 // ---------------------------------------------------------------- http
 
 const readJson = (req: IncomingMessage): Promise<unknown> =>
@@ -420,6 +548,9 @@ createServer((req, res) => {
     "/speculate": speculate as (b: never) => Promise<unknown>,
     "/push": push as (b: never) => Promise<unknown>,
     "/revert": revert as (b: never) => Promise<unknown>,
+    "/room-prepare": roomPrepare as (b: never) => Promise<unknown>,
+    "/room-verify": roomVerify as (b: never) => Promise<unknown>,
+    "/fast-forward": fastForward as (b: never) => Promise<unknown>,
   };
   const handler = req.method === "POST" ? routes[url.pathname] : undefined;
   if (!handler) {
