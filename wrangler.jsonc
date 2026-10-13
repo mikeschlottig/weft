@@ -31,8 +31,13 @@
 
   "workflows": [
     { "name": "weft-merge-queue", "binding": "MERGE_QUEUE", "class_name": "MergeQueue" },
-    { "name": "weft-room-resolver", "binding": "ROOM_RESOLVER", "class_name": "RoomResolver" }
+    { "name": "weft-room-resolver", "binding": "ROOM_RESOLVER", "class_name": "RoomResolver" },
+    { "name": "weft-push-observer", "binding": "PUSH_OBSERVER", "class_name": "PushObserver" }
   ],
+  // FR-05: every push to any repo in the namespace starts a PushObserver (no per-fork subscriptions).
+  "triggers": {
+    "events": [{ "type": "cf.artifacts.repo.pushed", "filter": { "namespace": "weft" }, "targets": [{ "type": "workflow", "workflow_name": "weft-push-observer" }] }]
+  },
 
   "queues": {
     "producers": [{ "binding": "JOBS", "queue": "weft-jobs" }],
@@ -76,8 +81,12 @@
       ],
       "workflows": [
         { "name": "weft-merge-queue-dev", "binding": "MERGE_QUEUE", "class_name": "MergeQueue" },
-        { "name": "weft-room-resolver-dev", "binding": "ROOM_RESOLVER", "class_name": "RoomResolver" }
+        { "name": "weft-room-resolver-dev", "binding": "ROOM_RESOLVER", "class_name": "RoomResolver" },
+        { "name": "weft-push-observer-dev", "binding": "PUSH_OBSERVER", "class_name": "PushObserver" }
       ],
+      "triggers": {
+        "events": [{ "type": "cf.artifacts.repo.pushed", "filter": { "namespace": "weft-dev" }, "targets": [{ "type": "workflow", "workflow_name": "weft-push-observer-dev" }] }]
+      },
       "queues": {
         "producers": [{ "binding": "JOBS", "queue": "weft-jobs-dev" }],
         "consumers": [

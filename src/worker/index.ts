@@ -12,6 +12,7 @@ import { handleMcp } from "./mcp.ts";
 export { RepoCoordinator } from "./coordinator.ts";
 export { MergeQueue } from "./merge-queue.ts";
 export { RoomResolver } from "./room-resolver.ts";
+export { PushObserver } from "./push-observer.ts";
 export { MergeRunner } from "./runner-client.ts";
 
 type Handler = (ctx: Ctx) => Promise<{ data: unknown; hints?: string[] }>;

@@ -113,6 +113,57 @@ export const trunkLog = (env: Env, name: string, limit: number): Promise<Artifac
     return r.log({ ref: "main", limit });
   });
 
+/**
+ * Paths that differ between two commits of one repo (spec §8.4): walk both root trees together and
+ * descend only into entries whose hashes differ. Capped; used for push-derived heartbeats.
+ */
+export const changedPaths = (env: Env, name: string, from: string, to: string, cap = 2_000): Promise<string[]> =>
+  call(`diff ${name} ${from.slice(0, 8)}..${to.slice(0, 8)}`, async () => {
+    using r = await env.ARTIFACTS.get(name);
+    const a = await r.readCommit(from);
+    const b = await r.readCommit(to);
+    if (!b) return [];
+    const out: string[] = [];
+    type Entry = { name: string; hash: string; type: string };
+    const entries = async (hash: string | null): Promise<Map<string, Entry>> => {
+      if (!hash) return new Map();
+      const list = ((await r.readTree(hash)) ?? []) as Entry[];
+      return new Map(list.map((e) => [e.name, e]));
+    };
+    const all = async (hash: string, prefix: string): Promise<void> => {
+      for (const e of (await entries(hash)).values()) {
+        if (out.length >= cap) return;
+        if (e.type === "tree") await all(e.hash, `${prefix}${e.name}/`);
+        else if (e.type !== "gitlink") out.push(`${prefix}${e.name}`);
+      }
+    };
+    const walk = async (ha: string | null, hb: string | null, prefix: string): Promise<void> => {
+      if (ha === hb || out.length >= cap) return;
+      const ea = await entries(ha);
+      const eb = await entries(hb);
+      for (const n of new Set([...ea.keys(), ...eb.keys()])) {
+        if (out.length >= cap) return;
+        const x = ea.get(n);
+        const y = eb.get(n);
+        if (x && y && x.hash === y.hash) continue;
+        const path = `${prefix}${n}`;
+        const xt = x?.type === "tree";
+        const yt = y?.type === "tree";
+        if (xt || yt) {
+          if (xt && yt) await walk(x?.hash ?? null, y?.hash ?? null, `${path}/`);
+          else {
+            if (xt && x) await all(x.hash, `${path}/`);
+            if (yt && y) await all(y.hash, `${path}/`);
+            if (!xt && x && x.type !== "gitlink") out.push(path);
+            if (!yt && y && y.type !== "gitlink") out.push(path);
+          }
+        } else out.push(path);
+      }
+    };
+    await walk(a?.treeHash ?? null, b.treeHash, "");
+    return [...new Set(out)].sort();
+  });
+
 /** Recursive tree walk of a commit, descending only where needed; capped for forecast use. */
 export const listFiles = (env: Env, name: string, commit: string, cap = 5_000): Promise<string[]> =>
   call(`tree ${name}@${commit.slice(0, 8)}`, async () => {

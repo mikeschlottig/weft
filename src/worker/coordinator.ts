@@ -35,7 +35,7 @@ import type {
   WeftEvent,
   Workspace,
 } from "../core/types.ts";
-import { createTrunk, forkName, headOf, headerToken, listFiles, mintToken, provisionFork, repoInfo, revokeToken } from "./artifacts.ts";
+import { changedPaths, createTrunk, forkName, headOf, headerToken, listFiles, mintToken, provisionFork, repoInfo, revokeToken } from "./artifacts.ts";
 import { runner } from "./runner-client.ts";
 
 export const DEFAULT_CONFIG: RepoConfig = {
@@ -484,7 +484,31 @@ export class RepoCoordinator extends DurableObject<Env> {
   }
 
   heartbeat(input: { wsId: string; agent: AgentClaims; touched: string[]; symbols?: Record<string, string[]> }) {
+    return this.guard(() => this.heartbeatCore({ ...input, source: "cli" }));
+  }
+
+  /**
+   * FR-05 (M1 half): a push to a workspace fork observed by the PushObserver Workflow (Artifacts
+   * `cf.artifacts.repo.pushed` trigger on the namespace). Changed paths come from a tree diff, so an
+   * agent's collisions are detected even if it never calls `weft status`.
+   */
+  pushObserved(input: { forkRepo: string; ref: string; after: string }) {
     return this.guard(async () => {
+      const w = this.liveWs().find((x) => x.forkRepo === input.forkRepo);
+      if (!w) return { ignored: "no live workspace for this fork" };
+      if (input.ref !== `refs/heads/${w.branch}`) return { ignored: `not the workspace branch (${input.ref})` };
+      if (w.status !== "active" && w.status !== "conflicted") return { ignored: `workspace is ${w.status}` };
+      const changed = await changedPaths(this.env, w.forkRepo, w.baseCommit, input.after);
+      const fresh = this.ws(w.id);
+      const agent: AgentClaims = { sub: fresh.agentId, name: fresh.agentName, model: fresh.model, role: "agent", iat: 0, exp: 0 };
+      const touched = [...new Set([...fresh.touched, ...changed])];
+      const res = await this.heartbeatCore({ wsId: fresh.id, agent, touched, symbols: fresh.touchedSymbols, source: "push", head: input.after });
+      return { observed: true, wsId: fresh.id, changed: changed.length, forecast: res.forecast.risk };
+    });
+  }
+
+  private async heartbeatCore(input: { wsId: string; agent: AgentClaims; touched: string[]; symbols?: Record<string, string[]>; source: "cli" | "push"; head?: string }) {
+    {
       const m0 = this.meta();
       const tf = await this.trunkFiles(m0);
       const m = this.meta();
@@ -502,7 +526,7 @@ export class RepoCoordinator extends DurableObject<Env> {
       const fresh = keys.filter((k) => !w.alertKeys.includes(k));
       w.alertKeys = keys;
       this.putWs(w);
-      if (workable) this.emit(m, "workspace.heartbeat", w.agentId, { wsId: w.id, agentName: w.agentName, touched: w.touched.length, symbols: Object.values(w.touchedSymbols ?? {}).reduce((n, xs) => n + xs.length, 0), forecast: fc.risk });
+      if (workable) this.emit(m, "workspace.heartbeat", w.agentId, { wsId: w.id, agentName: w.agentName, touched: w.touched.length, symbols: Object.values(w.touchedSymbols ?? {}).reduce((n, xs) => n + xs.length, 0), forecast: fc.risk, source: input.source, ...(input.head ? { head: input.head } : {}) });
       for (const o of fc.overlaps.filter(isRealOverlap)) {
         if (!fresh.some((k) => k.startsWith(`${o.workspaceId}:`))) continue;
         this.emit(
@@ -524,7 +548,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         trunkHead: tf.head,
         changeset: c ? { id: c.id, status: c.status, riskScore: c.riskScore, rejection: c.rejection, scorecard: c.scorecard } : null,
       };
-    });
+    }
   }
 
   widen(input: { wsId: string; agent: AgentClaims; globs: string[] }) {

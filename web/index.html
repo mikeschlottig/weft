@@ -338,7 +338,7 @@ const fmtEvent = (e) => {
   switch (e.type) {
     case "workspace.started": return [`started <b>${esc(d.wsId)}</b>: ${esc(d.task)}`, `intent ${esc((d.globs || []).join(" "))} · ${esc(d.mode)} · forecast <b>${esc(d.forecast)}</b>${d.peers?.length ? " · overlaps " + esc(d.peers.join(", ")) : ""}`];
     case "workspace.lease_refused": return [`<b>refused</b>: an exclusive lease is held`, esc((d.blocking || []).map((b) => b.agentName + " " + (b.files || []).join(",")).join("; "))];
-    case "workspace.heartbeat": return [`heartbeat: ${d.touched} file(s)${d.symbols ? `, ${d.symbols} symbol(s)` : ""} touched · forecast <b>${esc(d.forecast)}</b>`, ""];
+    case "workspace.heartbeat": return [`${d.source === "push" ? "<b>git push observed</b>" : "heartbeat"}: ${d.touched} file(s)${d.symbols ? `, ${d.symbols} symbol(s)` : ""} touched · forecast <b>${esc(d.forecast)}</b>`, d.source === "push" ? `fork head ${esc(String(d.head || "").slice(0, 10))} · no weft command needed` : ""];
     case "workspace.alert": return [`<b>collision forecast</b> with ${esc(d.peerAgent)} (${esc(d.strength)})`, esc((d.symbols && d.symbols.length ? d.symbols : d.files || []).join(", "))];
     case "workspace.synced": return [`synced with trunk (${esc(d.action)})`, esc(String(d.base || "").slice(0, 10))];
     case "workspace.conflicted": return [`<b>sync conflict</b>`, esc((d.files || []).join(", "))];
