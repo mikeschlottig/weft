@@ -15,7 +15,7 @@ import { classifyFiles, scanAddedLines } from "../src/core/rubric.ts";
 import type { BatchMember, ConflictPeer, DiffStats, Rejection, SpeculationResult } from "../src/core/types.ts";
 
 const PORT = Number(process.env.PORT ?? 8080);
-const ROOT = "/srv/repos";
+const ROOT = process.env.WEFT_RUNNER_ROOT ?? "/srv/repos";
 const GIT_TIMEOUT_MS = 600_000;
 const CHECK_TIMEOUT_MS = 600_000;
 const DIFF_BUDGET = 48_000;
@@ -280,10 +280,15 @@ const speculate = async (body: SpecInput): Promise<SpeculationResult> => {
     });
   }
 
-  const rejected: SpeculationResult["rejected"] = [];
+  let rejected: SpeculationResult["rejected"] = [];
+  const readmitted: string[] = [];
   const checkPassed: Record<string, boolean> = {};
   let candidates: BatchMember[] = [...body.members];
   let bisectSteps = 0;
+  const culprits = new Set<string>();
+  // FR-28: a changeset rejected only because it conflicted with changesets that were later thrown out as
+  // check culprits is re-admitted to the next round (it never conflicted with anything that will land).
+  const conflictOnly = new Map<string, { m: BatchMember; peerIds: string[] }>();
   for (;;) {
     const chain = await buildChain(gitDir, body.trunkHead, candidates, body.claimTime);
     for (const c of chain.conflicts) {
@@ -295,14 +300,16 @@ const speculate = async (body: SpecInput): Promise<SpeculationResult> => {
         logKey: null,
       };
       rejected.push({ id: c.m.id, rejection });
+      const peerIds = c.peers.map((p) => p.changesetId).filter((x): x is string => x !== null);
+      if (peerIds.length > 0) conflictOnly.set(c.m.id, { m: c.m, peerIds });
     }
     candidates = chain.applied.map((a) => a.m);
     const last = chain.applied[chain.applied.length - 1];
-    if (!last) return { tip: body.trunkHead, applied: [], rejected, checkPassed, checksRun, bisectSteps, logs };
+    if (!last) return { tip: body.trunkHead, applied: [], rejected, checkPassed, checksRun, bisectSteps, logs, readmitted };
     const tipOutcome = await check(last.commit, last.tree);
     if (tipOutcome.pass) {
       for (const a of chain.applied) checkPassed[a.m.id] = true;
-      return { tip: chain.tip, applied: chain.applied.map((a) => ({ id: a.m.id, commit: a.commit, tree: a.tree })), rejected, checkPassed, checksRun, bisectSteps, logs };
+      return { tip: chain.tip, applied: chain.applied.map((a) => ({ id: a.m.id, commit: a.commit, tree: a.tree })), rejected, checkPassed, checksRun, bisectSteps, logs, readmitted };
     }
     let lo = 1;
     let hi = chain.applied.length;
@@ -329,6 +336,17 @@ const speculate = async (body: SpecInput): Promise<SpeculationResult> => {
       },
     });
     candidates = candidates.filter((c) => c.id !== culprit.m.id);
+    culprits.add(culprit.m.id);
+    const readmit = [...conflictOnly.values()].filter((x) => x.peerIds.every((p) => culprits.has(p)));
+    if (readmit.length > 0) {
+      const ids = new Set(readmit.map((x) => x.m.id));
+      rejected = rejected.filter((r) => !ids.has(r.id));
+      for (const id of ids) conflictOnly.delete(id);
+      // Keep the original queue order.
+      const keep = new Set([...candidates.map((c) => c.id), ...ids]);
+      candidates = body.members.filter((m) => keep.has(m.id));
+      readmitted.push(...ids);
+    }
   }
 };
 

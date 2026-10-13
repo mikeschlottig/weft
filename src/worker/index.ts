@@ -2,6 +2,7 @@
 // RepoCoordinator DO; git data never flows through here (agents talk to Artifacts directly).
 
 import { WeftError, decodeFromRpc, usage } from "../core/errors.ts";
+import { type ContextPack, contextMarkdown } from "../core/context.ts";
 import { signJwt } from "../core/jwt.ts";
 import type { AgentClaims, Envelope, ErrorEnvelope, IntentMode, RepoConfig } from "../core/types.ts";
 import { trunkLog } from "./artifacts.ts";
@@ -207,6 +208,18 @@ route("GET", "/v1/repos/:repo/log", "log", "read", async (c) => {
       return { commit: e.hash, author: e.author.name, at: new Date(e.authoredAt * 1000).toISOString(), subject: e.message.split("\n")[0] ?? "", changeset: t["Weft-Changeset"] ?? null, model: t["Weft-Model"] ?? null, risk: t["Weft-Risk"] ? Number(t["Weft-Risk"]) : null, trailers: t };
     }),
   };
+});
+
+// ---- context preservation: context packs + resume (FR-16)
+route("GET", "/v1/repos/:repo/workspaces/:ws/context", "context", "agent", async (c) => {
+  const budget = Math.min(32_000, Math.max(800, Number(c.url.searchParams.get("budget") ?? "6000")));
+  const pack = (await coord(c.env, c.params.repo ?? "").contextPack(c.params.ws ?? "", claimsOf(c), budget)) as unknown as ContextPack;
+  const markdown = contextMarkdown(pack, c.params.repo ?? "");
+  return { data: c.url.searchParams.get("format") === "md" ? { markdown } : { ...pack, markdown }, hints: pack.next };
+});
+route("POST", "/v1/repos/:repo/workspaces/:ws/resume", "resume", "agent", async (c) => {
+  const res = await coord(c.env, c.params.repo ?? "").resume(c.params.ws ?? "", claimsOf(c));
+  return { data: res, hints: ["weft context  # what happened while you were away", "weft status"] };
 });
 
 // ---- Conflict Rooms (FR-24)

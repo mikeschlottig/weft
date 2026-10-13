@@ -114,10 +114,10 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
             await this.env.BLOBS.put(key, l.text, { httpMetadata: { contentType: "text/plain; charset=utf-8" } });
             for (const rej of r.rejected) if (rej.rejection.logKey === `commit:${l.commit}`) logKeys[rej.id] = key;
           }
-          return { trunkRed: null as string | null, tip: r.tip, applied: r.applied, rejected: r.rejected, checkPassed: r.checkPassed, checksRun: r.checksRun, bisectSteps: r.bisectSteps, logKeys };
+          return { trunkRed: null as string | null, tip: r.tip, applied: r.applied, rejected: r.rejected, checkPassed: r.checkPassed, checksRun: r.checksRun, bisectSteps: r.bisectSteps, logKeys, readmitted: r.readmitted ?? [] };
         } catch (err: unknown) {
           if (err instanceof WeftError && err.code === "TRUNK_RED") {
-            return { trunkRed: String(err.details.log ?? err.message), tip: claim.trunkHead, applied: [], rejected: [] as { id: string; rejection: Rejection }[], checkPassed: {}, checksRun: 1, bisectSteps: 0, logKeys: {} };
+            return { trunkRed: String(err.details.log ?? err.message), tip: claim.trunkHead, applied: [], rejected: [] as { id: string; rejection: Rejection }[], checkPassed: {}, checksRun: 1, bisectSteps: 0, logKeys: {}, readmitted: [] as string[] };
           }
           throw err;
         }
@@ -164,6 +164,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
             checksRun: spec.checksRun,
             bisectSteps: spec.bisectSteps,
             logKeys: spec.logKeys,
+            readmitted: spec.readmitted,
           }),
         ),
       );

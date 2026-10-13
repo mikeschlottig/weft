@@ -162,7 +162,8 @@ export type EventType =
   | "room.proposed"
   | "room.verified"
   | "room.failed"
-  | "room.accepted";
+  | "room.accepted"
+  | "workspace.resumed";
 
 export interface WeftEvent {
   seq: number;
@@ -255,6 +256,7 @@ export interface SpeculationResult {
   checksRun: number;
   bisectSteps: number;
   logs: { commit: string; text: string }[];
+  readmitted?: string[]; // FR-28: conflict-rejected, then re-admitted after their only peers were culprits
 }
 
 export interface Envelope<T> {

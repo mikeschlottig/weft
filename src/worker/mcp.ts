@@ -5,6 +5,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
+import { type ContextPack, contextMarkdown } from "../core/context.ts";
 import { decodeFromRpc } from "../core/errors.ts";
 import type { AgentClaims } from "../core/types.ts";
 
@@ -90,6 +91,19 @@ const buildServer = (env: Env, claims: AgentClaims): McpServer => {
     "weft_queue",
     { description: "The merge queue: needs-review, queued and validating changesets.", inputSchema: z.object({ repo: z.string() }) },
     async (a) => envelope("queue", () => repo(a.repo).queue()),
+  );
+  s.registerTool(
+    "weft_context",
+    {
+      description: "Your context pack as prompt-ready Markdown: task, intent, collision forecast, nearby agents, your earlier rejections + advice, recent landings in your scope, house rules, next steps. Read it at the start of every session.",
+      inputSchema: z.object({ repo: z.string(), workspace: z.string(), budgetTokens: z.number().int().min(800).max(32000).optional() }),
+    },
+    async (a) => envelope("context", async () => ({ markdown: contextMarkdown((await repo(a.repo).contextPack(a.workspace, claims, a.budgetTokens ?? 6000)) as unknown as ContextPack, a.repo) })),
+  );
+  s.registerTool(
+    "weft_resume",
+    { description: "Resume your workspace after a crash or an expired lease: re-acquires the intent if free, re-forecasts, returns fresh fork/trunk tokens.", inputSchema: z.object({ repo: z.string(), workspace: z.string() }) },
+    async (a) => envelope("resume", () => repo(a.repo).resume(a.workspace, claims)),
   );
   s.registerTool(
     "weft_rooms",

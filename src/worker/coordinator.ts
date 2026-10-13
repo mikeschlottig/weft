@@ -829,6 +829,7 @@ export class RepoCoordinator extends DurableObject<Env> {
     checksRun: number;
     bisectSteps: number;
     logKeys: Record<string, string>;
+    readmitted?: string[];
   }) {
     return this.guard(async () => {
       const m = this.meta();
@@ -904,6 +905,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         rejected: input.rejected.map((r) => r.id),
         checksRun: input.checksRun,
         bisectSteps: input.bisectSteps,
+        readmitted: input.readmitted ?? [],
         trunkHead: input.trunkAfter ?? b.claim.trunkHead,
       });
       this.saveMeta(m);
@@ -998,6 +1000,126 @@ export class RepoCoordinator extends DurableObject<Env> {
       this.saveMeta(m);
       this.project({ kind: "outcome", repo: m.repo, csId, outcome: "reverted" });
       return { csId, revertCommit: res.commit };
+    });
+  }
+
+  // ------------------------------------------------------------ context preservation (context packs, FR-16 resume)
+
+  /**
+   * A token-budgeted context pack for one workspace: what the agent is doing, what it may touch, who else is
+   * near it, what recently landed in its scope, what went wrong before, and the house rules. It is meant to be
+   * pasted into an agent's prompt at the start of every session, so work survives a crash or a new model.
+   */
+  contextPack(wsId: string, agent: AgentClaims, budgetTokens = 6000) {
+    return this.guard(async () => {
+      const m0 = this.meta();
+      const tf = await this.trunkFiles(m0);
+      const m = this.meta();
+      const w = this.own(wsId, agent);
+      const nowMs = Date.now();
+      const scope = tf.files.filter((f) => matches(f, w.intent.globs));
+      const others = this.liveWs().filter((o) => o.id !== w.id);
+      const fc = forecast(others, { wsId: w.id, globs: w.intent.globs, touched: w.touched }, tf.files, m.config, nowMs);
+      const peers = fc.overlaps.map((o) => {
+        const pw = others.find((x) => x.id === o.workspaceId);
+        return { agent: o.agentName, workspace: o.workspaceId, task: o.task, mode: o.mode, strength: o.strength, files: o.files, theirIntent: pw?.intent.globs ?? o.globs, theirTouched: pw?.touched ?? [] };
+      });
+      const inScope = (files: string[]) => files.filter((f) => scope.includes(f) || matches(f, w.intent.globs));
+      const landed = this.csByStatus("landed", 2000)
+        .filter((c) => inScope(c.provenance.filesTouched).length > 0)
+        .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+        .slice(0, 12)
+        .map((c) => ({ changeset: c.id, agent: c.provenance.agentName, model: c.provenance.model, message: c.message, commit: c.landedCommit, files: inScope(c.provenance.filesTouched), wqs: c.scorecard?.total ?? null, landedAt: c.updatedAt, afterMyBase: Date.parse(c.updatedAt) > Date.parse(w.createdAt) }));
+      const mine = this.allCs(2000).filter((c) => c.wsId === w.id);
+      const history = mine.map((c) => ({ changeset: c.id, status: c.status, message: c.message, rejection: c.rejection ? { reason: c.rejection.reason, files: c.rejection.files, conflictsWith: c.rejection.conflictsWith.map((p) => `${p.changesetId} (${p.agentName})`) } : null, wqs: c.scorecard?.total ?? null, advice: c.scorecard?.advice ?? [] }));
+      const rooms = this.allRooms(200).filter((r) => r.wsId === w.id).map((r) => ({ room: r.id, status: r.status, changeset: r.csId, files: r.files, verified: r.verified?.candidate ?? null }));
+      const recent = this.sql
+        .exec<{ seq: number; at: number; type: string; data: string }>(`SELECT seq, at, type, data FROM events ORDER BY seq DESC LIMIT 400`)
+        .toArray()
+        .map((r) => ({ seq: r.seq, at: new Date(r.at).toISOString(), type: r.type, data: JSON.parse(r.data) as Record<string, unknown> }))
+        .filter((e) => e.data.wsId === w.id || e.data.peerWs === w.id)
+        .slice(0, 20)
+        .map((e) => ({ at: e.at, type: e.type, csId: e.data.csId ?? null, detail: e.data.reason ?? e.data.forecast ?? e.data.message ?? null }));
+      const conventions = {
+        checkCommand: m.config.checkCommand,
+        unionMergedFiles: m.config.unionGlobs,
+        sensitivePaths: m.config.sensitiveGlobs,
+        sensitiveInMyScope: scope.filter((f) => matches(f, m.config.sensitiveGlobs)),
+        reviewThreshold: m.config.reviewThreshold,
+        rubric: "wqs-1: check on merged tree 25 · tests with source 10 · stay in intent 5 · ≤400 lines 5 · no secrets 5 · judge 40 · first try + fresh base 10",
+      };
+      const expired = Date.parse(w.intent.expiresAt) <= nowMs;
+      const next: string[] = [];
+      if (expired) next.push("weft resume  # your lease expired; re-acquire the intent");
+      if (rooms.some((r) => r.status === "verified")) next.push(`weft room accept ${rooms.find((r) => r.status === "verified")?.room ?? ""}`);
+      if (landed.some((l) => l.afterMyBase)) next.push("weft sync  # trunk changed files in your scope since you started");
+      if (peers.some((p) => p.strength === "touched")) next.push("coordinate: another agent already edited the same files");
+      if (w.status === "active") next.push("weft status · weft checkpoint · weft submit -m \"...\"");
+
+      // Budget: drop the least important detail first until the pack fits (≈ 4 chars per token).
+      const pack = {
+        workspace: { id: w.id, status: w.status, task: w.task, intent: w.intent.globs, mode: w.intent.mode, leaseExpiresAt: w.intent.expiresAt, expired, base: w.baseCommit, trunkHead: tf.head, touched: w.touched, outOfIntent: outOfIntent(w.touched, w.intent.globs, m.config.unionGlobs), changeset: w.changesetId },
+        forecast: { risk: fc.risk, advice: fc.advice },
+        peers,
+        rooms,
+        history,
+        recentLandingsInScope: landed,
+        scopeFiles: scope.slice(0, 400),
+        conventions,
+        recentEvents: recent,
+        next,
+        budget: { tokens: budgetTokens, trimmed: [] as string[] },
+      };
+      const size = () => Math.ceil(JSON.stringify(pack).length / 4);
+      const trims: [string, () => void][] = [
+        ["recentEvents", () => (pack.recentEvents = pack.recentEvents.slice(0, 5))],
+        ["scopeFiles", () => (pack.scopeFiles = pack.scopeFiles.slice(0, 40))],
+        ["recentLandingsInScope", () => (pack.recentLandingsInScope = pack.recentLandingsInScope.slice(0, 4))],
+        ["history", () => (pack.history = pack.history.slice(-3))],
+        ["scopeFiles", () => (pack.scopeFiles = [])],
+        ["recentEvents", () => (pack.recentEvents = [])],
+      ];
+      for (const [name, trim] of trims) {
+        if (size() <= budgetTokens) break;
+        trim();
+        pack.budget.trimmed.push(name);
+      }
+      return { ...pack, budget: { ...pack.budget, used: size() } };
+    });
+  }
+
+  /** FR-16: re-acquire an expired workspace's intent if the scope is free, re-forecast, renew the lease. */
+  resume(wsId: string, agent: AgentClaims) {
+    return this.guard(async () => {
+      const m0 = this.meta();
+      const tf = await this.trunkFiles(m0);
+      const m = this.meta();
+      const w = this.own(wsId, agent);
+      if (w.status !== "active" && w.status !== "conflicted") throw invalidState(`workspace ${w.id} is ${w.status}; only an active or conflicted workspace can be resumed`, w.status === "submitted" ? `weft show ${w.changesetId ?? ""}` : "weft start  # begin a new workspace");
+      const others = this.liveWs().filter((o) => o.id !== w.id);
+      const fc = forecast(others, { wsId: w.id, globs: w.intent.globs, touched: w.touched }, tf.files, m.config, Date.now());
+      const blocking = blockingOverlaps(fc, w.intent.mode);
+      if (blocking.length > 0) {
+        throw new WeftError("LEASE_HELD", "another agent holds an exclusive intent over your scope", { retryable: true, hint: "wait for it to land, or narrow your scope with a new workspace", details: { blocking } });
+      }
+      const wasExpired = Date.parse(w.intent.expiresAt) <= Date.now();
+      w.intent.expiresAt = plusSeconds(m.config.leaseTtlSeconds);
+      w.expiredNotified = false;
+      this.putWs(w);
+      this.emit(m, "workspace.resumed", agent.sub, { wsId: w.id, agentName: w.agentName, wasExpired, forecast: fc.risk, peers: fc.overlaps.map((o) => o.agentName) }, fc.overlaps.map((o) => `agent:${o.agentId}`));
+      this.saveMeta(m);
+      const forkTok = await mintToken(this.env, w.forkRepo, "write", FORK_TOKEN_TTL);
+      const trunkTok = await mintToken(this.env, m.repo, "read", TRUNK_READ_TTL);
+      const fresh = this.ws(w.id);
+      fresh.forkTokenId = forkTok.id;
+      this.putWs(fresh);
+      return {
+        workspace: this.publicWs(fresh),
+        wasExpired,
+        forecast: fc,
+        fork: { remote: fresh.forkRemote, token: headerToken(forkTok.plaintext), expiresAt: forkTok.expiresAt },
+        trunk: { remote: m.trunkRemote, token: headerToken(trunkTok.plaintext), expiresAt: trunkTok.expiresAt, head: tf.head },
+      };
     });
   }
 

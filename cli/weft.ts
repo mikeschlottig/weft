@@ -48,6 +48,8 @@ const OPTIONS = {
   since: { type: "string" },
   follow: { type: "boolean" },
   global: { type: "boolean" },
+  md: { type: "boolean" },
+  budget: { type: "string" },
   help: { type: "boolean", short: "h" },
 } as const;
 
@@ -73,6 +75,8 @@ Agent loop (inside a workspace dir, or --ws)
   weft sync [--continue|--abort]      merge trunk in; conflicts name the peer changeset
   weft submit -m MSG [--prompt-file F] [--tool-calls N] [--cost USD] [--resolves cs-x]
   weft abandon
+  weft context [--md] [--budget TOKENS]  context pack: task, peers, rejections, recent landings, rules
+  weft resume [<ws-id> --repo R --dir PATH]  re-acquire an expired workspace (or re-clone it elsewhere)
 
 Read
   weft queue · weft show <cs> · weft scorecard <cs> · weft logs <cs> · weft log [-n N]
@@ -431,6 +435,50 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
     case "who":
       if (!pos[0]) throw usage("weft who <path>");
       return api("GET", `/v1/repos/${repoOf(f)}/who?path=${encodeURIComponent(pos[0])}`);
+    case "context": {
+      const { w } = loadWs(f);
+      const budget = intOf(f.budget, "budget") ?? 6000;
+      if (f.md) {
+        const r = await api<{ markdown: string }>("GET", `/v1/repos/${w.repo}/workspaces/${w.ws}/context?format=md&budget=${budget}`);
+        return { data: r.data.markdown, hints: [] };
+      }
+      return api("GET", `/v1/repos/${w.repo}/workspaces/${w.ws}/context?budget=${budget}`);
+    }
+    case "resume": {
+      // In a workspace checkout: renew the lease + tokens. Elsewhere (`weft resume <ws> --repo R`): re-clone it.
+      const target = pos[0];
+      const inside = !target && git(["rev-parse", "--is-inside-work-tree"], { cwd: f.dir ? resolve(f.dir) : process.cwd(), allow: [128] }).code === 0;
+      const repo = inside ? loadWs(f).w.repo : repoOf(f);
+      const wsId = inside ? loadWs(f).w.ws : target;
+      if (!wsId) throw usage("weft resume (inside a workspace) | weft resume <ws-id> --repo R [--dir PATH]");
+      const r = await api<{ workspace: { id: string; branch: string; baseCommit: string }; wasExpired: boolean; forecast: unknown; fork: Tok; trunk: Tok & { head: string } }>("POST", `/v1/repos/${repo}/workspaces/${wsId}/resume`, {});
+      let dir: string;
+      if (inside) {
+        const { cwd, w } = loadWs(f);
+        saveWs(cwd, { ...w, fork: r.data.fork, trunk: r.data.trunk });
+        dir = cwd;
+      } else {
+        dir = resolve(f.dir ?? wsId);
+        git(["clone", "-q", r.data.fork.remote, dir], { token: r.data.fork.token });
+        // The workspace branch exists on the fork once the agent has pushed (checkpoint/submit); before that,
+        // the work starts again from the workspace base.
+        const hasBranch = git(["ls-remote", "--exit-code", "--heads", "origin", r.data.workspace.branch], { cwd: dir, token: r.data.fork.token, allow: [2] }).code === 0;
+        if (hasBranch) {
+          git(["fetch", "-q", "origin", `+refs/heads/${r.data.workspace.branch}:refs/remotes/origin/${r.data.workspace.branch}`], { cwd: dir, token: r.data.fork.token });
+          git(["checkout", "-q", "-B", r.data.workspace.branch, `origin/${r.data.workspace.branch}`], { cwd: dir });
+        } else {
+          git(["checkout", "-q", "-B", r.data.workspace.branch, r.data.workspace.baseCommit], { cwd: dir });
+        }
+        git(["remote", "add", "trunk", r.data.trunk.remote], { cwd: dir });
+        git(["config", "user.name", process.env.WEFT_AGENT_NAME ?? wsId.split("-").slice(2).join("-")], { cwd: dir });
+        git(["config", "user.email", `${wsId}@agents.weft.dev`], { cwd: dir });
+        git(["config", "weft.repo", repo], { cwd: dir });
+        git(["config", "weft.ws", wsId], { cwd: dir });
+        setBase(dir, r.data.workspace.baseCommit);
+        saveWs(dir, { repo, ws: wsId, branch: r.data.workspace.branch, fork: r.data.fork, trunk: r.data.trunk });
+      }
+      return { data: { workspace: r.data.workspace, wasExpired: r.data.wasExpired, forecast: r.data.forecast, path: dir }, hints: [`cd ${dir}`, "weft context --md  # what happened while you were away", ...r.hints] };
+    }
     case "room": {
       const repo = repoOf(f);
       const sub = pos[0] ?? "list";
