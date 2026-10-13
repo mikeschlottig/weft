@@ -12,6 +12,7 @@ import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { EXIT, WeftError, exitFor, toWeftError, usage } from "../src/core/errors.ts";
 import type { ErrorEnvelope } from "../src/core/types.ts";
+import { symbolsForWorktree } from "./symbols.ts";
 
 const DEFAULT_REMOTE = "https://weft.ceo-a53.workers.dev";
 const TIMEOUT_MS = 600_000;
@@ -310,7 +311,8 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
       const b = base(cwd);
       const behind = Number(out(["rev-list", "--count", `${b}..${trunkHead}`], { cwd }));
       const trunkChanged = lines(out(["diff", "--name-only", b, trunkHead], { cwd }));
-      const r = await api<Record<string, unknown>>("POST", `/v1/repos/${w.repo}/workspaces/${w.ws}/heartbeat`, { touched });
+      const symbols = await symbolsForWorktree(cwd, b, touched);
+      const r = await api<Record<string, unknown>>("POST", `/v1/repos/${w.repo}/workspaces/${w.ws}/heartbeat`, { touched, symbols });
       const drift = { trunkHead, commitsBehind: behind, collidingWithTrunk: touched.filter((x) => trunkChanged.includes(x)) };
       const hints = [...r.hints];
       if (drift.collidingWithTrunk.length > 0) hints.unshift("weft sync  # trunk changed files you touched");
@@ -326,7 +328,8 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
       const w = await fresh(cwd, w0);
       const commit = commitAll(cwd, f.message ?? "weft: checkpoint");
       if (commit) pushFork(cwd, w);
-      await api("POST", `/v1/repos/${w.repo}/workspaces/${w.ws}/heartbeat`, { touched: touchedFiles(cwd) });
+      const touched = touchedFiles(cwd);
+      await api("POST", `/v1/repos/${w.repo}/workspaces/${w.ws}/heartbeat`, { touched, symbols: await symbolsForWorktree(cwd, base(cwd), touched) });
       return { data: { commit, pushed: commit !== null }, hints: [] };
     }
     case "sync": {

@@ -8,7 +8,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { WeftError, encodeForRpc, invalidState, notFound, toWeftError, usage } from "../core/errors.ts";
-import { blockingOverlaps, forecast, isLive, outOfIntent, scoreRisk } from "../core/forecast.ts";
+import { blockingOverlaps, forecast, isLive, isRealOverlap, outOfIntent, scoreRisk } from "../core/forecast.ts";
 import { matches } from "../core/glob.ts";
 import { checkGate, composeScorecard, processGates } from "../core/rubric.ts";
 import type {
@@ -461,7 +461,7 @@ export class RepoCoordinator extends DurableObject<Env> {
     });
   }
 
-  heartbeat(input: { wsId: string; agent: AgentClaims; touched: string[] }) {
+  heartbeat(input: { wsId: string; agent: AgentClaims; touched: string[]; symbols?: Record<string, string[]> }) {
     return this.guard(async () => {
       const m0 = this.meta();
       const tf = await this.trunkFiles(m0);
@@ -470,23 +470,24 @@ export class RepoCoordinator extends DurableObject<Env> {
       const workable = w.status === "active" || w.status === "conflicted";
       if (workable) {
         w.touched = [...new Set(input.touched)].sort();
+        if (input.symbols) w.touchedSymbols = Object.fromEntries(Object.entries(input.symbols).filter(([f]) => w.touched.includes(f)));
         w.intent.expiresAt = plusSeconds(m.config.leaseTtlSeconds);
         w.expiredNotified = false;
       }
       const others = this.liveWs().filter((o) => o.id !== w.id);
-      const fc = forecast(others, { wsId: w.id, globs: w.intent.globs, touched: w.touched }, tf.files, m.config, Date.now());
-      const keys = fc.overlaps.filter((o) => o.strength !== "prefix").map((o) => `${o.workspaceId}:${o.strength}:${o.files.join(",")}`);
+      const fc = forecast(others, { wsId: w.id, globs: w.intent.globs, touched: w.touched, symbols: w.touchedSymbols }, tf.files, m.config, Date.now());
+      const keys = fc.overlaps.filter(isRealOverlap).map((o) => `${o.workspaceId}:${o.strength}:${o.files.join(",")}`);
       const fresh = keys.filter((k) => !w.alertKeys.includes(k));
       w.alertKeys = keys;
       this.putWs(w);
-      if (workable) this.emit(m, "workspace.heartbeat", w.agentId, { wsId: w.id, agentName: w.agentName, touched: w.touched.length, forecast: fc.risk });
-      for (const o of fc.overlaps.filter((o) => o.strength !== "prefix")) {
+      if (workable) this.emit(m, "workspace.heartbeat", w.agentId, { wsId: w.id, agentName: w.agentName, touched: w.touched.length, symbols: Object.values(w.touchedSymbols ?? {}).reduce((n, xs) => n + xs.length, 0), forecast: fc.risk });
+      for (const o of fc.overlaps.filter(isRealOverlap)) {
         if (!fresh.some((k) => k.startsWith(`${o.workspaceId}:`))) continue;
         this.emit(
           m,
           "workspace.alert",
           "weft",
-          { wsId: w.id, agentName: w.agentName, peerWs: o.workspaceId, peerAgent: o.agentName, strength: o.strength, files: o.files },
+          { wsId: w.id, agentName: w.agentName, peerWs: o.workspaceId, peerAgent: o.agentName, strength: o.strength, files: o.files, symbols: o.symbols ?? [] },
           [`agent:${w.agentId}`, `agent:${o.agentId}`],
         );
       }
@@ -513,7 +514,7 @@ export class RepoCoordinator extends DurableObject<Env> {
       if (w.status !== "active" && w.status !== "conflicted") throw invalidState(`workspace ${w.id} is ${w.status}`);
       const next = [...new Set([...w.intent.globs, ...input.globs])];
       const fc = forecast(this.liveWs().filter((o) => o.id !== w.id), { wsId: w.id, globs: next, touched: w.touched }, tf.files, m.config, Date.now());
-      const blocking = fc.overlaps.filter((o) => o.mode === "exclusive" && o.strength !== "prefix");
+      const blocking = fc.overlaps.filter((o) => o.mode === "exclusive" && isRealOverlap(o));
       if (blocking.length > 0) throw new WeftError("LEASE_HELD", "widening would overlap an exclusive intent", { retryable: true, details: { blocking } });
       w.intent.globs = next;
       w.intent.expiresAt = plusSeconds(m.config.leaseTtlSeconds);
@@ -606,8 +607,8 @@ export class RepoCoordinator extends DurableObject<Env> {
         toolCalls: input.toolCalls,
         costUsd: input.costUsd,
       };
-      const fc = forecast(this.liveWs().filter((o) => o.id !== w.id), { wsId: w.id, globs: w.intent.globs, touched: input.filesTouched }, tf.files, m.config, Date.now());
-      const overlapping = fc.overlaps.filter((o) => o.strength !== "prefix").length;
+      const fc = forecast(this.liveWs().filter((o) => o.id !== w.id), { wsId: w.id, globs: w.intent.globs, touched: input.filesTouched, symbols: w.touchedSymbols }, tf.files, m.config, Date.now());
+      const overlapping = fc.overlaps.filter(isRealOverlap).length;
       const risk = scoreRisk(m.config, prov, overlapping, input.behind);
       const needsReview = risk.sensitive || risk.score >= m.config.reviewThreshold;
       const id = `cs-${pad(this.nextSeq(m))}`;

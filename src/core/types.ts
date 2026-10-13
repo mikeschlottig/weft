@@ -38,6 +38,8 @@ export interface Workspace {
   status: WorkspaceStatus;
   intent: Intent;
   touched: string[];
+  /** FR-08: per touched file, the declarations the agent changed (from the CLI's tree-sitter pass). */
+  touchedSymbols?: Record<string, string[]>;
   createdAt: string;
   updatedAt: string;
   changesetId: string | null;
@@ -123,9 +125,11 @@ export interface OverlapFinding {
   agentName: string;
   task: string;
   mode: IntentMode;
-  strength: "files" | "prefix" | "touched";
+  strength: "files" | "prefix" | "touched" | "symbols-disjoint";
   files: string[];
   globs: string[];
+  /** For "touched": the shared symbols ("path#Name") when both sides reported them. For "symbols-disjoint": each side's symbols. */
+  symbols?: string[];
 }
 
 export interface Forecast {

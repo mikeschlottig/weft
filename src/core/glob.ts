@@ -5,7 +5,25 @@ const cache = new Map<string, RegExp>();
 
 const escape = (ch: string): string => (/[.+^$()|[\]\\]/.test(ch) ? `\\${ch}` : ch);
 
-export const globToRegExp = (glob: string): RegExp => {
+/** Intents may name a symbol: `src/billing/invoice.js#total`. Path matching uses the part before `#`. */
+export const pathOf = (glob: string): string => glob.split("#")[0] ?? glob;
+
+/** Symbol intents: path → declared symbol names (only for globs written as `path#Symbol`). */
+export const symbolIntents = (globs: readonly string[]): Map<string, Set<string>> => {
+  const out = new Map<string, Set<string>>();
+  for (const g of globs) {
+    const i = g.indexOf("#");
+    if (i <= 0 || i === g.length - 1) continue;
+    const path = g.slice(0, i);
+    const set = out.get(path) ?? new Set<string>();
+    set.add(g.slice(i + 1));
+    out.set(path, set);
+  }
+  return out;
+};
+
+export const globToRegExp = (raw: string): RegExp => {
+  const glob = pathOf(raw);
   const hit = cache.get(glob);
   if (hit) return hit;
   let re = "";
@@ -44,7 +62,8 @@ export const globToRegExp = (glob: string): RegExp => {
 
 export const matches = (path: string, globs: readonly string[]): boolean => globs.some((g) => globToRegExp(g).test(path));
 
-export const literalPrefix = (glob: string): string => {
+export const literalPrefix = (raw: string): string => {
+  const glob = pathOf(raw);
   const idx = glob.search(/[*?{]/);
   return idx === -1 ? glob : glob.slice(0, idx);
 };

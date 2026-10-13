@@ -247,7 +247,7 @@ function connect() {
     const m = JSON.parse(ev.data);
     if (m.t !== "event") return;
     const e = m.event;
-    if (e.type === "workspace.alert") toast(`Collision forecast: ${e.data.agentName} and ${e.data.peerAgent} on ${(e.data.files || []).join(", ")}`);
+    if (e.type === "workspace.alert") toast(`Collision forecast: ${e.data.agentName} and ${e.data.peerAgent} on ${((e.data.symbols && e.data.symbols.length) ? e.data.symbols : (e.data.files || [])).join(", ")}`);
     if (e.type === "room.opened") toast(`Conflict room ${e.data.roomId} opened for ${e.data.agentName}`);
     if (e.type === "room.verified") toast(`Room ${e.data.roomId}: resolution passed the check — offered to ${e.data.agentName}`);
     if (e.type === "room.failed") toast(`Room ${e.data.roomId}: no green resolution (${e.data.reason})`);
@@ -338,8 +338,8 @@ const fmtEvent = (e) => {
   switch (e.type) {
     case "workspace.started": return [`started <b>${esc(d.wsId)}</b>: ${esc(d.task)}`, `intent ${esc((d.globs || []).join(" "))} · ${esc(d.mode)} · forecast <b>${esc(d.forecast)}</b>${d.peers?.length ? " · overlaps " + esc(d.peers.join(", ")) : ""}`];
     case "workspace.lease_refused": return [`<b>refused</b>: an exclusive lease is held`, esc((d.blocking || []).map((b) => b.agentName + " " + (b.files || []).join(",")).join("; "))];
-    case "workspace.heartbeat": return [`heartbeat: ${d.touched} file(s) touched · forecast <b>${esc(d.forecast)}</b>`, ""];
-    case "workspace.alert": return [`<b>collision forecast</b> with ${esc(d.peerAgent)} (${esc(d.strength)})`, esc((d.files || []).join(", "))];
+    case "workspace.heartbeat": return [`heartbeat: ${d.touched} file(s)${d.symbols ? `, ${d.symbols} symbol(s)` : ""} touched · forecast <b>${esc(d.forecast)}</b>`, ""];
+    case "workspace.alert": return [`<b>collision forecast</b> with ${esc(d.peerAgent)} (${esc(d.strength)})`, esc((d.symbols && d.symbols.length ? d.symbols : d.files || []).join(", "))];
     case "workspace.synced": return [`synced with trunk (${esc(d.action)})`, esc(String(d.base || "").slice(0, 10))];
     case "workspace.conflicted": return [`<b>sync conflict</b>`, esc((d.files || []).join(", "))];
     case "workspace.intent_widened": return [`widened intent`, esc((d.added || []).join(" "))];

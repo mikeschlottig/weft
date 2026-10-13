@@ -1,7 +1,8 @@
 // Overlap forecasting and risk scoring — pure ports of prototype/cli/src/coordinator.ts
 // (forecast, scoreRisk). Weights and policy are normative (spec §7.2, §7.4).
 
-import { matches, prefixesOverlap } from "./glob.ts";
+import { matches, prefixesOverlap, symbolIntents } from "./glob.ts";
+import { symbolOverlap } from "./symbols.ts";
 import type { Forecast, OverlapFinding, Provenance, RepoConfig, RiskFactor, Workspace } from "./types.ts";
 
 export const isLive = (ws: Workspace, nowMs: number): boolean => {
@@ -10,7 +11,7 @@ export const isLive = (ws: Workspace, nowMs: number): boolean => {
   return Date.parse(ws.intent.expiresAt) > nowMs;
 };
 
-const finding = (ws: Workspace, strength: OverlapFinding["strength"], files: string[], globs: string[]): OverlapFinding => ({
+const finding = (ws: Workspace, strength: OverlapFinding["strength"], files: string[], globs: string[], symbols?: string[]): OverlapFinding => ({
   workspaceId: ws.id,
   agentId: ws.agentId,
   agentName: ws.agentName,
@@ -19,11 +20,15 @@ const finding = (ws: Workspace, strength: OverlapFinding["strength"], files: str
   strength,
   files: files.slice(0, 50),
   globs,
+  ...(symbols && symbols.length > 0 ? { symbols: symbols.slice(0, 50) } : {}),
 });
+
+/** A real (non-prefix, non-symbol-disjoint) overlap: alerts, risk and leases care about these. */
+export const isRealOverlap = (o: OverlapFinding): boolean => o.strength === "touched" || o.strength === "files";
 
 export const forecast = (
   workspaces: readonly Workspace[],
-  self: { wsId: string | null; globs: string[]; touched: string[] },
+  self: { wsId: string | null; globs: string[]; touched: string[]; symbols?: Record<string, string[]> },
   trunkFiles: readonly string[],
   config: RepoConfig,
   nowMs: number,
@@ -32,18 +37,47 @@ export const forecast = (
   const files = trunkFiles.filter(merging);
   const selfTouched = self.touched.filter(merging);
   const mine = new Set([...files.filter((f) => matches(f, self.globs)), ...selfTouched]);
+  const selfIntentSyms = symbolIntents(self.globs);
   const overlaps: OverlapFinding[] = [];
   for (const ws of workspaces) {
     if (ws.id === self.wsId || !isLive(ws, nowMs)) continue;
+    // FR-08: two agents in the same file but in different declarations do not collide.
     const touchedHit = selfTouched.filter((f) => ws.touched.includes(f));
     if (touchedHit.length > 0) {
-      overlaps.push(finding(ws, "touched", touchedHit, []));
+      const real: string[] = [];
+      const shared: string[] = [];
+      const disjoint: string[] = [];
+      for (const f of touchedHit) {
+        const ov = symbolOverlap(self.symbols?.[f], ws.touchedSymbols?.[f]);
+        if (ov === null || ov.length > 0) {
+          real.push(f);
+          for (const sym of ov ?? []) shared.push(`${f}#${sym}`);
+        } else {
+          disjoint.push(f);
+          for (const sym of [...(self.symbols?.[f] ?? []), ...(ws.touchedSymbols?.[f] ?? [])]) shared.push(`${f}#${sym}`);
+        }
+      }
+      if (real.length > 0) {
+        overlaps.push(finding(ws, "touched", real, [], shared.filter((x) => real.some((f) => x.startsWith(`${f}#`)))));
+        continue;
+      }
+      overlaps.push(finding(ws, "symbols-disjoint", disjoint, [], shared));
       continue;
     }
     const theirs = files.filter((f) => matches(f, ws.intent.globs) || ws.touched.includes(f));
+    const theirIntentSyms = symbolIntents(ws.intent.globs);
     const fileHit = theirs.filter((f) => mine.has(f));
+    const realFileHit = fileHit.filter((f) => {
+      const a = selfIntentSyms.get(f);
+      const b = theirIntentSyms.get(f);
+      return !(a && b && ![...a].some((x) => b.has(x)));
+    });
+    if (realFileHit.length > 0) {
+      overlaps.push(finding(ws, "files", realFileHit, []));
+      continue;
+    }
     if (fileHit.length > 0) {
-      overlaps.push(finding(ws, "files", fileHit, []));
+      overlaps.push(finding(ws, "symbols-disjoint", fileHit, [], fileHit.flatMap((f) => [...(selfIntentSyms.get(f) ?? []), ...(theirIntentSyms.get(f) ?? [])].map((x) => `${f}#${x}`))));
       continue;
     }
     const prefixHit = prefixesOverlap(self.globs, ws.intent.globs);
@@ -58,11 +92,14 @@ export const forecast = (
         : overlaps.length > 0
           ? "low"
           : "none";
+  const disjointOnly = overlaps.length > 0 && overlaps.every((o) => o.strength === "symbols-disjoint");
   const advice =
     risk === "none"
       ? "No other live intent overlaps this scope. Proceed."
       : risk === "low"
-        ? "Scopes share a directory prefix but no existing file. Proceed; new files may collide."
+        ? disjointOnly
+          ? "Another agent is in the same file but in different functions/classes. Proceed; keep to your symbols."
+          : "Scopes share a directory prefix but no existing file. Proceed; new files may collide."
         : risk === "medium"
           ? "Another agent has declared intent on the same files. Coordinate, narrow scope, or sync often."
           : "Another agent has already modified the same files. Expect a conflict; sync before continuing.";
@@ -70,7 +107,7 @@ export const forecast = (
 };
 
 export const blockingOverlaps = (fc: Forecast, requestedMode: "soft" | "exclusive"): OverlapFinding[] =>
-  fc.overlaps.filter((o) => (o.mode === "exclusive" || requestedMode === "exclusive") && o.strength !== "prefix");
+  fc.overlaps.filter((o) => (o.mode === "exclusive" || requestedMode === "exclusive") && isRealOverlap(o));
 
 export const scoreRisk = (
   config: RepoConfig,

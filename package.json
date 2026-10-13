@@ -2,7 +2,7 @@
   "name": "weft",
   "version": "0.1.0",
   "private": true,
-  "description": "Weft \u2014 coordination-first version control for many agents, on Cloudflare Workers + Artifacts.",
+  "description": "Weft — coordination-first version control for many agents, on Cloudflare Workers + Artifacts.",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
@@ -21,6 +21,10 @@
     "@cloudflare/containers": "^0.3.7",
     "@modelcontextprotocol/server": "^2.0.0",
     "agents": "^0.28.0",
+    "tree-sitter-javascript": "0.25.0",
+    "tree-sitter-python": "0.25.0",
+    "tree-sitter-typescript": "0.23.2",
+    "web-tree-sitter": "0.27.0",
     "zod": "^4.6.7"
   },
   "bin": {

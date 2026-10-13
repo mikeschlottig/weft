@@ -117,7 +117,10 @@ route("POST", "/v1/repos/:repo/workspaces", "start", "agent", async (c) => {
 
 route("POST", "/v1/repos/:repo/workspaces/:ws/heartbeat", "status", "agent", async (c) => {
   const b = await c.body();
-  const rep = await coord(c.env, c.params.repo ?? "").heartbeat({ wsId: c.params.ws ?? "", agent: claimsOf(c), touched: strs(b.touched ?? [], "touched") });
+  const symbols = b.symbols && typeof b.symbols === "object" && !Array.isArray(b.symbols)
+    ? Object.fromEntries(Object.entries(b.symbols as Record<string, unknown>).map(([f, xs]) => [f, strs(xs, `symbols.${f}`)]))
+    : undefined;
+  const rep = await coord(c.env, c.params.repo ?? "").heartbeat({ wsId: c.params.ws ?? "", agent: claimsOf(c), touched: strs(b.touched ?? [], "touched"), symbols });
   const hints: string[] = [];
   if (rep.workspace.status === "conflicted") hints.push("resolve conflicts, then `weft sync --continue`");
   if (rep.outOfIntent.length > 0) hints.push(`weft widen --touch "${rep.outOfIntent[0] ?? ""}"`);
