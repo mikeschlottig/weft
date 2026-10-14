@@ -240,6 +240,16 @@ export class RepoCoordinator extends DurableObject<Env> {
       .toArray()
       .map((r) => JSON.parse(r.data) as Changeset);
   }
+  private csCounts(): { total: number; byStatus: Record<string, number>; meanWqs: number | null } {
+    const byStatus: Record<string, number> = {};
+    let total = 0;
+    for (const r of this.sql.exec<{ status: string; n: number }>(`SELECT status, COUNT(*) AS n FROM changesets GROUP BY status`)) {
+      byStatus[r.status] = r.n;
+      total += r.n;
+    }
+    const w = this.sql.exec<{ m: number | null }>(`SELECT AVG(json_extract(data, '$.scorecard.total')) AS m FROM changesets WHERE json_extract(data, '$.scorecard.total') IS NOT NULL`).toArray()[0];
+    return { total, byStatus, meanWqs: w?.m == null ? null : Math.round(w.m * 10) / 10 };
+  }
   private allCs(limit = 500): Changeset[] {
     return this.sql
       .exec<{ data: string }>(`SELECT data FROM changesets ORDER BY enqueued_at DESC LIMIT ?`, limit)
@@ -1947,6 +1957,8 @@ export class RepoCoordinator extends DurableObject<Env> {
         paused: m.paused,
         workspaces: this.allWs(100).filter((w) => w.status !== "abandoned").map((w) => this.publicWs(w)),
         changesets: this.allCs(100).map((c) => ({ ...c, scorecard: c.scorecard })),
+        // Exact totals over every changeset (the list above is the newest 100 only).
+        counts: this.csCounts(),
         batch: b ? { id: b.id, state: b.state, trunkHead: b.claim.trunkHead, members: b.claim.members.map((x) => x.id) } : null,
         rooms: this.allRooms(50),
         lanes: { max: this.lanesOf(m), inFlight: this.actives(m).map((x) => ({ id: x.id, files: x.files, since: new Date(x.since).toISOString() })) },
