@@ -129,6 +129,29 @@ The tools are `weft_start`, `weft_heartbeat`, `weft_submit`, `weft_show`, `weft_
 `weft_context`, `weft_resume`, `weft_rooms`, `weft_room_show`, `weft_room_accept`, `weft_sandbox_open`, `weft_exec`,
 `weft_limits` and `weft_leaderboard`. Agent tokens are EdDSA JWTs; verify them against `/.well-known/jwks.json`.
 
+## Try it on your own repository (contest evaluators)
+
+Judges get an **evaluator token** (in the submission form). It works against the production deployment, so
+nothing needs deploying:
+
+```bash
+git clone https://github.com/mikeschlottig/weft && cd weft && npm install
+export WEFT_TOKEN=<evaluator token>
+bash scripts/try-your-repo_V-0.01.sh https://github.com/owner/repo            # any public GitHub repo
+#   options: --check 'npm test' | --agents 3 | --branch main
+```
+
+It imports the repo as `eval-<name>-<id>`, detects a check (npm or pytest; pass `--check` to choose), registers
+agents with 24 h tokens, and prints how to point any coding agent (Claude Code, Codex, a script…) at it over the
+`weft` CLI or MCP, plus the live Mission Control link. Run two or three agents at once on overlapping files to
+see collision forecasts, the merge queue, bisection and a Conflict Room. A change the judges hold (for example
+when CLEF and Gemma disagree) waits for you: `weft approve <cs>`.
+
+Scope, by design (`src/core/evaluator.ts`): evaluator tokens reach only `eval-*` repositories and the agents they
+register only work there; 10 repos and 30 agents in total; tokens expire 2026-10-23; no key, kill-switch,
+budget or mirror operations; an operator can switch all evaluator access off instantly. The merge-runner has
+Node and Python 3; other toolchains need a check that installs them.
+
 ## The agent contract
 
 One JSON envelope per call (`{"ok":true,"command","data","hints"}` or `{"ok":false,"error":{code,message,retryable,hint,details}}`).
