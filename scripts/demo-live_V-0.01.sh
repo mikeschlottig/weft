@@ -3,7 +3,7 @@
 # Artifacts · Workflows · Containers · Workers AI). Port of prototype/cli/scripts/demo_V-0.01.sh.
 #   act 1  concurrent starts: intents, forecasts, an exclusive lease refusing a fifth agent
 #   act 2  concurrent edits + heartbeats: overlap detected BEFORE anyone submits
-#   act 3  the queue: speculative batch, Gemma 4 rubric judge (+ CLEF-flash second opinion), conflict, bisection, single trunk push
+#   act 3  the queue: speculative batch, CLEF rubric judge (+ Gemma 4 second opinion), conflict, bisection, single trunk push
 #   act 4  human review of a sensitive change, conflict resolution, resubmits, second batch
 #   act 5  provenance trailers, quality leaderboard, one-command revert
 #
@@ -106,7 +106,7 @@ wait
 for a in atlas birch cedar dune; do printf '  %-6s %s status=%-12s risk=%s\n' "$a" "$(J '.data.changeset.id' <"$a.sub.json")" "$(J '.data.changeset.status' <"$a.sub.json")" "$(J '.data.changeset.riskScore' <"$a.sub.json")"; done
 cs() { J '.data.changeset.id' <"$1.sub.json"; }
 
-say "act 3 — the queue: Workflow → Container (merge-tree chain, check on merged tree, bisect) → Gemma 4 judge → one push"
+say "act 3 — the queue: Workflow → Container (merge-tree chain, check on merged tree, bisect) → CLEF judge → one push"
 node "$ROOT/scripts/wait-events.mjs" "$WEFT_REPO" "$S0" queue.batch_landed 600 --print \
   | jq -rc 'select(.type | test("batch_started|judged|landed|rejected|needs_review")) | "  \(.type) \(.data.csId // .data.batchId) \(.data.agentName // "") \(if .data.reason then "reason=" + .data.reason else "" end) \(if .data.wqs != null then "WQS=" + (.data.wqs|tostring) else "" end) \(if .data.intentAlignment != null then "intent=" + (.data.intentAlignment|tostring) else "" end) \(if .data.checksRun != null then "checks=" + (.data.checksRun|tostring) + " bisect=" + (.data.bisectSteps|tostring) else "" end)"'
 echo "  why was cedar rejected?"

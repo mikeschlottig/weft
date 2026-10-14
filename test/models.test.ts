@@ -11,7 +11,7 @@ import type { DiffStats } from "../src/core/types.ts";
 const STATS: DiffStats = { files: ["src/a.ts", "test/a.test.ts"], testFiles: ["test/a.test.ts"], sourceFiles: ["src/a.ts"], added: 10, deleted: 2, truncated: false, diffText: "+x", secretFindings: [] };
 const INPUT = { task: "add a", intentGlobs: ["src/**", "test/**"], message: "feat: a", stats: STATS };
 
-test("models: Gemma 4 is the default for judge and resolver; CLEF detection", () => {
+test("models: Gemma 4 is the default generator (resolver); CLEF detection", () => {
   assert.equal(DEFAULT_LLM, "@cf/google/gemma-4-26b-a4b-it");
   assert.equal(RESOLVER_MODEL, GEMMA_4);
   assert.ok(isClef(CLEF) && isClef(CLEF_FLASH));

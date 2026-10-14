@@ -63,12 +63,12 @@
     </section>
     <section class="view" id="v-conflicts">
       <h1>Conflict rooms</h1>
-      <p class="lede">When the queue rejects a changeset for a conflict, a room opens. Workers AI proposes a resolution, the merge-runner merges it onto current trunk, and the repo's check runs on the merged tree. Only a green proposal is offered to the agent.</p>
+      <p class="lede">When the queue rejects a changeset for a conflict, a room opens. Gemma 4 writes a resolution, CLEF-flash checks that it keeps both sides' intent, the merge-runner merges it onto current trunk, and the repo's check runs on the merged tree. Only a green proposal is offered to the agent.</p>
       <div class="split"><div class="panel"><div class="ph"><h2>Rooms</h2></div><div class="cslist" id="roomlist"></div></div><div id="roomdetail"><div class="panel"><div class="empty">No conflict rooms yet.</div></div></div></div>
     </section>
     <section class="view" id="v-quality">
       <h1>Quality</h1>
-      <p class="lede">Every changeset is scored on the Weft Quality Score (WQS-1): deterministic gates (50), a Workers AI judge scoring intent, tests and risk (40), and process (10). The judge is Gemma 4 in JSON mode by default, with Cloudflare CLEF-flash as an independent second opinion; disagreement holds a change for a human. Ranked by agent and by model, this is the signal agents improve against.</p>
+      <p class="lede">Every changeset is scored on the Weft Quality Score (WQS-1): deterministic gates (50), Cloudflare's CLEF decision model scoring intent, tests and risk (40), and process (10). Gemma 4 gives an independent second opinion from a different model family; when the two disagree, a human decides. Ranked by agent and by model, this is the signal agents improve against.</p>
       <div class="grid g2">
         <div class="panel"><div class="ph"><h2>By agent</h2><span class="meta">mean WQS</span></div><div class="scroll"><table><thead><tr><th>Agent</th><th>WQS</th><th>Landed</th><th>First try</th><th>Intent</th></tr></thead><tbody id="lbAgent"></tbody></table></div></div>
         <div class="panel"><div class="ph"><h2>By model</h2><span class="meta">mean WQS</span></div><div class="scroll"><table><thead><tr><th>Model</th><th>WQS</th><th>Landed</th><th>First try</th><th>Intent</th></tr></thead><tbody id="lbModel"></tbody></table></div></div>
@@ -80,10 +80,10 @@
           <tr><td>Gates</td><td>Edits stay inside the declared intent</td><td class="num">5</td><td>intent globs</td></tr>
           <tr><td>Gates</td><td>Size within budget (400 lines)</td><td class="num">5</td><td>numstat</td></tr>
           <tr><td>Gates</td><td>No secrets in added lines</td><td class="num">5</td><td>pattern scan (holds for review)</td></tr>
-          <tr><td>Judge</td><td>Intent alignment (0–3)</td><td class="num">15</td><td>judge <code>score</code></td></tr>
-          <tr><td>Judge</td><td>Test adequacy (0–3)</td><td class="num">10</td><td>judge <code>score</code></td></tr>
-          <tr><td>Judge</td><td>Maintainability (0–2)</td><td class="num">5</td><td>judge <code>score</code></td></tr>
-          <tr><td>Judge</td><td>No scope creep · no security concern</td><td class="num">5 + 5</td><td>judge probability (security ≥ 0.7 holds)</td></tr>
+          <tr><td>Judge</td><td>Intent alignment (0–3)</td><td class="num">15</td><td>CLEF <code>score</code></td></tr>
+          <tr><td>Judge</td><td>Test adequacy (0–3)</td><td class="num">10</td><td>CLEF <code>score</code></td></tr>
+          <tr><td>Judge</td><td>Maintainability (0–2)</td><td class="num">5</td><td>CLEF <code>score</code></td></tr>
+          <tr><td>Judge</td><td>No scope creep · no security concern</td><td class="num">5 + 5</td><td>CLEF <code>noul</code> (security ≥ 0.7 holds)</td></tr>
           <tr><td>Process</td><td>Landed first try · fresh base</td><td class="num">5 + 5</td><td>coordinator history</td></tr>
         </tbody></table></div></div>
     </section>
@@ -239,7 +239,7 @@ const ICON = { "workspace.started": "▶", "workspace.lease_refused": "⛔", "wo
 const fmtEvent = (e) => {
   const d = e.data || {};
   switch (e.type) {
-    case "workspace.started": return [`started <b>${esc(d.wsId)}</b>: ${esc(d.task)}`, `intent ${esc((d.globs || []).join(" "))} · ${esc(d.mode)} · forecast <b>${esc(d.forecast)}</b>${d.peers?.length ? " · overlaps " + esc(d.peers.join(", ")) : ""}`];
+    case "workspace.started": return [`started <b>${esc(d.wsId)}</b>: ${esc(d.task)}`, `intent ${esc((d.globs || []).join(" "))} · ${esc(d.mode)} · forecast <b>${esc(d.forecast)}</b>${d.peers?.length ? " · overlaps " + esc(d.peers.join(", ")) : ""}${d.duplicates?.length ? ` · <b>possible duplicate</b> of ${esc(d.duplicates[0].agentName)} (${d.duplicates[0].sameWorkP != null ? "CLEF-flash P " + Number(d.duplicates[0].sameWorkP).toFixed(2) : "similarity " + d.duplicates[0].similarity})` : ""}`];
     case "workspace.lease_refused": return [`<b>refused</b>: an exclusive lease is held`, esc((d.blocking || []).map((b) => b.agentName + " " + (b.files || []).join(",")).join("; "))];
     case "workspace.heartbeat": return [`${d.source === "push" ? "<b>git push observed</b>" : "heartbeat"}: ${d.touched} file(s)${d.symbols ? `, ${d.symbols} symbol(s)` : ""} touched · forecast <b>${esc(d.forecast)}</b>`, d.source === "push" ? `fork head ${esc(String(d.head || "").slice(0, 10))} · no weft command needed` : ""];
     case "workspace.alert": return [`<b>collision forecast</b> with ${esc(d.peerAgent)} (${esc(d.strength)})`, esc((d.symbols && d.symbols.length ? d.symbols : d.files || []).join(", "))];
@@ -290,14 +290,14 @@ function renderRooms() {
   const r = rooms.find((x) => x.id === selRoom);
   if (!r) { $("roomdetail").innerHTML = '<div class="panel"><div class="empty">No conflict rooms yet.</div></div>'; return; }
   const peerTxt = r.peers.map((p) => `${agent(p.agentName || "trunk")} <span class="mono">${esc(p.changesetId || "")}</span><div class="sub mono" style="color:var(--muted)">${esc(p.task || "")}</div>`).join("<br>") || "trunk";
-  const attempts = r.attempts.map((a) => `<div class="it"><span class="t mono">#${a.n}</span><span class="ic">${a.checkPassed === true ? "✓" : a.checkPassed === null ? "·" : "✕"}</span><div class="tx">${a.error ? `proposal unusable: ${esc(a.error)}` : `rewrote ${esc(a.files.join(", "))} · check ${a.checkPassed === true ? "<b>passed</b>" : a.checkPassed === null ? "not configured" : "<b>failed</b>"}${a.markersLeft.length ? " · markers left in " + esc(a.markersLeft.join(", ")) : ""}`}<div class="sub">${esc(a.rationale)}${a.candidate ? " · candidate " + esc(a.candidate.slice(0, 10)) : ""} · ${(a.ms / 1000).toFixed(1)} s · ${esc(a.model)}</div></div></div>`).join("") || '<div class="empty">Waiting for the resolver…</div>';
+  const attempts = r.attempts.map((a) => `<div class="it"><span class="t mono">#${a.n}</span><span class="ic">${a.checkPassed === true ? "✓" : a.checkPassed === null ? "·" : "✕"}</span><div class="tx">${a.error ? `proposal unusable: ${esc(a.error)}` : `rewrote ${esc(a.files.join(", "))} · check ${a.checkPassed === true ? "<b>passed</b>" : a.checkPassed === null ? "not configured" : "<b>failed</b>"}${a.markersLeft.length ? " · markers left in " + esc(a.markersLeft.join(", ")) : ""}`}<div class="sub">${esc(a.rationale)}${a.candidate ? " · candidate " + esc(a.candidate.slice(0, 10)) : ""} · ${(a.ms / 1000).toFixed(1)} s · ${esc(a.model)}${a.screen ? ` · screened by ${esc(a.screen.model.replace("@cf/", ""))}: keeps change P ${a.screen.keepsChange ?? "?"}, keeps trunk P ${a.screen.keepsTrunk ?? "?"}` : ""}</div></div></div>`).join("") || '<div class="empty">Waiting for the resolver…</div>';
   const hunks = (r.hunks || []).filter((h) => h.conflicted).map((h) => `<div class="ph"><h2 class="mono" style="text-transform:none">${esc(h.path)}</h2><span class="meta">conflict as the queue saw it</span></div><pre class="code">${esc(h.merged || "")}</pre>`).join("");
   $("roomdetail").innerHTML = `
     <div class="panel" style="margin-bottom:16px"><div class="ph"><h2>${esc(r.id)}</h2>${pill(...(ROOM[r.status] || [r.status, "s-mut"]))}<span class="meta">${esc(r.csId)}${r.resubmittedAs ? " → " + esc(r.resubmittedAs) : ""}</span></div>
       <div class="vs"><div><dt class="mono" style="color:var(--muted)">CHANGE BEING RESOLVED</dt>${agent(r.agentName)} <span class="mono">${esc(r.csId)}</span><div class="sub mono" style="color:var(--muted)">${esc(r.task)} · ${esc(r.intentGlobs.join(" "))}</div></div><div><dt class="mono" style="color:var(--muted)">ALREADY ON TRUNK</dt>${peerTxt}</div></div>
       ${r.error ? `<div class="note" style="color:var(--bad)">${esc(r.error)}</div>` : ""}
       ${r.verified ? `<div class="note" style="color:var(--ok)"><b>Verified:</b> merge commit ${esc(r.verified.candidate.slice(0, 10))} on <code>${esc(r.verified.branch)}</code> passed the check on trunk ${esc((r.trunkHead || "").slice(0, 10))}. ${r.status === "accepted" ? "Accepted and resubmitted." : "The agent can run <code>weft room accept " + esc(r.id) + "</code>."}</div>` : ""}</div>
-    <div class="grid g2"><div class="panel"><div class="ph"><h2>Resolver attempts</h2><span class="meta">Workers AI → merge-runner check</span></div><div class="tl">${attempts}</div></div>
+    <div class="grid g2"><div class="panel"><div class="ph"><h2>Resolver attempts</h2><span class="meta">Gemma 4 proposes · CLEF-flash screens · check decides</span></div><div class="tl">${attempts}</div></div>
       <div class="panel">${hunks || '<div class="empty">Conflict contents not captured yet.</div>'}</div></div>`;
 }
 // ---------------------------------------------------------------- limits (D7)

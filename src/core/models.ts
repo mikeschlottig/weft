@@ -1,6 +1,8 @@
 // Workers AI model registry — pure, no Cloudflare imports.
 //
-// Default for every generative role (judge, conflict-room resolver) is Gemma 4 26B A4B: a MoE model
+// Decisions (score, classify, rank) run on Cloudflare CLEF / CLEF-flash: typed answers with probabilities,
+// billed on input tokens only ($0.24 / $0.038 per M). Generation (the conflict-room resolver) runs on
+// Gemma 4 26B A4B, which is also the judge's independent second opinion: a MoE model
 // with 4B active parameters, 256K context, JSON mode, $0.10 / $0.30 per M tokens (verified against
 // developers.cloudflare.com/workers-ai/models/gemma-4-26b-a4b-it on 2026-10-14). The earlier models
 // stay selectable per repo via `PATCH /v1/repos/:repo/config` (CLI: weft config --judge-model …).
@@ -10,7 +12,12 @@ export const CLEF = "@cf/cloudflare/clef";
 export const CLEF_FLASH = "@cf/cloudflare/clef-flash";
 export const KIMI_K2_CODE = "@cf/moonshotai/kimi-k2.7-code";
 
+/** Generation (the Conflict Room resolver writes code). */
 export const DEFAULT_LLM = GEMMA_4;
+/** Decisions: the rubric judge scores with CLEF; classifiers (duplicates, room pre-screen) use CLEF-flash. */
+export const DEFAULT_JUDGE = CLEF;
+export const DEFAULT_SECOND_OPINION = GEMMA_4;
+export const CLASSIFIER = CLEF_FLASH;
 
 /** Models the judge can run. CLEF variants use the System One API; the rest use chat completions + JSON mode. */
 export const JUDGE_MODELS = [GEMMA_4, CLEF, CLEF_FLASH] as const;

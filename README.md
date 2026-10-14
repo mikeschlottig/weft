@@ -18,14 +18,14 @@ Live: **https://weft.ceo-a53.workers.dev** (Mission Control; open a repo such as
 | Many writers race on `main` | **Changesets, not branches**: every workspace is an Artifacts fork with a fork-scoped token; agents never write trunk | Artifacts `fork()` + `createToken()` |
 | Green branches produce a red trunk | **Speculative Weave queue**: batch, merge in memory (`git merge-tree`), check the merged tip once, bisect on red, land with a compare-and-swap push | Workflows + Containers (real git) |
 | Hot files (changelogs, `package.json`, allow-lists) always conflict | **Merge-driver registry v2**: `union`, `json-merge` (3-way by key), `sorted-lines` | merge-runner `.gitattributes` + registered drivers |
-| A conflict stops an agent cold | **Conflict Rooms**: Workers AI proposes a resolution, the merge-runner builds it on current trunk and runs the check; only a **green** proposal is offered (`weft room accept`) | RoomResolver Workflow + Workers AI (Gemma 4 `gemma-4-26b-a4b-it` by default; `kimi-k2.7-code` selectable) + Container |
+| A conflict stops an agent cold | **Conflict Rooms**: Workers AI proposes a resolution, the merge-runner builds it on current trunk and runs the check; only a **green** proposal is offered (`weft room accept`) | RoomResolver Workflow + Workers AI: Gemma 4 `gemma-4-26b-a4b-it` writes the resolution (`kimi-k2.7-code` selectable), CLEF-flash pre-screens it for both intents + Container |
 | Two agents in one file are flagged as colliding even in different functions | **Symbol-level intents**: tree-sitter (TS/JS/Python) reports the declarations each agent changed; same file + different symbols = no alert | CLI-side tree-sitter; DO forecast |
 | Collisions are only seen when an agent asks | **Push-derived heartbeats**: a plain `git push` to a fork triggers a forecast and live alerts within seconds | Artifacts `cf.artifacts.repo.pushed` Workflow trigger |
 | A crashed or new agent session loses its context | **Context packs + resume**: a token-budgeted, prompt-ready pack (peers, rejections + advice, recent landings, house rules); `weft resume` re-acquires an expired workspace, even on another machine | DO event log + Artifacts forks |
 | Codemods (renames) break code that landed meanwhile | **Recipe changesets**: an admin-defined codemod is replayed on the newest trunk instead of merging text | merge-runner |
 | Dependent work waits for review | **Stacked changesets** (`--after cs-x`): the child forks the parent's fork and lands right after it | Artifacts fork-of-fork |
 | Forgeable attribution | Server-written trailers on every trunk commit (`Weft-Agent`, `Weft-Model`, `Weft-Task`, `Weft-Risk`, …), **SSH-signed** trunk commits, and a **provenance bundle** (prompt hash, tool calls, cost, risk, judge) linked by `refs/notes/weft` | Only the queue writes trunk; R2 |
-| No signal for agents to improve against | **WQS-1 quality rubric**: deterministic gates + a Workers AI judge (**Gemma 4** in JSON mode by default, with **Cloudflare CLEF-flash** as an independent second opinion; CLEF selectable as primary) + process; scores go back to the agent and are ranked by agent and by model | Workers AI (`@cf/google/gemma-4-26b-a4b-it`, `@cf/cloudflare/clef-flash`), D1 |
+| No signal for agents to improve against | **WQS-1 quality rubric**: deterministic gates + the **Cloudflare CLEF** decision-model judge, with **Gemma 4** as an independent second opinion (disagreement holds for a human) + process; scores go back to the agent and are ranked by agent and by model | Workers AI (`@cf/cloudflare/clef`, `@cf/google/gemma-4-26b-a4b-it`), D1 |
 | Humans can't review everything | Risk-routed review: sensitive paths and judge holds go to a human, the rest auto-lands on green | Policy in the coordinator |
 | Trying it needs a migration | **GitHub import**: `weft init shop --import https://github.com/owner/repo` | Artifacts `import()` |
 | Teams still live on GitHub | **Mirror-out**: after every landing, trunk + provenance notes are pushed to a mirror (`weft mirror set`), credential sealed | merge-runner + KV (AES-GCM sealed) |
@@ -43,7 +43,7 @@ agent (weft CLI / MCP) ──► weft Worker ──► RepoCoordinator DO (1 per
         │                                        │ fork() · createToken()            │ create batch / open room
         └── git push to OWN fork ──► Artifacts ◄─┘                                    ▼
               │ cf.artifacts.repo.pushed ▲                         MergeQueue Workflow
-              ▼                          │  push trunk (lease,      prepare → judge (Workers AI Gemma 4) → provenance (R2)
+              ▼                          │  push trunk (lease,      prepare → judge (Workers AI CLEF) → provenance (R2)
         PushObserver Workflow            │  signed, + notes)        → speculate · check · bisect · recipes · drivers
         (heartbeat + alerts)             └────── merge-runner ◄──── → push → verify → land
                                                  Container (git 2.47)  ▲

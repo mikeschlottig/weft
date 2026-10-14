@@ -180,7 +180,7 @@ export interface Forecast {
   overlaps: OverlapFinding[];
   advice: string;
   /** FR-09: live workspaces whose task is semantically close to this one. */
-  duplicates?: { workspaceId: string; agentName: string; task: string; similarity: number }[];
+  duplicates?: { workspaceId: string; agentName: string; task: string; similarity: number; sameWorkP?: number | null; decidedBy?: "clef" | "embedding" }[];
 }
 
 export type EventType =
@@ -374,6 +374,8 @@ export interface RoomAttempt {
   logKey: string | null;
   error: string | null;
   ms: number;
+  /** CLEF-flash pre-screen of the proposal (FR-24 + decision model); absent on older attempts. */
+  screen?: { model: string; keepsChange: number | null; keepsTrunk: number | null; reject: boolean } | null;
 }
 
 export interface Room {

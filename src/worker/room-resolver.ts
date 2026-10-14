@@ -10,7 +10,8 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import { WeftError, decodeFromRpc } from "../core/errors.ts";
-import { chatExtras } from "../core/models.ts";
+import { type RoomScreen, readRoomScreen, roomScreenRequest } from "../core/classify.ts";
+import { CLEF_FLASH, chatExtras } from "../core/models.ts";
 import { MAX_ROOM_ATTEMPTS, RESOLVER_MODEL, parseProposal, resolverMessages, responseText } from "../core/resolve.ts";
 import type { MergeDriverRule, Room, RoomAttempt, RoomFile } from "../core/types.ts";
 import { headOf, headerToken, mintToken, resolveShard } from "./artifacts.ts";
@@ -102,11 +103,34 @@ export class RoomResolver extends WorkflowEntrypoint<Env, Params> {
           }
         });
 
+        // Decision model pre-screen (CLEF-flash): does the proposal keep both sides' intent? A confident "no"
+        // sends it back without spending a container check — except on the last attempt, where the check decides.
+        const screen = proposal.ok
+          ? await step.do(`screen-${n}`, STEP, async (): Promise<RoomScreen | null> => {
+              try {
+                const raw = await (this.env.AI as unknown as { run(model: string, input: Record<string, unknown>): Promise<unknown> }).run(
+                  CLEF_FLASH,
+                  roomScreenRequest(room, prep.files, proposal.files) as unknown as Record<string, unknown>,
+                );
+                return readRoomScreen(CLEF_FLASH, raw);
+              } catch (err: unknown) {
+                console.log(JSON.stringify({ level: "warn", msg: "room pre-screen unavailable (check decides)", roomId, err: String(err) }));
+                return null;
+              }
+            })
+          : null;
+
         const attempt = await step.do(`verify-${n}`, LONG, async (): Promise<{ attempt: RoomAttempt; log: string; verified: Room["verified"] }> => {
-          const base: RoomAttempt = { n, model, files: proposal.files.map((f) => f.path), rationale: proposal.rationale, candidate: null, checkPassed: false, markersLeft: [], logKey: null, error: proposal.error, ms: proposal.ms };
+          const base: RoomAttempt = { n, model, files: proposal.files.map((f) => f.path), rationale: proposal.rationale, candidate: null, checkPassed: false, markersLeft: [], logKey: null, error: proposal.error, ms: proposal.ms, screen };
           if (!proposal.ok) {
             await rpc(() => coord.roomUpdate(roomId, { status: "proposing", attempt: base }));
             return { attempt: base, log: `the proposal could not be parsed: ${proposal.error ?? ""}`, verified: null };
+          }
+          if (screen?.reject && n < MAX_ROOM_ATTEMPTS) {
+            const why = `decision model (${screen.model}): the proposal likely drops intent — keeps the change P=${screen.keepsChange ?? "?"}, keeps trunk P=${screen.keepsTrunk ?? "?"}. Keep both behaviours.`;
+            const a: RoomAttempt = { ...base, error: why };
+            await rpc(() => coord.roomUpdate(roomId, { status: "proposing", attempt: a }));
+            return { attempt: a, log: why, verified: null };
           }
           await rpc(() => coord.roomUpdate(roomId, { status: "verifying" }));
           const trunkRead = headerToken((await mintToken(this.env, input.trunkRepo, "read", 1800)).plaintext);
@@ -119,7 +143,7 @@ export class RoomResolver extends WorkflowEntrypoint<Env, Params> {
             fork: { forkRemote: input.forkRemote, forkToken: forkRead, writeToken: forkWrite, branch: input.branch, headCommit: input.headCommit },
             roomBranch,
             resolutions: proposal.files,
-            message: `Resolve ${input.room.csId} against trunk (${roomId})\n\n${proposal.rationale}\n\nWeft-Room: ${roomId}\nWeft-Resolver-Model: ${RESOLVER_MODEL}\n`,
+            message: `Resolve ${input.room.csId} against trunk (${roomId})\n\n${proposal.rationale}\n\nWeft-Room: ${roomId}\nWeft-Resolver-Model: ${model}\n`,
             authorName: "weft-resolver",
             authorEmail: "resolver@weft.dev",
             claimTime: Math.floor(Date.parse(input.room.createdAt) / 1000) + n,

@@ -159,7 +159,7 @@ const isWeftErrorShape = (
 // ---- E4 (review M3): infrastructure vs. changeset failures
 
 /** Codes that describe the platform, not the changeset: retried without counting toward MAX_ATTEMPTS. */
-const INFRA_CODES = /\b(UPSTREAM_RUNNER|UPSTREAM_ARTIFACTS|GIT_FAILED|SPAWN_FAILED|CHECKOUT_FAILED|TIP_DIVERGED|CHECK_FLAKY|CHECK_INTERRUPTED|UPSTREAM_PLATFORM|BISECT_LOST|INTERNAL|TIMEOUT)\b|\bcontainer\b|\bnetwork\b|timed? ?out|ECONNRESET|\b50[234]\b/i;
+const INFRA_CODES = /\b(UPSTREAM_RUNNER|UPSTREAM_ARTIFACTS|GIT_FAILED|GIT_INTERRUPTED|SPAWN_FAILED|CHECKOUT_FAILED|TIP_DIVERGED|CHECK_FLAKY|CHECK_INTERRUPTED|UPSTREAM_PLATFORM|BISECT_LOST|INTERNAL|TIMEOUT)\b|\bcontainer\b|\bnetwork\b|timed? ?out|ECONNRESET|\b50[234]\b/i;
 export const infraFailure = (err: unknown): boolean => {
   if (err instanceof WeftError) return err.retryable || INFRA_CODES.test(err.code);
   return INFRA_CODES.test(err instanceof Error ? `${err.name} ${err.message}` : String(err));

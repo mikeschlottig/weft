@@ -78,7 +78,12 @@ const run = (cmd: string, args: string[], opts: { cwd?: string; input?: string; 
     child.on("close", (code, signal) => {
       clearTimeout(timer);
       const r: Run = { code: code ?? -1, stdout, stderr, interrupted: code === null && signal !== null && !timedOut, timedOut };
-      if (r.code !== 0 && !(opts.allow ?? []).includes(r.code)) {
+      if (r.interrupted && !(opts.allow ?? []).includes(-1)) {
+        // Killed by a signal we did not send (instance replaced during a rollout, OOM): infrastructure, not the
+        // command. Retryable, so the Worker's runner client tries again (live: room accept, 2026-10-14). Callers that
+        // allow -1 (the check) classify interruption themselves (CHECK_INTERRUPTED).
+        reject(new RunnerError("GIT_INTERRUPTED", redact(`${cmd} ${args.filter((a) => !a.includes("Bearer")).slice(0, 4).join(" ")} was killed by ${signal} before it finished`), 503, true));
+      } else if (r.code !== 0 && !(opts.allow ?? []).includes(r.code)) {
         reject(new RunnerError("GIT_FAILED", redact(`${cmd} ${args.filter((a) => !a.includes("Bearer")).slice(0, 4).join(" ")} exited ${r.code}: ${stderr.slice(0, 600)}`)));
       } else resolve(r);
     });

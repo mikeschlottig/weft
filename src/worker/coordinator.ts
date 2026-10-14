@@ -11,8 +11,9 @@ import { WeftError, encodeForRpc, invalidState, notFound, toWeftError, usage } f
 import { RECIPE_ARG } from "../core/types.ts";
 import { blockingOverlaps, forecast, isLive, isRealOverlap, outOfIntent, reconcileDiff, scoreRisk } from "../core/forecast.ts";
 import { matches, prefixesOverlap } from "../core/glob.ts";
-import { CLEF_FLASH, DEFAULT_LLM } from "../core/models.ts";
+import { CLEF, CLEF_FLASH, DEFAULT_LLM, GEMMA_4 } from "../core/models.ts";
 import { DUPLICATE_THRESHOLD, EMBED_MODEL, cosine, parseEmbedding } from "../core/similarity.ts";
+import { DUPLICATE_CANDIDATE_FLOOR, MAX_DUPLICATE_CANDIDATES, decideDuplicates, duplicateRequest, noulAnswers } from "../core/classify.ts";
 import { checkGate, composeScorecard, processGates } from "../core/rubric.ts";
 import { type LimitRow, type RepoUsage, assessRepo } from "../core/limits.ts";
 import type {
@@ -49,7 +50,7 @@ export const DEFAULT_CONFIG: RepoConfig = {
   unionGlobs: ["CHANGELOG.md", "**/CHANGELOG.md"],
   leaseTtlSeconds: 1800,
   batchWindowMs: 2500,
-  judge: { enabled: true, model: DEFAULT_LLM, holdOnSecurity: 0.7, holdOnAlignment: 1.0, secondOpinion: CLEF_FLASH, disagreementHold: 1.0 },
+  judge: { enabled: true, model: CLEF, holdOnSecurity: 0.7, holdOnAlignment: 1.0, secondOpinion: GEMMA_4, disagreementHold: 1.0 },
   resolverModel: DEFAULT_LLM,
 };
 
@@ -426,6 +427,40 @@ export class RepoCoordinator extends DurableObject<Env> {
     return all.filter((w) => w.id !== exceptId && w.enqueuedAt < before && overlap(w.globs));
   }
 
+  /**
+   * FR-09 + decision model: live tasks whose embedding similarity clears DUPLICATE_CANDIDATE_FLOOR are put to
+   * CLEF-flash as noul questions ("same piece of work?"). Returns P(same) per workspace id; empty on failure,
+   * so the caller falls back to the embedding threshold.
+   */
+  private async classifyDuplicates(task: string, taskVec: number[], exceptWsId: string | null): Promise<Map<string, number | null>> {
+    const out = new Map<string, number | null>();
+    const nowMs = Date.now();
+    const live = new Map(this.liveWs().filter((o) => o.id !== exceptWsId && isLive(o, nowMs)).map((o) => [o.id, o]));
+    const cands: { workspaceId: string; agentName: string; task: string; similarity: number }[] = [];
+    for (const row of this.sql.exec<{ ws_id: string; vec: ArrayBuffer }>(`SELECT ws_id, vec FROM task_vecs`)) {
+      const o = live.get(row.ws_id);
+      if (!o) continue;
+      const similarity = cosine(taskVec, Array.from(new Float32Array(row.vec)));
+      if (similarity >= DUPLICATE_CANDIDATE_FLOOR) cands.push({ workspaceId: o.id, agentName: o.agentName, task: o.task, similarity });
+    }
+    for (const o of live.values()) {
+      if (!o.taskVec) continue;
+      const similarity = cosine(taskVec, o.taskVec);
+      if (similarity >= DUPLICATE_CANDIDATE_FLOOR) cands.push({ workspaceId: o.id, agentName: o.agentName, task: o.task, similarity });
+    }
+    const top = cands.sort((a, b) => b.similarity - a.similarity).slice(0, MAX_DUPLICATE_CANDIDATES);
+    if (top.length === 0) return out;
+    try {
+      const req = duplicateRequest(task, top);
+      const raw = await (this.env.AI as unknown as { run(model: string, input: Record<string, unknown>): Promise<unknown> }).run(CLEF_FLASH, req as unknown as Record<string, unknown>);
+      const p = noulAnswers(raw, top.map((_, i) => `same_t${i}`));
+      top.forEach((c, i) => out.set(c.workspaceId, p[`same_t${i}`] ?? null));
+    } catch (err: unknown) {
+      console.log(JSON.stringify({ level: "warn", msg: "duplicate classifier failed (embedding threshold used)", err: String(err) }));
+    }
+    return out;
+  }
+
   private async embedTask(task: string): Promise<number[] | null> {
     try {
       const raw = await (this.env.AI as unknown as { run(model: string, input: Record<string, unknown>): Promise<unknown> }).run(EMBED_MODEL, { text: [task.slice(0, 1000)] });
@@ -493,6 +528,8 @@ export class RepoCoordinator extends DurableObject<Env> {
         }
       }
       const taskVec = await this.embedTask(input.task);
+      // Decision model on the embedding candidates (awaited here, before the no-await decision block).
+      const sameWork = taskVec ? await this.classifyDuplicates(input.task, taskVec, parent?.ws.id ?? null) : new Map<string, number | null>();
 
       // ---- decision block (no awaits)
       const m = this.meta();
@@ -510,13 +547,19 @@ export class RepoCoordinator extends DurableObject<Env> {
         for (const o of liveById.values()) {
           if (o.taskVec) scored.push({ workspaceId: o.id, agentName: o.agentName, task: o.task, similarity: Math.round(cosine(taskVec, o.taskVec) * 1000) / 1000 }); // legacy inline rows
         }
-        const dups = scored
-          .filter((d) => d.similarity >= DUPLICATE_THRESHOLD)
+        // Embeddings shortlist; CLEF-flash decides "same work" (falls back to the embedding threshold if unanswered).
+        const cands = scored
+          .filter((d) => d.similarity >= DUPLICATE_CANDIDATE_FLOOR)
           .sort((a, b) => b.similarity - a.similarity)
+          .slice(0, MAX_DUPLICATE_CANDIDATES);
+        const dups = decideDuplicates(cands, cands.map((c) => sameWork.get(c.workspaceId) ?? null), DUPLICATE_THRESHOLD)
+          .sort((a, b) => (b.sameWorkP ?? b.similarity) - (a.sameWorkP ?? a.similarity))
           .slice(0, 5);
         if (dups.length > 0) {
           fc.duplicates = dups;
-          fc.advice += ` A live task looks like the same work: ${dups[0]?.agentName ?? "?"} — "${dups[0]?.task ?? ""}" (similarity ${dups[0]?.similarity ?? 0}). Coordinate before duplicating it.`;
+          const d0 = dups[0];
+          const why = d0?.sameWorkP != null ? `CLEF-flash P(same work) ${d0.sameWorkP.toFixed(2)}, similarity ${d0.similarity}` : `similarity ${d0?.similarity ?? 0}`;
+          fc.advice += ` A live task looks like the same work: ${d0?.agentName ?? "?"} — "${d0?.task ?? ""}" (${why}). Coordinate before duplicating it.`;
         }
       }
       const blocking = blockingOverlaps(fc, input.mode);
@@ -605,7 +648,7 @@ export class RepoCoordinator extends DurableObject<Env> {
           forecast: fc.risk,
           peers: fc.overlaps.map((o) => o.agentName),
           after: parent?.cs.id ?? null,
-          duplicates: (fc.duplicates ?? []).map((d) => ({ agentName: d.agentName, similarity: d.similarity })),
+          duplicates: (fc.duplicates ?? []).map((d) => ({ agentName: d.agentName, similarity: d.similarity, sameWorkP: d.sameWorkP ?? null, decidedBy: d.decidedBy ?? "embedding" })),
         }, fc.overlaps.map((o) => `agent:${o.agentId}`));
         this.saveMeta(m2);
         return {
