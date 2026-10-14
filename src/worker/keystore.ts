@@ -110,6 +110,26 @@ export const mintAgentToken = async (
   return { token, expiresAt: new Date((iat + ttlS) * 1000).toISOString(), kid: key.kid, jti };
 };
 
+/** Mint a contest evaluator token (role `evaluator`, limited to eval-* repos) and record the grant. */
+export const mintEvaluatorToken = async (
+  env: Env,
+  label: string,
+  expMs: number,
+  by: string,
+): Promise<{ token: string; expiresAt: string; kid: string; jti: string }> => {
+  const key = await ensureCurrent(env);
+  const iat = Math.floor(Date.now() / 1000);
+  const exp = Math.floor(expMs / 1000);
+  const jti = crypto.randomUUID();
+  const sub = `evaluator:${label}`;
+  const claims: AgentClaims = { sub, name: sub, model: "human", role: "evaluator", iat, exp, jti };
+  const token = await signEdDsa(claims, key);
+  await env.DB.prepare("INSERT INTO token_grants (jti, agent_id, ttl_s, long_lived, kid, granted_by, via, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    .bind(jti, sub, exp - iat, 1, key.kid, by, "evaluator", Date.now())
+    .run();
+  return { token, expiresAt: new Date(exp * 1000).toISOString(), kid: key.kid, jti };
+};
+
 /** Verify any agent token (EdDSA by kid; HS256 during the migration window). Retries once on an unknown kid. */
 export const verifyAgentToken = async (env: Env, token: string, nowSec: number): Promise<AgentClaims> => {
   let ks = await keyset(env);

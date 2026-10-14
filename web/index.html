@@ -238,7 +238,7 @@ function renderDetail() {
 }
 
 // ---------------------------------------------------------------- agent console
-const ICON = { "workspace.started": "▶", "workspace.lease_refused": "⛔", "workspace.heartbeat": "♥", "workspace.alert": "⚠", "workspace.synced": "⇣", "workspace.conflicted": "⚠", "workspace.intent_widened": "↔", "workspace.abandoned": "✕", "workspace.expired": "⌛", "changeset.submitted": "⇡", "changeset.needs_review": "⚑", "changeset.approved": "✓", "changeset.judged": "⚖", "changeset.landed": "✓", "changeset.rejected": "✕", "changeset.reverted": "↶", "room.opened": "◇", "room.proposed": "✎", "room.verified": "◆", "room.failed": "✕", "room.accepted": "⇡" };
+const ICON = { "workspace.started": "▶", "workspace.lease_refused": "⛔", "workspace.heartbeat": "♥", "workspace.alert": "⚠", "workspace.synced": "⇣", "workspace.conflicted": "⚠", "workspace.intent_widened": "↔", "workspace.abandoned": "✕", "workspace.expired": "⌛", "changeset.submitted": "⇡", "changeset.needs_review": "⚑", "changeset.approved": "✓", "changeset.hold_overridden": "✓", "changeset.judged": "⚖", "changeset.landed": "✓", "changeset.rejected": "✕", "changeset.reverted": "↶", "room.opened": "◇", "room.proposed": "✎", "room.verified": "◆", "room.failed": "✕", "room.accepted": "⇡" };
 const fmtEvent = (e) => {
   const d = e.data || {};
   switch (e.type) {
@@ -254,6 +254,7 @@ const fmtEvent = (e) => {
     case "changeset.submitted": return [`submitted <b>${esc(d.csId)}</b>: ${esc(d.message)}`, `${d.files} file(s) · risk ${d.risk} · ${esc(d.status)}${d.after ? " · stacked on " + esc(d.after) : ""}`];
     case "changeset.needs_review": return [`<b>${esc(d.csId)}</b> held for a human`, esc(d.reason || "")];
     case "changeset.approved": return [`<b>${esc(d.csId)}</b> approved by ${esc(e.actor)}`, ""];
+    case "changeset.hold_overridden": return [`<b>${esc(d.csId)}</b>: human approval overrides the judge hold`, esc(d.hold || "")];
     case "changeset.judged": return [`judged <b>${esc(d.csId)}</b>`, `intent alignment ${d.intentAlignment ?? "—"} · security ${d.securityConcern ?? "—"}${d.hold ? " · HOLD " + esc(d.hold) : ""}`];
     case "changeset.landed": return [`<b>${esc(d.csId)}</b> landed on trunk`, `${esc(String(d.commit || "").slice(0, 10))} · WQS ${d.wqs ?? "—"}`];
     case "changeset.rejected": return [`<b>${esc(d.csId)}</b> rejected: ${esc(d.reason)}`, `${(d.conflictsWith || []).length ? "conflicts with " + esc(d.conflictsWith.join(", ")) + " · " : ""}${esc((d.files || []).join(", "))}`];

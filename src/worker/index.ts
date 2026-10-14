@@ -1,7 +1,7 @@
 // weft-api Worker: the single public entry point (spec §6). Routes decisions to the repo's
 // RepoCoordinator DO; git data never flows through here (agents talk to Artifacts directly).
 
-import { WeftError, decodeFromRpc, invalidState as invalidStateErr, usage } from "../core/errors.ts";
+import { WeftError, decodeFromRpc, forbidden, invalidState as invalidStateErr, usage } from "../core/errors.ts";
 import { withRetry } from "../core/retry.ts";
 import { type ContextPack, contextMarkdown } from "../core/context.ts";
 import { DUPLICATE_THRESHOLD, EMBED_MODEL, cosine } from "../core/similarity.ts";
@@ -12,7 +12,8 @@ import type { AgentClaims, Envelope, ErrorEnvelope, IntentMode, RepoConfig } fro
 import { pickShard, repoInfo, resolveShard, shardCount, trunkLog } from "./artifacts.ts";
 import { getMirror, pushMirror, removeMirror, setMirror } from "./mirror.ts";
 import { authenticate, optionalAuth, requireAdmin, requireReviewer } from "./auth.ts";
-import { keyStatus, mintAgentToken, publicKeys, rotateIfDue, rotateKeys } from "./keystore.ts";
+import { keyStatus, mintAgentToken, mintEvaluatorToken, publicKeys, rotateIfDue, rotateKeys } from "./keystore.ts";
+import { EVAL_KILL_KEY, EVAL_MAX_AGENTS, EVAL_MAX_REPOS, evalAgentMay, evalExpiry, evaluatorMay, filterEvalConfig, isEvalName, isGithubHttps } from "../core/evaluator.ts";
 import { handleMcp } from "./mcp.ts";
 
 export { RepoCoordinator } from "./coordinator.ts";
@@ -135,6 +136,12 @@ route("POST", "/v1/agents", "agent register", "admin", async (c) => {
   const name = str(b.name, "name");
   const model = str(b.model, "model");
   if (!/^[a-z0-9][a-z0-9_-]{0,30}$/.test(name)) throw usage(`invalid agent name: ${name}`, "lowercase letters, digits, - and _ (max 31)");
+  if (claimsOf(c).role === "evaluator") {
+    if (!isEvalName(name)) throw forbidden(`evaluator agents must be named eval-* (got ${name})`);
+    const known = await c.env.DB.prepare("SELECT id FROM agents WHERE name = ?").bind(name).first<{ id: string }>();
+    const n = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM agents WHERE name LIKE 'eval-%'").first<{ n: number }>();
+    if (!known && (n?.n ?? 0) >= EVAL_MAX_AGENTS) throw new WeftError("BUDGET_EXCEEDED", `the evaluation cap of ${EVAL_MAX_AGENTS} eval-* agents is reached`, { exitCode: 7, hint: "reuse an existing eval-* agent name" });
+  }
   // E8 (review H2): agent tokens live ≤ 1 h (spec §12). Longer is an explicit, recorded admin grant (≤ 24 h).
   const ttl = tokenTtl(numOr(b.ttlHours, null), b.longLived === true);
   const existing = await c.env.DB.prepare("SELECT id FROM agents WHERE name = ?").bind(name).first<{ id: string }>();
@@ -229,6 +236,15 @@ route("POST", "/v1/repos", "init", "admin", async (c) => {
   const b = await c.body();
   const repo = str(b.repo, "repo");
   const imp = b.import && typeof b.import === "object" ? (b.import as Record<string, unknown>) : null;
+  if (claimsOf(c).role === "evaluator") {
+    if (!isEvalName(repo)) throw forbidden(`evaluator repositories must be named eval-* (got ${repo})`);
+    if (imp && !isGithubHttps(String(imp.url ?? ""))) throw forbidden("evaluators can import public GitHub repositories over HTTPS (https://github.com/owner/repo)");
+    const known = await c.env.DB.prepare("SELECT id FROM repos WHERE id = ?").bind(repo).first<{ id: string }>();
+    const n = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM repos WHERE id LIKE 'eval-%'").first<{ n: number }>();
+    if (!known && (n?.n ?? 0) >= EVAL_MAX_REPOS) throw new WeftError("BUDGET_EXCEEDED", `the evaluation cap of ${EVAL_MAX_REPOS} eval-* repositories is reached`, { exitCode: 7, hint: "reuse an existing eval-* repository" });
+    b.config = filterEvalConfig((b.config ?? {}) as Record<string, unknown>).patch;
+    delete b.shard;
+  }
   // D7: place the repo (and all of its forks) on a namespace shard; recorded before any Artifacts call.
   const shards = shardCount(c.env);
   const shard = typeof b.shard === "number" && Number.isInteger(b.shard) && b.shard >= 0 && b.shard < shards ? b.shard : pickShard(repo, shards);
@@ -245,9 +261,28 @@ route("POST", "/v1/repos", "init", "admin", async (c) => {
   return { data, hints: ["push an initial commit to the returned remote (the CLI does this with --from DIR)", "weft agent register --name <agent> --model <model>"] };
 });
 
-route("PATCH", "/v1/repos/:repo/config", "config", "admin", async (c) => ({
-  data: await coord(c.env, c.params.repo ?? "").configure((await c.body()) as Partial<RepoConfig>, claimsOf(c).name),
-}));
+route("PATCH", "/v1/repos/:repo/config", "config", "admin", async (c) => {
+  let patch = (await c.body()) as Record<string, unknown>;
+  const hints: string[] = [];
+  if (claimsOf(c).role === "evaluator") {
+    const f = filterEvalConfig(patch);
+    patch = f.patch;
+    if (f.dropped.length) hints.push(`ignored for evaluator tokens (admin-only): ${f.dropped.join(", ")}`);
+  }
+  return { data: await coord(c.env, c.params.repo ?? "").configure(patch as Partial<RepoConfig>, claimsOf(c).name), hints };
+});
+
+// Contest evaluator tokens (src/core/evaluator.ts): minted by an admin, limited to eval-* repos, hard expiry.
+route("POST", "/v1/admin/evaluator-token", "evaluator token", "admin", async (c) => {
+  const b = await c.body();
+  const label = str(b.label, "label");
+  if (!/^[a-z0-9][a-z0-9_-]{0,30}$/.test(label)) throw usage(`invalid label: ${label}`, "lowercase letters, digits, - and _ (max 31)");
+  const minted = await mintEvaluatorToken(c.env, label, evalExpiry(Date.now(), typeof b.expiresAt === "string" ? b.expiresAt : null), claimsOf(c).name);
+  return {
+    data: { label, token: minted.token, expiresAt: minted.expiresAt, kid: minted.kid, jti: minted.jti, limits: { repos: EVAL_MAX_REPOS, agents: EVAL_MAX_AGENTS, prefix: "eval-" } },
+    hints: [`switch all evaluator access off: npx wrangler kv key put --binding CONFIG "${EVAL_KILL_KEY}" 1 --remote`],
+  };
+});
 
 // ---- D7: namespace shards + limits dashboard
 route("GET", "/v1/limits", "limits", "read", async (c) => {
@@ -637,8 +672,22 @@ export default {
     try {
       const claims = r.auth === "public" ? null : r.auth === "read" ? await optionalAuth(req, env, exec) : await authenticate(req, env, exec);
       if (r.auth === "read" && !claims && env.PUBLIC_READ !== "true") throw new WeftError("UNAUTHENTICATED", "missing bearer token");
-      if (r.auth === "admin" && claims) requireAdmin(claims);
-      if (r.auth === "review" && claims) requireReviewer(claims);
+      const evalScoped = claims && (claims.role === "evaluator" || (claims.role === "agent" && isEvalName(claims.name)));
+      if (evalScoped && r.auth !== "public" && r.auth !== "read" && (await env.CONFIG.get(EVAL_KILL_KEY))) {
+        throw forbidden("evaluator access is switched off on this deployment");
+      }
+      if (claims?.role === "evaluator") {
+        // Contest judges: admin/review-level actions only on eval-* repos (src/core/evaluator.ts).
+        const d = evaluatorMay(r.auth, r.command, params.repo);
+        if (!d.allow) throw forbidden(d.reason ?? "not allowed for evaluator tokens");
+      } else {
+        if (r.auth === "admin" && claims) requireAdmin(claims);
+        if (r.auth === "review" && claims) requireReviewer(claims);
+      }
+      if (claims?.role === "agent" && r.auth !== "public" && r.auth !== "read") {
+        const d = evalAgentMay(claims.name, params.repo);
+        if (!d.allow) throw forbidden(d.reason ?? "not allowed");
+      }
       await gateAgent(env, claims);
       const ctx: Ctx = {
         req,

@@ -1192,6 +1192,12 @@ export class RepoCoordinator extends DurableObject<Env> {
       this.putBatch(b);
       const c = this.cs(csId);
       let hold = judgeHold;
+      if (hold && c.approvedBy) {
+        // A human approved this changeset after it was held; re-judging must not hold it again (that looped:
+        // approve → queue → same judge hold → needs_review). The judge's answers stay on the scorecard.
+        this.emit(m, "changeset.hold_overridden", c.approvedBy, { csId, agentName: c.provenance.agentName, hold });
+        hold = null;
+      }
       // E3: re-score risk from the runner's authoritative diff (not the agent's claim) before speculation.
       // Stacked children carry their parent's commits in the fork diff, so they keep the claimed stats.
       if (actual && !c.provenance.claimed && !c.after) {

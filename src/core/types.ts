@@ -18,8 +18,9 @@ export interface AgentClaims {
   sub: string; // agent id
   name: string;
   model: string;
-  /** `review`: a human (via Cloudflare Access) who may approve/reject but not administer. */
-  role: "agent" | "admin" | "review";
+  /** `review`: a human (via Cloudflare Access) who may approve/reject but not administer.
+   *  `evaluator`: a contest judge, limited to eval-* repos (src/core/evaluator.ts). */
+  role: "agent" | "admin" | "review" | "evaluator";
   iat: number;
   exp: number;
   /** Token id (D6): recorded for long-lived grants. */
@@ -208,6 +209,7 @@ export type EventType =
   | "queue.requeued"
   | "queue.flaky_check"
   | "changeset.rescored"
+  | "changeset.hold_overridden"
   | "mirror.pushed"
   | "mirror.failed"
   | "queue.trunk_red"

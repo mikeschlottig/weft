@@ -1,11 +1,12 @@
 # weft merge-runner — real git for speculative merges, checks and the single trunk push.
 # Build context is the repo root (wrangler.jsonc: image_build_context ".") so src/core is shared.
+# Python 3 too, so imported Python repos can run their check (pytest via `pip install` in the check command).
 # trixie: git 2.47 (merge-tree --merge-base needs git >= 2.40; bookworm ships 2.39)
 FROM node:24-trixie-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates openssh-client \
+ && apt-get install -y --no-install-recommends git ca-certificates openssh-client python3 python3-pip python3-venv \
  && rm -rf /var/lib/apt/lists/* \
- && git --version \
+ && git --version && python3 --version \
  && git --version | awk '{split($3,v,"."); if (v[1] < 2 || (v[1] == 2 && v[2] < 40)) exit 1}'
 WORKDIR /srv/app
 COPY src/core ./src/core
