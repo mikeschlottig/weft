@@ -328,6 +328,8 @@ $("repoForm").addEventListener("submit", (e) => { e.preventDefault(); open($("re
 const qs = new URLSearchParams(location.search);
 if (qs.get("view")) show(qs.get("view"));
 if (qs.get("cs")) selected = qs.get("cs");
+if (qs.get("agent")) selAgent = qs.get("agent"); // deep link: ?view=agents&agent=<name>
+if (qs.get("room")) selRoom = qs.get("room");
 let initial = location.hash.slice(1);
 if (!initial) { try { initial = localStorage.getItem("weft-repo") || ""; } catch (err) { initial = ""; } }
 if (initial) open(initial); else showStart();
