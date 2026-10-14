@@ -115,5 +115,13 @@ export const verifyAgentToken = async (env: Env, token: string, nowSec: number):
   let ks = await keyset(env);
   const kid = tokenHeader(token).kid;
   if (kid && !ks.keys.some((k) => k.kid === kid)) ks = await keyset(env, true);
-  return verifyToken(token, ks.keys, { secret: env.JWT_SIGNING_SECRET, allowedUntilSec: ks.hs256Until }, nowSec);
+  try {
+    return await verifyToken(token, ks.keys, { secret: env.JWT_SIGNING_SECRET, allowedUntilSec: ks.hs256Until }, nowSec);
+  } catch (err: unknown) {
+    // A stale per-isolate key set (seen on production right after the first key bootstrap, 2026-10-14) can
+    // reject a valid token. Re-read D1 once and verify again; a forged token still fails the second check.
+    if (!(err instanceof WeftError) || err.code !== "UNAUTHENTICATED" || !/signature|unknown signing key/.test(err.message)) throw err;
+    ks = await keyset(env, true);
+    return verifyToken(token, ks.keys, { secret: env.JWT_SIGNING_SECRET, allowedUntilSec: ks.hs256Until }, nowSec);
+  }
 };
