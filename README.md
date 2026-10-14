@@ -8,7 +8,8 @@ repository stays plain git that any client can clone.
 
 > Agents declare intent, the coordinator serializes, and the queue judges the merged tree.
 
-Live: **https://weft.ceo-a53.workers.dev** (Mission Control; open a repo such as `#shop-live1`).
+Live: **https://weft.ceo-a53.workers.dev** (Mission Control). A finished five-agent run to open:
+**https://weft.ceo-a53.workers.dev/#shop-10141259** (no account needed; reads are public).
 
 ## What it does
 
@@ -66,7 +67,7 @@ Containers), and Docker with buildx for deploys.
 
 ```bash
 npm install
-npm run typecheck && npm test            # strict TS; 50 tests incl. the real merge-runner against local git
+npm run typecheck && npm test            # strict TS; 64 tests incl. the real merge-runner against local git
 npx wrangler d1 create weft-index        # put the ids below in wrangler.jsonc
 npx wrangler r2 bucket create weft-blobs
 npx wrangler kv namespace create weft-config
@@ -143,8 +144,8 @@ JSON is printed automatically when stdout is not a TTY. Exit codes: `0` ok · `2
   endpoints are public on the demo deployments (`PUBLIC_READ=true`) so judges need no account.
 - Rubric thresholds are not calibrated yet. Calibration needs labeled outcomes (reverted, hotfixed,
   human-rejected), which Weft records; precision targets need ≥ 150 real labels.
-- Tier D/E (lanes on separate runners, flake guard, re-scoring, EdDSA keys, mirror-out, sharding, sandboxes)
-  is live on `weft-dev`; production runs Tiers A–C until it is promoted.
+- Everything in the table above runs in production (promoted 2026-10-14, gated by live demo, lanes, sandbox and
+  duplicate-detection runs). The 500- and 150-agent swarm runs were done on the separate `weft-dev` stack.
 - Load test (single repo coordinator): 3,000 req/min → p95 260 ms; 6,000 req/min → p95 384 ms; zero 5xx.
 - Symbol intents cover TS/JS/Python; other languages fall back to whole-file overlap. Conflict Room
   proposals come from a model: only proposals that pass the repo's check are offered, and the agent
