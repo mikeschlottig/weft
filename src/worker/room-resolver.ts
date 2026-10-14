@@ -10,6 +10,7 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import { WeftError, decodeFromRpc } from "../core/errors.ts";
+import { chatExtras } from "../core/models.ts";
 import { MAX_ROOM_ATTEMPTS, RESOLVER_MODEL, parseProposal, resolverMessages, responseText } from "../core/resolve.ts";
 import type { MergeDriverRule, Room, RoomAttempt, RoomFile } from "../core/types.ts";
 import { headOf, headerToken, mintToken, resolveShard } from "./artifacts.ts";
@@ -33,6 +34,8 @@ interface RoomInput {
   unionGlobs: string[];
   drivers: MergeDriverRule[];
   workspaceStatus: string;
+  /** Absent on rooms opened before the field existed. */
+  resolverModel?: string;
 }
 
 const STEP = { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" }, timeout: "10 minutes" } as const;
@@ -77,16 +80,18 @@ export class RoomResolver extends WorkflowEntrypoint<Env, Params> {
       });
 
       const room: Room = { ...input.room, trunkHead: prep.trunkHead, hunks: prep.files };
+      const model = input.resolverModel ?? RESOLVER_MODEL;
       const allowed = prep.files.map((f: RoomFile) => f.path);
       let previous: { attempt: RoomAttempt; log: string } | null = null;
 
       for (let n = 1; n <= MAX_ROOM_ATTEMPTS; n += 1) {
         const proposal = await step.do(`propose-${n}`, AI_STEP, async () => {
           const started = Date.now();
-          const raw = await (this.env.AI as unknown as { run(model: string, input: Record<string, unknown>): Promise<unknown> }).run(RESOLVER_MODEL, {
+          const raw = await (this.env.AI as unknown as { run(model: string, input: Record<string, unknown>): Promise<unknown> }).run(model, {
             messages: resolverMessages(room, prep.files, previous),
             max_tokens: 16_000,
             temperature: 0.1,
+            ...chatExtras(model),
           });
           try {
             const p = parseProposal(responseText(raw), allowed);
@@ -98,7 +103,7 @@ export class RoomResolver extends WorkflowEntrypoint<Env, Params> {
         });
 
         const attempt = await step.do(`verify-${n}`, LONG, async (): Promise<{ attempt: RoomAttempt; log: string; verified: Room["verified"] }> => {
-          const base: RoomAttempt = { n, model: RESOLVER_MODEL, files: proposal.files.map((f) => f.path), rationale: proposal.rationale, candidate: null, checkPassed: false, markersLeft: [], logKey: null, error: proposal.error, ms: proposal.ms };
+          const base: RoomAttempt = { n, model, files: proposal.files.map((f) => f.path), rationale: proposal.rationale, candidate: null, checkPassed: false, markersLeft: [], logKey: null, error: proposal.error, ms: proposal.ms };
           if (!proposal.ok) {
             await rpc(() => coord.roomUpdate(roomId, { status: "proposing", attempt: base }));
             return { attempt: base, log: `the proposal could not be parsed: ${proposal.error ?? ""}`, verified: null };

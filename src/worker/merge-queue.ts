@@ -13,6 +13,7 @@ import type { BatchClaim, DiffStats, GateResult, JudgeAnswers, Rejection } from 
 type Claim = BatchClaim & { pre: Record<string, { gates: GateResult[]; judge: JudgeAnswers | null; behind: number; rejections: number }> };
 import { headOf, headerToken, mintToken, resolveShard } from "./artifacts.ts";
 import { judgeChangeset } from "./judge.ts";
+import { CLEF_FLASH } from "../core/models.ts";
 import { pushMirror } from "./mirror.ts";
 import { runner, signingKey, type SpecInput } from "./runner-client.ts";
 
@@ -94,7 +95,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
           const jin = { task: m.task, intentGlobs: m.intentGlobs, message: m.message, stats };
           const primary = claim.config.judge.enabled ? await judgeChangeset(ai, claim.config.judge.model, jin) : null;
           // FR-48: an independent second opinion (default clef-flash; JEV-compatible System One API).
-          const secondModel = claim.config.judge.enabled ? (claim.config.judge.secondOpinion === undefined ? "@cf/cloudflare/clef-flash" : claim.config.judge.secondOpinion) : null;
+          const secondModel = claim.config.judge.enabled ? (claim.config.judge.secondOpinion === undefined ? CLEF_FLASH : claim.config.judge.secondOpinion) : null;
           const second = primary && secondModel ? await judgeChangeset(ai, secondModel, jin) : null;
           const judge = primary
             ? {

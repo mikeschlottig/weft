@@ -214,6 +214,17 @@ route("GET", "/v1/leaderboard", "leaderboard", "read", async (c) => {
   return { data: { rubric: "wqs-1", rows: rows.results } };
 });
 
+/** Recent repos with their landed and scored counts — Mission Control's starting point (public read). */
+route("GET", "/v1/repos", "repo list", "read", async (c) => {
+  const limit = Math.min(50, Math.max(1, Number(c.url.searchParams.get("limit") ?? "12") || 12));
+  const rows = await c.env.DB.prepare(
+    `SELECT r.id AS repo, r.created_at AS createdAt, COUNT(s.cs_id) AS scored, COALESCE(SUM(s.status = 'landed'), 0) AS landed, ROUND(AVG(s.wqs), 1) AS meanWqs
+       FROM repos r LEFT JOIN scorecards s ON s.repo = r.id
+      GROUP BY r.id ORDER BY r.created_at DESC LIMIT ?`,
+  ).bind(limit).all<{ repo: string; createdAt: number; scored: number; landed: number; meanWqs: number | null }>();
+  return { data: rows.results.map((r) => ({ ...r, createdAt: new Date(r.createdAt).toISOString() })) };
+});
+
 route("POST", "/v1/repos", "init", "admin", async (c) => {
   const b = await c.body();
   const repo = str(b.repo, "repo");

@@ -29,6 +29,9 @@ const OPTIONS = {
   sensitive: { type: "string" },
   union: { type: "string" },
   "no-judge": { type: "boolean" },
+  "judge-model": { type: "string" },
+  "second-opinion": { type: "string" },
+  "resolver-model": { type: "string" },
   "batch-window": { type: "string" },
   name: { type: "string" },
   model: { type: "string" },
@@ -85,7 +88,7 @@ Env: WEFT_REMOTE (default ${DEFAULT_REMOTE}), WEFT_TOKEN (agent token or admin t
 Admin
   weft init <repo> [--from DIR | --import https://github.com/owner/repo [--branch B]] [--check CMD] [--batch N] [--batch-window MS] [--sensitive GLOBS] [--union GLOBS] [--driver GLOB=DRIVER] [--no-judge]
                                       drivers: union · json-merge (3-way by key) · sorted-lines
-  weft config [--check CMD] [--batch N] [--review-threshold N] [--sensitive GLOBS] [--no-judge]
+  weft config [--check CMD] [--batch N] [--review-threshold N] [--sensitive GLOBS] [--no-judge] [--judge-model M] [--second-opinion M|none] [--resolver-model M]
   weft agent register --name NAME --model MODEL [--ttl-hours N --long-lived]   weft agent show|kill|revive --name NAME
   weft agent refresh                  re-issue your own agent token (tokens live 1 h; EdDSA, see /.well-known/jwks.json)
   weft keys list|rotate               agent-token signing keys (rotation keeps the previous key verifying)
@@ -302,6 +305,14 @@ const configPatch = (f: Flags): Record<string, unknown> => {
   const u = csv(f.union);
   if (u) p.unionGlobs = u;
   if (f["no-judge"]) p.judge = { enabled: false };
+  // Workers AI models per role (default Gemma 4); --second-opinion none disables the second judge.
+  if (f["judge-model"] !== undefined || f["second-opinion"] !== undefined) {
+    const j: Record<string, unknown> = (p.judge as Record<string, unknown> | undefined) ?? {};
+    if (f["judge-model"] !== undefined) j.model = f["judge-model"];
+    if (f["second-opinion"] !== undefined) j.secondOpinion = f["second-opinion"] === "none" ? null : f["second-opinion"];
+    p.judge = j;
+  }
+  if (f["resolver-model"] !== undefined) p.resolverModel = f["resolver-model"];
   const bw = intOf(f["batch-window"], "batch-window");
   if (bw !== undefined) p.batchWindowMs = bw;
   if (f["recipe-def"]) {

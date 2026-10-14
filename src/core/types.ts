@@ -152,6 +152,8 @@ export interface RepoConfig {
   /** FR-26: batches validated concurrently when their file scopes are disjoint (default 2). */
   lanes?: number;
   judge: { enabled: boolean; model: string; holdOnSecurity: number; holdOnAlignment: number; secondOpinion?: string | null; disagreementHold?: number };
+  /** FR-24: Workers AI model the Conflict Room resolver proposes with (default Gemma 4). */
+  resolverModel?: string;
 }
 
 export type MergeDriverName = "union" | "json-merge" | "sorted-lines";

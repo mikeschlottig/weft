@@ -11,6 +11,7 @@ import { WeftError, encodeForRpc, invalidState, notFound, toWeftError, usage } f
 import { RECIPE_ARG } from "../core/types.ts";
 import { blockingOverlaps, forecast, isLive, isRealOverlap, outOfIntent, reconcileDiff, scoreRisk } from "../core/forecast.ts";
 import { matches, prefixesOverlap } from "../core/glob.ts";
+import { CLEF_FLASH, DEFAULT_LLM } from "../core/models.ts";
 import { DUPLICATE_THRESHOLD, EMBED_MODEL, cosine, parseEmbedding } from "../core/similarity.ts";
 import { checkGate, composeScorecard, processGates } from "../core/rubric.ts";
 import { type LimitRow, type RepoUsage, assessRepo } from "../core/limits.ts";
@@ -48,7 +49,8 @@ export const DEFAULT_CONFIG: RepoConfig = {
   unionGlobs: ["CHANGELOG.md", "**/CHANGELOG.md"],
   leaseTtlSeconds: 1800,
   batchWindowMs: 2500,
-  judge: { enabled: true, model: "@cf/cloudflare/clef", holdOnSecurity: 0.7, holdOnAlignment: 1.0, secondOpinion: "@cf/cloudflare/clef-flash", disagreementHold: 1.0 },
+  judge: { enabled: true, model: DEFAULT_LLM, holdOnSecurity: 0.7, holdOnAlignment: 1.0, secondOpinion: CLEF_FLASH, disagreementHold: 1.0 },
+  resolverModel: DEFAULT_LLM,
 };
 
 const FORK_TOKEN_TTL = 3600;
@@ -1693,6 +1695,7 @@ export class RepoCoordinator extends DurableObject<Env> {
         unionGlobs: m.config.unionGlobs,
         drivers: m.config.drivers ?? [],
         workspaceStatus: w.status,
+        resolverModel: m.config.resolverModel ?? DEFAULT_LLM,
       };
     });
   }

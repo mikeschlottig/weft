@@ -3,203 +3,27 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Weft Mission Control</title>
+<title>Weft Simulation</title>
 <meta name="description" content="Prototype UI for Weft: live agent swarm, lease map, speculative merge queue, changeset provenance and conflict rooms.">
+<meta name="color-scheme" content="dark light">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=IBM+Plex+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>
-:root{
-  --bg:#F4F2EA; --panel:#FFFFFF; --panel2:#FAF8F1; --ink:#0E0F11; --muted:#5B5F66; --line:#0E0F11; --hair:#0E0F1122;
-  --lime:#C8FF1E; --magenta:#FF2E88; --cyan:#00C2DB; --violet:#7A3CFF; --tang:#FF6A00;
-  --ok:#14804A; --ok-bg:#DDF5E6; --warn:#9A6700; --warn-bg:#FFF1C7; --bad:#C4252B; --bad-bg:#FFE0DE; --info-bg:#E8E1FF;
-  --sh:4px 4px 0 var(--line);
-  --display:"Archivo Black","Arial Black",sans-serif; --body:"Space Grotesk","Helvetica Neue",Arial,sans-serif; --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
-  color-scheme:light;
-}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
-  --bg:#0D0E10; --panel:#16181C; --panel2:#1C1F24; --ink:#F1F0EA; --muted:#A3A7AE; --line:#F1F0EA; --hair:#F1F0EA22;
-  --ok:#4ADE80; --ok-bg:#12321F; --warn:#FBBF24; --warn-bg:#3A2E0A; --bad:#FF7A7F; --bad-bg:#3D1416; --info-bg:#2A2147; color-scheme:dark;}}
-:root[data-theme="dark"]{
-  --bg:#0D0E10; --panel:#16181C; --panel2:#1C1F24; --ink:#F1F0EA; --muted:#A3A7AE; --line:#F1F0EA; --hair:#F1F0EA22;
-  --ok:#4ADE80; --ok-bg:#12321F; --warn:#FBBF24; --warn-bg:#3A2E0A; --bad:#FF7A7F; --bad-bg:#3D1416; --info-bg:#2A2147; color-scheme:dark;}
-*{box-sizing:border-box;border-radius:0}
-body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 var(--body);-webkit-font-smoothing:antialiased}
-button{font:inherit;color:inherit;cursor:pointer}
-:focus-visible{outline:3px solid var(--violet);outline-offset:2px}
-code,.mono{font-family:var(--mono);font-size:12.5px}
-@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
-
-/* shell */
-.top{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--panel);border-bottom:2px solid var(--line)}
-.logo{font:22px var(--display);letter-spacing:-.5px;display:flex;align-items:center;gap:8px}
-.logo i{display:inline-block;width:22px;height:22px;background:var(--lime);border:2px solid var(--line);box-shadow:3px 3px 0 var(--magenta)}
-.repo{font:13px var(--mono);border:2px solid var(--line);padding:3px 8px;background:var(--panel2);white-space:nowrap}
-.trunk{font:12px var(--mono);color:var(--muted);white-space:nowrap}
-.sp{flex:1}
-.live{display:flex;align-items:center;gap:6px;font:12px var(--mono)}
-.dot{width:9px;height:9px;background:var(--ok);display:inline-block}
-.live.paused .dot{background:var(--muted)}
-.btn{border:2px solid var(--line);background:var(--panel);padding:5px 10px;font-weight:600;box-shadow:3px 3px 0 var(--line)}
-.btn:hover{background:var(--lime);color:#0E0F11}
-.btn:active{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--line)}
-.btn.pri{background:var(--lime);color:#0E0F11}
-.btn.dng{background:var(--tang);color:#fff}
-.btn.sm{padding:3px 8px;font-size:12px}
-.app{display:grid;grid-template-columns:200px minmax(0,1fr);min-height:calc(100vh - 56px)}
-.nav{border-right:2px solid var(--line);background:var(--panel);padding:14px 10px;display:flex;flex-direction:column;gap:4px}
-.nav button{display:flex;justify-content:space-between;align-items:center;text-align:left;border:2px solid transparent;background:none;padding:8px 10px;font-weight:600}
-.nav button:hover{border-color:var(--line)}
-.nav button[aria-current="page"]{background:var(--ink);color:var(--bg)}
-.nav .badge{font:11px var(--mono);border:1.5px solid currentColor;padding:0 5px}
-.nav .foot{margin-top:auto;font:11px var(--mono);color:var(--muted);padding:8px}
-main{padding:18px;min-width:0}
-.view{display:none}
-.view.on{display:block}
-h1{font:24px var(--display);margin:0 0 4px;text-transform:uppercase;letter-spacing:-.3px}
-.lede{color:var(--muted);margin:0 0 16px;max-width:80ch}
-@media (max-width:860px){
-  .app{grid-template-columns:1fr}
-  .nav{position:fixed;bottom:0;left:0;right:0;z-index:6;flex-direction:row;border-right:0;border-top:2px solid var(--line);padding:6px;overflow-x:auto}
-  .nav .foot{display:none}
-  .nav button{flex:1;justify-content:center;font-size:12px;padding:6px}
-  .nav .badge{display:none}
-  main{padding:14px 16px 90px}
-  .trunk,.repo{display:none}
-  .app{grid-template-columns:minmax(0,1fr)}
-  .top{flex-wrap:wrap;gap:8px;padding:8px 16px}
-  .top .sp{display:none}
-  .live{order:9;flex-basis:100%;font-size:11px}
-  .lanes{grid-template-columns:repeat(5,minmax(200px,1fr))}
-}
-
-/* panels */
-.grid{display:grid;gap:16px;grid-template-columns:minmax(0,1fr)}
-.g2{grid-template-columns:minmax(0,1.25fr) minmax(0,1fr)}
-.g3{grid-template-columns:repeat(3,minmax(0,1fr))}
-@media (max-width:1100px){.g2,.g3{grid-template-columns:minmax(0,1fr)}}
-.panel{background:var(--panel);border:2px solid var(--line);box-shadow:var(--sh);min-width:0}
-.ph{display:flex;align-items:center;gap:10px;padding:9px 12px;border-bottom:2px solid var(--line)}
-.ph h2{font:13px var(--display);text-transform:uppercase;margin:0;letter-spacing:.3px}
-.ph .meta{margin-left:auto;font:11.5px var(--mono);color:var(--muted)}
-.pb{padding:12px}
-.kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:16px}
-@media (max-width:1100px){.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media (max-width:520px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
-.kpi{background:var(--panel);border:2px solid var(--line);box-shadow:var(--sh);padding:10px 12px}
-.kpi b{display:block;font:26px/1.1 var(--display)}
-.kpi span{font-size:12px;color:var(--muted)}
-.kpi small{display:block;font:11px var(--mono);margin-top:2px}
-
-/* pills & avatars */
-.pill{display:inline-flex;align-items:center;gap:4px;font:11px/1.6 var(--mono);border:1.5px solid var(--line);padding:0 6px;white-space:nowrap}
-.s-ok{background:var(--ok-bg);color:var(--ok);border-color:var(--ok)}
-.s-warn{background:var(--warn-bg);color:var(--warn);border-color:var(--warn)}
-.s-bad{background:var(--bad-bg);color:var(--bad);border-color:var(--bad)}
-.s-info{background:var(--info-bg)}
-.s-mut{color:var(--muted);border-color:var(--muted)}
-.av{display:inline-grid;place-items:center;width:22px;height:22px;border:2px solid var(--line);font:11px var(--display);color:#fff;flex:none}
-.agent{display:inline-flex;align-items:center;gap:6px;font-weight:600}
-
-/* tables & lists */
-table{width:100%;border-collapse:collapse}
-th{font:11px var(--display);text-transform:uppercase;text-align:left;padding:7px 10px;border-bottom:2px solid var(--line);letter-spacing:.3px}
-td{padding:8px 10px;border-bottom:1px solid var(--hair);vertical-align:middle}
-tr.click{cursor:pointer}
-tr.click:hover td{background:var(--panel2)}
-.scroll{overflow-x:auto}
-.files .row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 12px;border-bottom:1px solid var(--hair)}
-.files .path{font:12.5px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.files .claims{display:flex;gap:4px;align-items:center}
-.claim{width:18px;height:18px;border:2px solid var(--line);position:relative}
-.claim.soft{opacity:.55}
-.claim.touched::after{content:"";position:absolute;inset:3px;background:var(--line)}
-.claim.excl{outline:2px solid var(--line);outline-offset:1px}
-.heat{height:6px;background:var(--hair);margin-top:4px}
-.heat i{display:block;height:100%;background:var(--magenta)}
-.legend{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:var(--muted);padding:8px 12px;border-top:2px solid var(--line)}
-.legend span{display:inline-flex;gap:5px;align-items:center}
-
-/* events */
-.events{max-height:340px;overflow:auto;font:12px/1.5 var(--mono)}
-.ev{display:grid;grid-template-columns:52px 170px minmax(0,1fr);gap:8px;padding:5px 12px;border-bottom:1px solid var(--hair)}
-.ev.new{background:var(--info-bg)}
-.ev .t{color:var(--muted)}
-@media (max-width:640px){.ev{grid-template-columns:44px minmax(0,1fr)}.ev .d{grid-column:2}}
-
-/* queue */
-.chain{display:flex;align-items:stretch;gap:0;overflow-x:auto;padding:14px 12px}
-.node{min-width:150px;border:2px solid var(--line);background:var(--panel2);padding:8px 10px;position:relative}
-.node + .node{margin-left:26px}
-.node + .node::before{content:"";position:absolute;left:-28px;top:50%;width:26px;border-top:2px solid var(--line)}
-.node.trunk{background:var(--ink);color:var(--bg)}
-.node.ok{border-color:var(--ok);box-shadow:3px 3px 0 var(--ok)}
-.node.bad{border-color:var(--bad);box-shadow:3px 3px 0 var(--bad)}
-.node.warn{border-color:var(--warn);box-shadow:3px 3px 0 var(--warn)}
-.node .id{font:12px var(--mono);font-weight:600}
-.node .msg{font-size:12px;margin:3px 0}
-.lanes{display:grid;grid-template-columns:repeat(5,minmax(160px,1fr));gap:12px;overflow-x:auto}
-.lane{background:var(--panel);border:2px solid var(--line);min-height:160px}
-.lane h3{font:12px var(--display);text-transform:uppercase;margin:0;padding:8px 10px;border-bottom:2px solid var(--line);display:flex;justify-content:space-between}
-.card{margin:8px;border:2px solid var(--line);padding:8px;background:var(--panel2);cursor:pointer}
-.card:hover{background:var(--lime);color:#0E0F11}
-.card .id{font:11px var(--mono);font-weight:600}
-.card .msg{font-size:12.5px;margin:2px 0 6px}
-.steps{display:flex;gap:6px;flex-wrap:wrap;padding:0 12px 12px}
-.step{font:11px var(--mono);border:1.5px solid var(--line);padding:2px 7px}
-.step.done{background:var(--lime);color:#0E0F11}
-.step.cur{background:var(--magenta);color:#fff}
-
-/* changeset detail */
-.split{display:grid;grid-template-columns:minmax(220px,300px) minmax(0,1fr);gap:16px}
-@media (max-width:980px){.split{grid-template-columns:minmax(0,1fr)}}
-.cslist button{display:block;width:100%;text-align:left;border:0;border-bottom:1px solid var(--hair);background:none;padding:9px 12px}
-.cslist button[aria-selected="true"]{background:var(--ink);color:var(--bg)}
-.cslist .id{font:12px var(--mono);font-weight:600}
-.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:0;border-top:2px solid var(--line)}
-.kv div{padding:8px 12px;border-bottom:1px solid var(--hair);border-right:1px solid var(--hair)}
-.kv dt{font:10.5px var(--display);text-transform:uppercase;color:var(--muted);letter-spacing:.3px}
-.kv dd{margin:2px 0 0;font:12.5px var(--mono);word-break:break-all}
-.risk{display:grid;grid-template-columns:150px minmax(0,1fr) 40px;gap:8px;align-items:center;padding:4px 12px;font-size:12.5px}
-.risk .bar{height:12px;background:var(--hair)}
-.risk .bar i{display:block;height:100%;background:var(--violet)}
-.riskbig{font:40px var(--display);line-height:1}
-.diff{font:12.5px/1.55 var(--mono);overflow-x:auto;border-top:2px solid var(--line)}
-.diff div{white-space:pre;padding:0 12px}
-.diff .h{background:var(--panel2);color:var(--muted);padding:4px 12px;border-bottom:1px solid var(--hair)}
-.diff .a{background:var(--ok-bg)}
-.diff .d{background:var(--bad-bg)}
-.trailers{font:12px/1.6 var(--mono);background:#0E0F11;color:var(--lime);padding:12px;margin:0;overflow-x:auto;white-space:pre}
-
-/* conflict room */
-.room{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
-@media (max-width:1100px){.room{grid-template-columns:minmax(0,1fr)}}
-.side h4{margin:0;font:12px var(--display);text-transform:uppercase;padding:8px 10px;border-bottom:2px solid var(--line);display:flex;gap:8px;align-items:center}
-.side pre{margin:0;padding:10px;font:12px/1.55 var(--mono);white-space:pre;overflow-x:auto}
-.verdict{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:12px;border-top:2px solid var(--line)}
-
-/* console */
-.console{background:#0E0F11;color:#DADAD3;font:12px/1.55 var(--mono);padding:12px;max-height:520px;overflow:auto;border-top:2px solid var(--line)}
-.console .p{color:var(--lime)}
-.console .j{color:#9FD9FF;white-space:pre-wrap;word-break:break-word}
-.console .e{color:#FF9BA0;white-space:pre-wrap;word-break:break-word}
-.toast{position:fixed;right:16px;bottom:16px;z-index:9;background:var(--ink);color:var(--bg);border:2px solid var(--line);box-shadow:4px 4px 0 var(--magenta);padding:10px 14px;max-width:360px;display:none;font-size:13px}
-@media (max-width:860px){.toast{bottom:76px;left:16px;right:16px}}
-.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
-.empty{padding:20px 12px;color:var(--muted);font-size:13px}
-.note{font-size:12px;color:var(--muted);padding:8px 12px}
-</style>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/weft.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%2316191e'/%3E%3Cg fill='%237fd3e6'%3E%3Crect x='5' y='5' width='2' height='14' rx='1'/%3E%3Crect x='11' y='5' width='2' height='14' rx='1'/%3E%3Crect x='17' y='5' width='2' height='14' rx='1'/%3E%3C/g%3E%3Crect x='4' y='11' width='16' height='2.4' rx='1.2' fill='%23e8edf2'/%3E%3C/svg%3E">
+<script>try{const t=localStorage.getItem("weft-theme");if(t)document.documentElement.dataset.theme=t;}catch(e){}</script>
 </head>
 <body>
 <header class="top">
-  <div class="logo"><i aria-hidden="true"></i>weft</div>
-  <span class="repo">leverageai / shop</span>
+  <a class="logo" href="/" aria-label="Weft Mission Control"><svg viewBox="0 0 24 24" aria-hidden="true"><rect width="24" height="24" rx="6" fill="var(--surface-3)"/><g fill="var(--accent)"><rect x="5" y="5" width="2" height="14" rx="1"/><rect x="11" y="5" width="2" height="14" rx="1"/><rect x="17" y="5" width="2" height="14" rx="1"/></g><rect x="4" y="10.8" width="16" height="2.4" rx="1.2" fill="var(--ink)"/></svg>weft</a>
+  <span class="repo">simulation · shop</span>
   <span class="trunk">trunk <b id="trunkSha">f13823f</b> · <span id="trunkCount">1</span> commits</span>
   <span class="sp"></span>
-  <span class="live" id="live"><span class="dot" aria-hidden="true"></span><span id="liveTxt">LIVE · step 0/0</span></span>
+  <span class="live on" id="live"><span class="dot" aria-hidden="true"></span><span id="liveTxt">LIVE · step 0/0</span></span>
   <button class="btn sm" id="playBtn" aria-pressed="true">Pause</button>
   <button class="btn sm" id="stepBtn">Step</button>
-  <button class="btn sm" id="replayBtn">Replay</button>
-  <button class="btn sm" id="themeBtn" aria-label="Toggle color theme">◐</button>
+  <button class="btn sm pri" id="replayBtn">Replay</button>
+  <button class="btn icon" id="themeBtn" type="button" aria-label="Switch color theme" title="Switch color theme"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 2a6 6 0 0 1 0 12z" fill="currentColor"/></svg></button>
+  <a class="btn sm" href="/">Mission Control</a>
 </header>
 <div class="app">
   <nav class="nav" aria-label="Views">
@@ -281,11 +105,11 @@ tr.click:hover td{background:var(--panel2)}
 "use strict";
 /* ---------------- static model (mirrors prototype/cli demo run) ---------------- */
 const AGENTS = {
-  atlas:{name:"atlas",model:"claude-opus-5-5",color:"#7A3CFF"},
-  birch:{name:"birch",model:"claude-sonnet-5-5",color:"#FF6A00"},
-  cedar:{name:"cedar",model:"claude-haiku-5-5",color:"#00A3B8"},
-  dune:{name:"dune",model:"claude-sonnet-5-5",color:"#FF2E88"},
-  elm:{name:"elm",model:"claude-haiku-5-5",color:"#3C7A00"}
+  atlas:{name:"atlas",model:"claude-opus-5-5",color:"#A59BFA"},
+  birch:{name:"birch",model:"claude-sonnet-5-5",color:"#F4A86B"},
+  cedar:{name:"cedar",model:"claude-haiku-5-5",color:"#5FCFD9"},
+  dune:{name:"dune",model:"claude-sonnet-5-5",color:"#F28DBE"},
+  elm:{name:"elm",model:"claude-haiku-5-5",color:"#93D27F"}
 };
 const FILES = ["src/auth/session.js","src/billing/invoice.js","src/util/format.js","test/invoice.test.js","test/discount.test.js","test/format.test.js","test/session.test.js","CHANGELOG.md","package.json"];
 const UNION = ["CHANGELOG.md"];
@@ -586,7 +410,7 @@ function render() {
 
 /* ---------------- controls ---------------- */
 let toastTimer = null;
-function toast(msg) { const t = $("toast"); t.textContent = msg; t.style.display = "block"; clearTimeout(toastTimer); toastTimer = setTimeout(() => t.style.display = "none", 3800); }
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.remove("show"); void t.offsetWidth; t.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 4000); }
 function tick() { if (step >= SCRIPT.length) { setPlaying(false); return; } apply(SCRIPT[step]); step += 1; render(); }
 function setPlaying(p) {
   playing = p; $("playBtn").textContent = p ? "Pause" : "Play"; $("playBtn").setAttribute("aria-pressed", String(p));
@@ -597,7 +421,7 @@ $("stepBtn").onclick = () => { setPlaying(false); tick(); };
 $("replayBtn").onclick = () => { reset(); selectedCs = null; render(); setPlaying(true); };
 $("themeBtn").onclick = () => {
   const root = document.documentElement, cur = root.getAttribute("data-theme");
-  const dark = cur ? cur === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  const dark = cur ? cur === "dark" : true; // the UI is dark unless the viewer chose light
   root.setAttribute("data-theme", dark ? "light" : "dark");
   try { localStorage.setItem("weft-theme", dark ? "light" : "dark"); } catch (err) { /* storage unavailable: theme still applies for this view */ }
 };

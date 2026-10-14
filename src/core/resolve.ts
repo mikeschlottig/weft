@@ -2,9 +2,11 @@
 // The model only PROPOSES file contents. A proposal reaches trunk only after the merge-runner has
 // built it as a merge commit and the repo's check passed on it (spec §9.7).
 
+import { DEFAULT_LLM } from "./models.ts";
 import type { Room, RoomAttempt, RoomFile } from "./types.ts";
 
-export const RESOLVER_MODEL = "@cf/moonshotai/kimi-k2.7-code";
+/** Default resolver model; per repo via config.resolverModel (e.g. @cf/moonshotai/kimi-k2.7-code). */
+export const RESOLVER_MODEL = DEFAULT_LLM;
 export const MAX_ROOM_ATTEMPTS = 3;
 const FILE_OPEN = "=== FILE: ";
 const FILE_CLOSE = "=== END FILE ===";
