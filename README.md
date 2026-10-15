@@ -67,7 +67,7 @@ Containers), and Docker with buildx for deploys.
 
 ```bash
 npm install
-npm run typecheck && npm test            # strict TS; 64 tests incl. the real merge-runner against local git
+npm run typecheck && npm test            # strict TS; 70 tests incl. the real merge-runner against local git
 npx wrangler d1 create weft-index        # put the ids below in wrangler.jsonc
 npx wrangler r2 bucket create weft-blobs
 npx wrangler kv namespace create weft-config
