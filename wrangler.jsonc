@@ -33,7 +33,7 @@
       "class_name": "MergeRunner",
       "image": "./container/Dockerfile",
       "image_build_context": ".",
-      "max_instances": 10,
+      "max_instances": 40,
       "instance_type": "basic"
     },
     {
@@ -98,7 +98,7 @@
           "class_name": "MergeRunner",
           "image": "./container/Dockerfile",
           "image_build_context": ".",
-          "max_instances": 10,
+          "max_instances": 40,
           "instance_type": "basic"
         },
         {
