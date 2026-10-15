@@ -90,5 +90,5 @@ Or over MCP: point the agent's MCP client at $WEFT_REMOTE/mcp with header
 (tools include weft_start, weft_heartbeat, weft_submit, weft_show, weft_rooms, weft_room_accept, weft_context).
 
 Run two or three agents at once on overlapping files to see collision forecasts, the merge queue,
-bisection and a Conflict Room. Limits: eval-* repos only, 10 repos / 30 agents in total, tokens expire.
+bisection and a Conflict Room. Limits: eval-* repos only, 25 repos / 75 agents in total, tokens expire.
 EOF

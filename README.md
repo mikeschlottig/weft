@@ -152,7 +152,7 @@ security concern in the resolution still holds it). Inside a workspace, plain `g
 `git push` work (a credential helper serves the workspace token) and count as heartbeats.
 
 Scope, by design (`src/core/evaluator.ts`): evaluator tokens reach only `eval-*` repositories and the agents they
-register only work there; 10 repos and 30 agents in total; tokens expire 2026-10-23; no key, kill-switch,
+register only work there; 25 repos and 75 agents in total; tokens expire 2026-10-23; no key, kill-switch,
 budget or mirror operations; an operator can switch all evaluator access off instantly. The merge-runner has
 Node and Python 3; other toolchains need a check that installs them.
 

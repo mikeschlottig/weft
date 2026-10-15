@@ -9,8 +9,9 @@
 // It can never rotate keys, kill or budget agents, configure mirrors, or touch non-eval repos.
 
 export const EVAL_PREFIX = "eval-";
-export const EVAL_MAX_REPOS = 10;
-export const EVAL_MAX_AGENTS = 30;
+// Raised from 10 / 30 on 2026-10-15: release gates and failed imports also use evaluator repos.
+export const EVAL_MAX_REPOS = 25;
+export const EVAL_MAX_AGENTS = 75;
 /** Evaluator tokens never outlive this (the day after finalists present at Cloudflare Connect). */
 export const EVAL_HARD_EXPIRY = Date.parse("2026-10-23T06:59:00Z");
 export const EVAL_KILL_KEY = "evaluator/disabled";
