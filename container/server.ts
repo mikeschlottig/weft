@@ -808,7 +808,7 @@ const serialized = <T>(fn: () => Promise<T>): Promise<T> => {
   return next;
 };
 
-createServer((req, res) => {
+const server = createServer((req, res) => {
   const url = new URL(req.url ?? "/", "http://runner");
   if (req.method === "GET" && url.pathname === "/healthz") {
     run("git", ["--version"]).then(
@@ -849,3 +849,14 @@ createServer((req, res) => {
       send(res, e.status, { ok: false, error: { code: e.code, message: redact(e.message), retryable: e.retryable, details: e.details } });
     });
 }).listen(PORT, () => console.log(JSON.stringify({ level: "info", msg: "weft merge-runner listening", port: PORT })));
+
+// The Containers runtime stops an idle runner (sleepAfter) with SIGTERM and never follows up with SIGKILL.
+// Node runs as PID 1 here, and PID 1 ignores SIGTERM unless it has a handler, so without this an idle runner
+// never stopped and running instances piled up to max_instances (production, 2026-10-15: merges stalled).
+for (const sig of ["SIGTERM", "SIGINT"] as const) {
+  process.on(sig, () => {
+    console.log(JSON.stringify({ level: "info", msg: "weft merge-runner stopping", signal: sig }));
+    server.close();
+    process.exit(0);
+  });
+}
