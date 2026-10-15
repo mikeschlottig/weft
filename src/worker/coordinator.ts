@@ -14,7 +14,7 @@ import { matches, prefixesOverlap } from "../core/glob.ts";
 import { CLEF, CLEF_FLASH, DEFAULT_LLM, GEMMA_4 } from "../core/models.ts";
 import { DUPLICATE_THRESHOLD, EMBED_MODEL, cosine, parseEmbedding } from "../core/similarity.ts";
 import { DUPLICATE_CANDIDATE_FLOOR, MAX_DUPLICATE_CANDIDATES, decideDuplicates, duplicateRequest, noulAnswers } from "../core/classify.ts";
-import { checkGate, composeScorecard, processGates } from "../core/rubric.ts";
+import { approvalCarries, checkGate, composeScorecard, processGates } from "../core/rubric.ts";
 import { type LimitRow, type RepoUsage, assessRepo } from "../core/limits.ts";
 import type {
   AgentClaims,
@@ -223,6 +223,10 @@ export class RepoCoordinator extends DurableObject<Env> {
     const row = this.sql.exec<{ data: string }>(`SELECT data FROM changesets WHERE id = ?`, id).toArray()[0];
     if (!row) throw notFound("changeset", id);
     return JSON.parse(row.data) as Changeset;
+  }
+  private csOrNull(id: string): Changeset | null {
+    const row = this.sql.exec<{ data: string }>(`SELECT data FROM changesets WHERE id = ?`, id).toArray()[0];
+    return row ? (JSON.parse(row.data) as Changeset) : null;
   }
   private putCs(c: Changeset): void {
     c.updatedAt = now();
@@ -1165,6 +1169,7 @@ export class RepoCoordinator extends DurableObject<Env> {
     ];
     if (c.provenance.promptSha256) t.push(`Weft-Prompt-Sha256: ${c.provenance.promptSha256}`);
     if (c.approvedBy) t.push(`Weft-Approved-By: ${c.approvedBy}`);
+    else if (c.approvalCarriedFrom) t.push(`Weft-Approved-By: ${oneLine(c.approvalCarriedFrom.by)} (carried from ${c.approvalCarriedFrom.csId})`);
     if (c.resolves) t.push(`Weft-Resolves: ${c.resolves}`);
     return t;
   }
@@ -1197,6 +1202,16 @@ export class RepoCoordinator extends DurableObject<Env> {
         // approve → queue → same judge hold → needs_review). The judge's answers stay on the scorecard.
         this.emit(m, "changeset.hold_overridden", c.approvedBy, { csId, agentName: c.provenance.agentName, hold });
         hold = null;
+      }
+      if (hold && !c.approvedBy && c.resolves) {
+        // A Conflict Room resolution is judged again as a new changeset. If a human already approved the change it
+        // resolves, and this hold is only about intent, that approval carries over: judges approve once.
+        const original = this.csOrNull(c.resolves);
+        if (original && approvalCarries(hold, c, original)) {
+          c.approvalCarriedFrom = { csId: original.id, by: original.approvedBy ?? "" };
+          this.emit(m, "changeset.hold_overridden", original.approvedBy ?? "", { csId, agentName: c.provenance.agentName, hold, carriedFrom: original.id });
+          hold = null;
+        }
       }
       // E3: re-score risk from the runner's authoritative diff (not the agent's claim) before speculation.
       // Stacked children carry their parent's commits in the fork diff, so they keep the claimed stats.
@@ -1232,7 +1247,8 @@ export class RepoCoordinator extends DurableObject<Env> {
       });
       if (hold) this.emit(m, "changeset.needs_review", "weft-judge", { csId, agentName: c.provenance.agentName, reason: hold });
       this.saveMeta(m);
-      return { held: hold !== null };
+      // Trailers can change here (a carried approval), after the batch claim was built; the Workflow uses these.
+      return { held: hold !== null, trailers: this.trailers(c) };
     });
   }
 
@@ -1668,7 +1684,7 @@ export class RepoCoordinator extends DurableObject<Env> {
             toolCalls: c.provenance.toolCalls,
             costUsd: c.provenance.costUsd,
             risk: { score: c.riskScore, factors: c.risk },
-            review: { approvedBy: c.approvedBy, hold: c.scorecard?.hold ?? null },
+            review: { approvedBy: c.approvedBy, carriedFrom: c.approvalCarriedFrom ?? null, hold: c.scorecard?.hold ?? null },
             judge: pre?.judge ?? null,
             gates: pre?.gates ?? [],
             resolves: c.resolves,

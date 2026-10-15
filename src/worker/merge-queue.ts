@@ -86,6 +86,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
 
       // 2. rubric: deterministic gates + CLEF judge; hold rules route to a human before speculation
       const held: string[] = [];
+      const trailersById: Record<string, string[]> = {};
       for (const m of claim.members) {
         const stats: DiffStats | undefined = prepared.stats[m.id];
         if (!stats) continue;
@@ -106,10 +107,13 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
               }
             : null;
           const hold = holdReason(gates, judge, claim.config);
-          return rpc<{ held: boolean }>(() => coord.recordJudgement(batchId, m.id, gates, judge, hold, { files: stats.files, added: stats.added, deleted: stats.deleted }));
+          return rpc<{ held: boolean; trailers?: string[] }>(() => coord.recordJudgement(batchId, m.id, gates, judge, hold, { files: stats.files, added: stats.added, deleted: stats.deleted }));
         });
         if (res.held) held.push(m.id);
+        if (res.trailers) trailersById[m.id] = res.trailers;
       }
+      // Speculate with the trailers as they stand after judging (a carried approval adds Weft-Approved-By).
+      const judged: BatchClaim = { ...claim, members: claim.members.map((m) => (trailersById[m.id] ? { ...m, trailers: trailersById[m.id] ?? m.trailers } : m)) };
       const ids = claim.members.map((m) => m.id).filter((id) => !held.includes(id));
       if (ids.length === 0) {
         await step.do("land-empty", STEP, () =>
@@ -120,7 +124,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
 
       // 3. speculative merge chain + merged-tree check + bisection (in the runner)
       const spec = await step.do("speculate", LONG, async () => {
-        const input = await specInput(this.env, claim, ids);
+        const input = await specInput(this.env, judged, ids);
         const startedAt = Date.now();
         try {
           const r = await runner(this.env, repo, lane).speculate(input);
@@ -156,7 +160,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
         for (let attempt = 1; ; attempt += 1) {
           const at = final;
           const pushed = await step.do(`push-${attempt}`, STEP, async () => {
-            const rebuild = { ...(await specInput(this.env, claim, ids)), trunkHead: at.trunkHead };
+            const rebuild = { ...(await specInput(this.env, judged, ids)), trunkHead: at.trunkHead };
             const write = headerToken((await mintToken(this.env, claim.trunkRepo, "write", 600)).plaintext);
             try {
               await runner(this.env, repo, lane).push({ trunk: { ...rebuild.trunk, writeToken: write }, expectedOld: at.trunkHead, tip: at.tip, rebuild });
@@ -174,7 +178,7 @@ export class MergeQueue extends WorkflowEntrypoint<Env, Params> {
           const respec = await step.do(`rebase-${attempt}`, LONG, async () => {
             const head = await headOf(this.env, claim.trunkRepo);
             if (!head) throw new NonRetryableError("trunk vanished");
-            const input = { ...(await specInput(this.env, claim, final.applied.map((a) => a.id))), trunkHead: head };
+            const input = { ...(await specInput(this.env, judged, final.applied.map((a) => a.id))), trunkHead: head };
             try {
               const r = await runner(this.env, repo, lane).speculate(input);
               return { trunkRed: false, head, r };

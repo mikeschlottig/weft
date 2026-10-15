@@ -129,6 +129,8 @@ export interface Changeset {
   /** FR-25: replayed on the current trunk at landing instead of merging the fork's text. */
   recipe?: RecipeRef | null;
   outcome?: OutcomeLabel | null;
+  /** A human approval of the changeset this one resolves, carried over to an intent-judgement hold (see approvalCarries). */
+  approvalCarriedFrom?: { csId: string; by: string } | null;
 }
 
 export interface RecipeRef {
@@ -252,7 +254,7 @@ export interface JudgeAnswers {
   correctnessRisk: "low" | "medium" | "high" | null;
   correctnessRiskP: Record<string, number> | null;
   error: string | null;
-  /** FR-48: an independent second judge (default clef-flash); its intent score and the disagreement. */
+  /** FR-48: an independent second judge (default Gemma 4); its intent score and the disagreement. */
   second?: { model: string; intentAlignment: number | null; securityConcern: number | null; error: string | null } | null;
   disagreement?: number | null;
 }

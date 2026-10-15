@@ -312,6 +312,34 @@ export const holdReason = (pre: GateResult[], j: JudgeAnswers | null, config: Re
   return null;
 };
 
+export type HoldKind = "secret" | "security" | "alignment" | "disagreement" | "other";
+
+/** The kind of a hold produced by holdReason (or by the coordinator's own rules, which are "other"). */
+export const holdKind = (reason: string): HoldKind => {
+  if (reason.startsWith("possible secret")) return "secret";
+  if (reason.startsWith("judge: security concern")) return "security";
+  if (reason.startsWith("judge: intent alignment")) return "alignment";
+  if (reason.startsWith("judges disagree on intent")) return "disagreement";
+  return "other";
+};
+
+/**
+ * Does a human approval of `original` cover a hold on `resolution`, the changeset that resolves it (a Conflict
+ * Room proposal or `weft submit --resolves`)? Only for holds about intent (alignment, judge disagreement): the
+ * human already judged that intent. A secret or a security concern in the resolution is new content the human
+ * never saw, so it holds again. The original must be the same agent's and must carry a human approval.
+ */
+export const approvalCarries = (
+  hold: string,
+  resolution: { agentId: string; resolves: string | null },
+  original: { id: string; agentId: string; approvedBy: string | null } | null,
+): boolean => {
+  if (!original || resolution.resolves !== original.id) return false;
+  if (original.agentId !== resolution.agentId || !original.approvedBy) return false;
+  const k = holdKind(hold);
+  return k === "alignment" || k === "disagreement";
+};
+
 export const adviceFor = (gates: GateResult[], j: JudgeAnswers | null): string[] => {
   const tips: string[] = [];
   for (const g of gates) {
