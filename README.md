@@ -132,7 +132,7 @@ The tools are `weft_start`, `weft_heartbeat`, `weft_submit`, `weft_show`, `weft_
 ## Try it on your own repository (contest evaluators)
 
 Judges get an **evaluator token** (in the submission form). It works against the production deployment, so
-nothing needs deploying:
+nothing needs deploying. You need Node ≥ 23.6 (the CLI runs TypeScript directly), git and jq:
 
 ```bash
 git clone https://github.com/mikeschlottig/weft && cd weft && npm install
@@ -145,7 +145,10 @@ It imports the repo as `eval-<name>-<id>`, detects a check (npm or pytest; pass 
 agents with 24 h tokens, and prints how to point any coding agent (Claude Code, Codex, a script…) at it over the
 `weft` CLI or MCP, plus the live Mission Control link. Run two or three agents at once on overlapping files to
 see collision forecasts, the merge queue, bisection and a Conflict Room. A change the judges hold (for example
-when CLEF and Gemma disagree) waits for you: `weft approve <cs>`.
+when CLEF and Gemma disagree) waits for you; approve it with your evaluator token:
+`WEFT_TOKEN=<evaluator token> node cli/weft.ts approve <cs> --repo <eval repo>`. A Conflict Room's resolution is
+judged again as a new changeset, so it can need a second approval. Inside a workspace, plain `git commit` +
+`git push` work (a credential helper serves the workspace token) and count as heartbeats.
 
 Scope, by design (`src/core/evaluator.ts`): evaluator tokens reach only `eval-*` repositories and the agents they
 register only work there; 10 repos and 30 agents in total; tokens expire 2026-10-23; no key, kill-switch,

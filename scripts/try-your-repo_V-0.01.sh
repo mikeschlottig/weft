@@ -82,6 +82,9 @@ Give each coding agent (Claude Code, Codex, Cursor, a script…) its own token a
   node $CLI room list                   # if a conflict was rejected: a test-verified resolution
   node $CLI room accept <room-id>
 
+A change held for review (for example when the two judges disagree) waits for you, with your evaluator token:
+  WEFT_TOKEN=<evaluator token> node $CLI approve <changeset-id> --repo $REPO
+
 Or over MCP: point the agent's MCP client at $WEFT_REMOTE/mcp with header
   Authorization: Bearer <that agent's token>
 (tools include weft_start, weft_heartbeat, weft_submit, weft_show, weft_rooms, weft_room_accept, weft_context).

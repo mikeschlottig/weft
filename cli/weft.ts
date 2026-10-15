@@ -214,7 +214,11 @@ const loadWs = (flags: Flags): { cwd: string; w: WsFile } => {
   if (!inRepo) throw usage("not inside a weft workspace", "cd into the directory `weft start` created, or pass --dir");
   const p = wsFilePath(cwd);
   if (!existsSync(p)) throw usage("this git repo is not a weft workspace", "run `weft start` first");
-  return { cwd: out(["rev-parse", "--show-toplevel"], { cwd }), w: JSON.parse(readFileSync(p, "utf8")) as WsFile };
+  const top = out(["rev-parse", "--show-toplevel"], { cwd });
+  const w = JSON.parse(readFileSync(p, "utf8")) as WsFile;
+  // Workspaces created by an older CLI have no credential helper yet; wire them on first use.
+  if (git(["config", "--get", "credential.useHttpPath"], { cwd: top, allow: [1] }).code !== 0) wireGit(top, w);
+  return { cwd: top, w };
 };
 
 // ---- D8 sandbox workspaces: no local clone; the directory holds only .weft-sandbox.json (repo, ws, branch).
@@ -231,10 +235,36 @@ const loadSandbox = (flags: Flags): SandboxFile | null => {
   return null;
 };
 
+// Plain git works in a workspace (`git push` is a heartbeat, FR-05): a per-remote credential helper serves the
+// current token from .git/weft.json, so no token is written into git config and a refreshed token is picked up.
+// Artifacts accepts Basic auth with the token secret (the part before `?expires=`) as the password.
+const CRED_HELPER_JS =
+  'const w=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))[process.argv[2]];' +
+  'if(Date.parse(w.expiresAt)<Date.now())process.stderr.write("weft: this workspace git token expired; run weft status to refresh it\\n");' +
+  'process.stdout.write("username=x\\npassword="+String(w.token).split("?")[0]+"\\n")';
+const credHelper = (kind: "fork" | "trunk"): string =>
+  `!f() { test "$1" = get || exit 0; node -e '${CRED_HELPER_JS}' "$(git rev-parse --absolute-git-dir)/weft.json" ${kind}; }; f`;
+
+const wireGit = (cwd: string, w: WsFile): void => {
+  git(["config", "credential.useHttpPath", "true"], { cwd });
+  for (const [kind, tok] of [["fork", w.fork], ["trunk", w.trunk]] as const) {
+    const key = `credential.${tok.remote}.helper`;
+    git(["config", "--unset-all", key], { cwd, allow: [5] });
+    // The empty entry resets inherited helpers (e.g. osxkeychain), so the token is never stored outside .git.
+    git(["config", "--add", key, ""], { cwd });
+    git(["config", "--add", key, credHelper(kind)], { cwd });
+  }
+  if (w.branch) {
+    git(["config", `branch.${w.branch}.remote`, "origin"], { cwd });
+    git(["config", `branch.${w.branch}.merge`, `refs/heads/${w.branch}`], { cwd });
+  }
+};
+
 const saveWs = (cwd: string, w: WsFile): void => {
   const p = wsFilePath(cwd);
   writeFileSync(p, JSON.stringify(w, null, 2));
   chmodSync(p, 0o600);
+  wireGit(cwd, w);
 };
 
 /** Refresh git tokens when they are within 5 minutes of expiry. */
@@ -515,10 +545,12 @@ const run = async (cmd: string, pos: string[], f: Flags): Promise<Result> => {
       const { cwd, w: w0 } = loadWs(f);
       const w = await fresh(cwd, w0);
       const commit = commitAll(cwd, f.message ?? "weft: checkpoint");
-      if (commit) pushFork(cwd, w);
+      // Push whenever the branch has work, including commits the agent made itself with plain git.
+      const hasWork = commit !== null || out(["rev-parse", "HEAD"], { cwd }) !== base(cwd);
+      if (hasWork) pushFork(cwd, w);
       const touched = touchedFiles(cwd);
       await api("POST", `/v1/repos/${w.repo}/workspaces/${w.ws}/heartbeat`, { touched, symbols: await symbolsForWorktree(cwd, base(cwd), touched) });
-      return { data: { commit, pushed: commit !== null }, hints: [] };
+      return { data: { commit, pushed: hasWork }, hints: [] };
     }
     case "sync": {
       const { cwd, w: w0 } = loadWs(f);
