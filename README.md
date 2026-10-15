@@ -146,8 +146,9 @@ agents with 24 h tokens, and prints how to point any coding agent (Claude Code, 
 `weft` CLI or MCP, plus the live Mission Control link. Run two or three agents at once on overlapping files to
 see collision forecasts, the merge queue, bisection and a Conflict Room. A change the judges hold (for example
 when CLEF and Gemma disagree) waits for you; approve it with your evaluator token:
-`WEFT_TOKEN=<evaluator token> node cli/weft.ts approve <cs> --repo <eval repo>`. A Conflict Room's resolution is
-judged again as a new changeset, so it can need a second approval. Inside a workspace, plain `git commit` +
+`WEFT_TOKEN=<evaluator token> node cli/weft.ts approve <cs> --repo <eval repo>`. Your approval carries to that
+change's Conflict Room resolution when the resolution is held only on intent, so you approve once (a new secret or
+security concern in the resolution still holds it). Inside a workspace, plain `git commit` +
 `git push` work (a credential helper serves the workspace token) and count as heartbeats.
 
 Scope, by design (`src/core/evaluator.ts`): evaluator tokens reach only `eval-*` repositories and the agents they

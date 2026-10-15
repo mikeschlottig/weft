@@ -109,3 +109,12 @@ test("jwt: roundtrip, expiry and tampering", async () => {
   await assert.rejects(verifyJwt(tok, "secret", 250), /expired/);
   await assert.rejects(verifyJwt(tok, "other", 150), /signature/);
 });
+
+test("gitSubcommand: skips global options so --git-dir fetches still count as network ops (retry)", async () => {
+  const { gitSubcommand } = await import("../src/core/retry.ts");
+  assert.equal(gitSubcommand(["fetch", "-q", "origin"]), "fetch");
+  assert.equal(gitSubcommand(["--git-dir=/tmp/g.git", "fetch", "-q", "https://x"]), "fetch");
+  assert.equal(gitSubcommand(["-c", "http.extraHeader=Authorization: Bearer t", "push", "origin"]), "push");
+  assert.equal(gitSubcommand(["-C", "/tmp/w", "--work-tree=/tmp/w", "ls-remote", "--heads", "u"]), "ls-remote");
+  assert.equal(gitSubcommand(["--version"]), null);
+});

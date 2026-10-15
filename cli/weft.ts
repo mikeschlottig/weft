@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { EXIT, WeftError, exitFor, toWeftError, usage } from "../src/core/errors.ts";
+import { gitSubcommand } from "../src/core/retry.ts";
 import type { ErrorEnvelope } from "../src/core/types.ts";
 import { symbolsForWorktree } from "./symbols.ts";
 
@@ -189,9 +190,9 @@ const git = (args: string[], opts: { cwd?: string; token?: string; allow?: numbe
     const r = spawnSync("git", [...auth, ...args], { cwd: opts.cwd, encoding: "utf8", input: opts.input, timeout: TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...(opts.env ?? {}) } });
     res = { code: r.status ?? -1, stdout: r.stdout ?? "", stderr: (r.stderr ?? "").replace(/Bearer [A-Za-z0-9_\-.]+/g, "Bearer <redacted>") };
     const failed = res.code !== 0 && !(opts.allow ?? []).includes(res.code);
-    if (!failed || !NETWORK_OPS.has(args[0] ?? "") || !GIT_TRANSIENT.test(res.stderr) || attempt === 4) break;
+    if (!failed || !NETWORK_OPS.has(gitSubcommand(args) ?? "") || !GIT_TRANSIENT.test(res.stderr) || attempt === 4) break;
     // A failed clone may leave a partial directory behind; git refuses to clone into it.
-    if (args[0] === "clone") {
+    if (gitSubcommand(args) === "clone") {
       const target = args[args.length - 1];
       if (target && !target.startsWith("-") && !target.includes("://")) rmSync(resolve(opts.cwd ?? process.cwd(), target), { recursive: true, force: true });
     }

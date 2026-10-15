@@ -23,3 +23,23 @@ export const withRetry = async <T>(fn: (attempt: number) => Promise<T>, o: Retry
   }
   throw toWeftError(last);
 };
+
+/** Git options that take their value as the next argument (`git -C dir fetch`, `git -c k=v push`). */
+const GIT_OPTS_WITH_VALUE = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"]);
+
+/**
+ * The git subcommand in an argument list, skipping global options (`--git-dir=…`, `-c k=v`, `-C dir`).
+ * Retry decisions key on it: `git --git-dir=x fetch` is a network operation like `git fetch`.
+ */
+export const gitSubcommand = (args: readonly string[]): string | null => {
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i] ?? "";
+    if (GIT_OPTS_WITH_VALUE.has(a)) {
+      i += 1;
+      continue;
+    }
+    if (a.startsWith("-")) continue;
+    return a;
+  }
+  return null;
+};
