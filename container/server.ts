@@ -12,6 +12,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { classifyFiles, scanAddedLines } from "../src/core/rubric.ts";
+import { failureExcerpt } from "../src/core/check-log.ts";
 import type { BatchMember, ConflictPeer, DiffStats, Rejection, SpeculationResult } from "../src/core/types.ts";
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -536,7 +537,7 @@ const speculateSigned = async (body: SpecInput, sign: { pre: string[]; flag: str
       id: culprit.m.id,
       rejection: {
         reason: "check_failed",
-        detail: `check failed on the merged result (bisected in ${bisectSteps} step(s)): ${outcome.text.slice(-500)}`,
+        detail: `check failed on the merged result (bisected in ${bisectSteps} step(s)): ${failureExcerpt(outcome.text)}`,
         files: culprit.m.filesTouched,
         conflictsWith: [],
         logKey: `commit:${culprit.commit}`,
